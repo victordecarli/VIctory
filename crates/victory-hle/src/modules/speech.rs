@@ -5,10 +5,6 @@
 // speech synthesis) needs COM bindings this crate has only in diagnostics
 // builds, plus voice enumeration and SSML the title sends (slot 0xa8); the
 // title then plays the empty stream and goes on.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{c_char, c_void};
 
@@ -71,7 +67,13 @@ extern "system" fn create_stream(
 extern "system" fn stream_size(_: This, _: *const u8, out: *mut usize) -> HRESULT {
     put(out, SILENCE.len())
 }
-extern "system" fn stream_data(
+/// Copies the empty WAVE file into the title's buffer.
+///
+/// # Safety
+///
+/// `buffer` is null or valid for writes of `size` bytes, and `used` is null
+/// or valid for a write of a `usize`, as the stream data getter requires.
+unsafe extern "system" fn stream_data(
     _: This,
     _: *const u8,
     size: usize,
@@ -81,10 +83,11 @@ extern "system" fn stream_data(
     if buffer.is_null() || size < SILENCE.len() {
         return super::xasync::E_NOT_SUFFICIENT_BUFFER;
     }
-    // SAFETY: the buffer holds `size` bytes, checked above.
+    // SAFETY: `buffer` is non-null and holds `size` bytes, at least
+    // `SILENCE.len()`, per this function's contract.
     unsafe { buffer.copy_from_nonoverlapping(SILENCE.as_ptr(), SILENCE.len()) };
     if !used.is_null() {
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { used.write(SILENCE.len()) };
     }
     S_OK
