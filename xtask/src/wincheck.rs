@@ -32,9 +32,9 @@ pub enum Variant {
 }
 
 impl Variant {
-    const ALL: [Self; 2] = [Self::Default, Self::AllFeatures];
+    pub const ALL: [Self; 2] = [Self::Default, Self::AllFeatures];
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Default => "default features",
             Self::AllFeatures => "--all-features",
@@ -42,12 +42,13 @@ impl Variant {
     }
 }
 
-/// The arguments for `cargo` for one clippy run. Pure, for testing.
-pub fn clippy_args(variant: Variant) -> Vec<&'static str> {
+/// The `cargo clippy` arguments before `--` that pick what is linted and
+/// for which target, shared with `cargo xtask audit-metrics --lints`. Pure,
+/// for testing.
+pub fn workspace_args(variant: Variant) -> Vec<&'static str> {
     let mut args = vec![
         "clippy",
         "--workspace",
-        "--all-targets",
         "--locked",
         "--keep-going",
         "--target",
@@ -59,8 +60,29 @@ pub fn clippy_args(variant: Variant) -> Vec<&'static str> {
         Variant::Default => {}
         Variant::AllFeatures => args.push("--all-features"),
     }
-    args.extend(["--", "-D", "warnings"]);
     args
+}
+
+/// The arguments for `cargo` for one clippy run. Pure, for testing.
+pub fn clippy_args(variant: Variant) -> Vec<&'static str> {
+    let mut args = workspace_args(variant);
+    args.extend(["--all-targets", "--", "-D", "warnings"]);
+    args
+}
+
+/// A `cargo` command for the workspace root, set up for the Windows target
+/// from any host. Fails with the rustup hint unless the target's standard
+/// library is installed.
+pub fn cargo(root: &Path) -> Result<Command> {
+    ensure_target(root)?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(root)
+        // With BLAKE3_CI set, blake3's build script turns its "no MSVC
+        // compiler" warning, expected here, into a failure.
+        .env_remove("BLAKE3_CI");
+    Ok(command)
 }
 
 /// What to tell someone whose toolchain lacks the target's standard library.
@@ -74,19 +96,11 @@ pub fn missing_target_hint() -> String {
 
 /// Runs both clippy variants, even when the first fails, and reports each.
 pub fn run(root: &Path) -> Result<()> {
-    ensure_target(root)?;
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut failed = Vec::new();
     for variant in Variant::ALL {
         eprintln!("wincheck: clippy for {TARGET}, {}", variant.name());
-        let status = Command::new(&cargo)
-            .args(clippy_args(variant))
-            .current_dir(root)
-            // With BLAKE3_CI set, blake3's build script turns its "no MSVC
-            // compiler" warning, expected here, into a failure.
-            .env_remove("BLAKE3_CI")
-            .status()
-            .context("running cargo clippy")?;
+        let status =
+            cargo(root)?.args(clippy_args(variant)).status().context("running cargo clippy")?;
         if !status.success() {
             failed.push(variant.name());
         }
@@ -122,7 +136,7 @@ fn ensure_target(root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TARGET, Variant, clippy_args, missing_target_hint};
+    use super::{TARGET, Variant, clippy_args, missing_target_hint, workspace_args};
 
     /// Arguments before and after the `--` that separates cargo's from clippy's.
     fn split(variant: Variant) -> (Vec<&'static str>, Vec<&'static str>) {
@@ -165,6 +179,16 @@ mod tests {
                 cargo.windows(2).any(|w| w == ["--features", "blake3/pure"]),
                 "{variant:?}"
             );
+        }
+    }
+
+    #[test]
+    fn clippy_runs_extend_the_shared_workspace_arguments() {
+        for variant in Variant::ALL {
+            let shared = workspace_args(variant);
+            assert!(clippy_args(variant).starts_with(&shared), "{variant:?}");
+            assert!(!shared.contains(&"--all-targets"), "{variant:?}");
+            assert!(!shared.contains(&"--"), "{variant:?}");
         }
     }
 

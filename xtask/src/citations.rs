@@ -42,6 +42,23 @@ pub struct Citation {
 
 /// Checks the citations of each document (paths relative to `root`).
 pub fn run(root: &Path, docs: &[String]) -> Result<()> {
+    let (checked, problems) = find_problems(root, docs)?;
+    if problems.is_empty() {
+        println!("citations: {checked} paths ok in {}", docs.join(", "));
+        return Ok(());
+    }
+    for p in &problems {
+        eprintln!("CITATION: {p}");
+    }
+    bail!(
+        "{} stale citation(s): cite paths from the repository root and update \
+         the document in the same commit as the code (AGENTS.md, Citations)",
+        problems.len()
+    )
+}
+
+/// How many citations the documents hold, and one line per stale one.
+pub fn find_problems(root: &Path, docs: &[String]) -> Result<(usize, Vec<String>)> {
     let mut problems = Vec::new();
     let mut checked = 0usize;
     for doc in docs {
@@ -58,18 +75,7 @@ pub fn run(root: &Path, docs: &[String]) -> Result<()> {
             }
         }
     }
-    if problems.is_empty() {
-        println!("citations: {checked} paths ok in {}", docs.join(", "));
-        return Ok(());
-    }
-    for p in &problems {
-        eprintln!("CITATION: {p}");
-    }
-    bail!(
-        "{} stale citation(s): cite paths from the repository root and update \
-         the document in the same commit as the code (AGENTS.md, Citations)",
-        problems.len()
-    )
+    Ok((checked, problems))
 }
 
 fn display(c: &Citation) -> String {

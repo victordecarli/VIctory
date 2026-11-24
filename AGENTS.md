@@ -27,7 +27,7 @@ out and the gotchas local to it. This file still applies there.
 | `victory-gpu` | D3D12.X objects, command lists, GPU memory → host D3D12 | shader translation logic | compiles, with dead-code warnings |
 | `victory-hle` | console API implementations called by title code | format decoders (call `victory-formats`) | **no** (see the ratchet) |
 | `apps/victory` | CLI: inspect, census, translate, run | library logic that other crates need | no (depends on `victory-hle`) |
-| `xtask` | asset-policy check, citation check, Windows-target clippy (`wincheck`), git hooks | product code | yes |
+| `xtask` | asset-policy check, citation check, Windows-target clippy (`wincheck`), code metrics (`audit-metrics`), git hooks | product code | yes |
 
 Dependency direction (enforced by review, keep it acyclic and downward):
 
@@ -83,6 +83,13 @@ PR, and do not change what `cfg(windows)` code does beyond what you can
 prove by reading and by `wincheck`. Never use `#[expect(...)]` in code you
 could not compile for every configuration CI builds: an unfulfilled
 expectation is itself a warning, and CI runs `-D warnings`.
+
+`cargo xtask audit-metrics [--json] [--lints]` measures and verifies
+nothing: it is not in CI and none of its numbers gate a change. It prints
+per-crate counts (text counts always; with `--lints`, clippy's counts
+outside tests, using `wincheck`'s setup), and grades each crate by the
+written rules in `xtask/src/audit/grade.rs`, giving a reason for each
+level. The JSON format is documented in `xtask/src/audit.rs`.
 
 Claude Code sessions run `.claude/hooks/check_edit.ps1` before every file
 edit and shell command (configured in `.claude/settings.json`; needs
@@ -171,11 +178,11 @@ checks:
 | Portable code calls a `cfg(windows)` item; Windows CI passes, every other host fails to build | `victory-gpu` `resource::view_format` called `host_resource` (fixed by gating it); `victory-hle` `d3d12x.rs` uses `super::xmem`, `xgame.rs` uses `super::lifecycle`, `xgameui.rs` uses `windows_sys` unconditionally | Gate the caller too, or give the item a non-Windows body. Run the Linux commands above. |
 | Tests assume the test binary is a PE image | `victory-pe` `image.rs` and `victory-loader` `prepare.rs` tests reading `current_exe()` (now `cfg(windows)`) | Gate with `#[cfg(windows)]` and a comment saying why, or build a synthetic image (`synthetic_image` in `image.rs`). |
 | Safe signature, raw-pointer dereference inside | 7 module-level `not_unsafe_ptr_arg_deref` allows (3 in `victory-gpu`, 4 in `crates/victory-hle/src/modules`) | `unsafe extern "system" fn` with a `# Safety` section; see the ratchet. |
-| Swallowed I/O errors | `apps/victory/src/translate.rs` dropped dump writes with `let _ = std::fs::write(...)` (fixed: `write_dump` logs the path); `.filter_map(Result::ok)` over `walkdir` in `apps/victory/src/census.rs:37` and the non-git fallback of `xtask/src/policy.rs:134` (`translate` itself now walks through `apps/victory/src/walk.rs`, which reports every skipped entry) | `if let Err(e) = ... { tracing::warn!(...) }`; count and report skipped entries, as `walk.rs` does. |
-| Hand-written field-by-field merge | `Tally::merge` added ~40 fields one by one, so a new field could be left out of the sum (fixed: `apps/victory/src/translate/tally.rs:122` destructures every field) | `let Tally { a, b, c } = other;` naming every field, never `..`, so a new field fails to compile until merged. |
+| Swallowed I/O errors | `apps/victory/src/translate.rs` dropped dump writes with `let _ = std::fs::write(...)` (fixed: `write_dump` logs the path); `.filter_map(Result::ok)` over `walkdir` in `apps/victory/src/census.rs:32` and the non-git fallback of `xtask/src/policy.rs:121` (`translate` itself now walks through `apps/victory/src/walk.rs`, which reports every skipped entry) | `if let Err(e) = ... { tracing::warn!(...) }`; count and report skipped entries, as `walk.rs` does. |
+| Hand-written field-by-field merge | `Tally::merge` added ~40 fields one by one, so a new field could be left out of the sum (fixed: `apps/victory/src/translate/tally.rs:139` destructures every field) | `let Tally { a, b, c } = other;` naming every field, never `..`, so a new field fails to compile until merged. |
 | `_ =>` standing for "vertex/pixel" | `counter()` and `check()` in `apps/victory/src/translate.rs` treated every `HwStage` (8 variants) other than `Cs`/`Ms`/`Vs` as one group (fixed: both list the variants) | Name the variants: `HwStage::Ls \| HwStage::Hs \| ... =>`. |
 | Panic reachable from title code | `crates/victory-shader/src/emit/bitcode.rs` `panic!`ed on internal invariants, reached from `victory-gpu` pipeline creation (fixed: builder and writer invariants are recorded on the `Module` and reported by `write` as `ShaderError::Internal`); `host!` in `crates/victory-hle/src/modules/files.rs` panicked if a host export was missing (fixed: `try_host!` returns `Option` and each caller returns its API's failure); `Stage::translated` in `crates/victory-gpu/src/pipeline/host.rs` used `expect` (fixed: a `Stage` now holds its translation from construction) | Return `Result` and map it to the API's failure (`E_FAIL`, a dropped draw) with a log line. |
-| Giant functions and files | `crates/victory-shader/src/emit/lower.rs` is 7,424 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
+| Giant functions and files | `crates/victory-shader/src/emit/lower.rs` is 7,440 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
 | Docs promise what the code does not do (or deny what it does) | `crates/victory-formats/src/lib.rs` called BCPack and XMA2 "Planned" beside the modules implementing them; `docs/architecture.md` routed game assets through a converter that does not exist; module docs cited numbered decision records the repository never held (all fixed) | Update the doc in the same commit as the code; cite only what exists. |
 | A Windows-only test helper prints, Linux CI is green and Windows clippy fails | `crates/victory-shader/src/emit/valu_tests.rs` was gated `#[cfg(all(test, windows))]`; clippy only exempts code under a plain `#[cfg(test)]`, so its `eprintln!` in `run_cases` broke PR #1 | Gate test modules with `#[cfg(test)]` and `#[cfg(windows)]` as two attributes, never `cfg(all(test, ...))` (the `portable` CI job rejects it). |
 | Unverifiable lint suppression | `#[allow(dead_code)] // unused in test builds` | `#[allow(dead_code, reason = "...")]`; never `#[expect]` on code CI compiles differently per cfg. |
