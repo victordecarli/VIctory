@@ -9,10 +9,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`XApuConnect`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::alloc::Layout;
 use std::collections::VecDeque;
@@ -149,7 +145,12 @@ fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
     c.state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub extern "system" fn XApuConnect(
+/// # Safety
+///
+/// `input` is null or valid for reads of a [`ConnectInput`]. `output` is
+/// null or valid for a write of a [`ConnectOutput`], and `handle` is null
+/// or valid for a write of a pointer.
+pub unsafe extern "system" fn XApuConnect(
     input: *const ConnectInput,
     output: *mut ConnectOutput,
     handle: *mut *mut Connection,
@@ -157,7 +158,7 @@ pub extern "system" fn XApuConnect(
     if input.is_null() || output.is_null() || handle.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; readable, per this function's contract.
     let input = unsafe { &*input };
     if !(1..=500).contains(&input.streams)
         || !(1..=16).contains(&input.commands_per_stream)
@@ -209,7 +210,8 @@ pub extern "system" fn XApuConnect(
             dequeued: 0,
         }),
     });
-    // SAFETY: checked non-null.
+    // SAFETY: both checked non-null; writable, per this function's
+    // contract.
     unsafe {
         output.write(ConnectOutput { memory: memory.cast(), result_event: event });
         handle.write(Box::into_raw(connection));
@@ -217,11 +219,17 @@ pub extern "system" fn XApuConnect(
     S_OK
 }
 
-pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
+/// # Safety
+///
+/// `handle` is null or a connection `XApuConnect` made that is not
+/// disconnected yet. It, and the memory block it handed out, must not be
+/// used afterwards.
+pub unsafe extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     if handle.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: made by `XApuConnect`; disconnected once.
+    // SAFETY: non-null, so a connection `XApuConnect` made that is
+    // disconnected once, per this function's contract.
     let connection = unsafe { Box::from_raw(handle) };
     if !connection.event.is_null() {
         // SAFETY: our event.
@@ -232,7 +240,16 @@ pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     S_OK
 }
 
-pub extern "system" fn XApuEnqueueCommand(
+/// # Safety
+///
+/// `handle` is null or a live connection `XApuConnect` made. `command` is
+/// null or points to a command that starts with a [`CommandId`] and, for
+/// the kinds that have more, is valid for reads of the whole command
+/// (unaligned). A process command's `input` is null or valid for reads of
+/// `input_length` bytes, and its `output` null or valid for writes of
+/// `output_length` bytes, until the call returns. `total` is null or valid
+/// for a write of a `u32`.
+pub unsafe extern "system" fn XApuEnqueueCommand(
     handle: *mut Connection,
     command: *const CommandId,
     total: *mut u32,
@@ -240,7 +257,8 @@ pub extern "system" fn XApuEnqueueCommand(
     if handle.is_null() || command.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: a connection from `XApuConnect`; every command starts with an id.
+    // SAFETY: both checked non-null; a live connection and a readable
+    // command that starts with an id, per this function's contract.
     let (connection, id) = unsafe { (&*handle, command.read_unaligned()) };
     let mut state = lock(connection);
     let stream = id.stream as usize;
@@ -266,7 +284,8 @@ pub extern "system" fn XApuEnqueueCommand(
     let decoder = &mut state.streams[stream];
     match id.kind {
         ACTIVATE => {
-            // SAFETY: an activate command is this struct.
+            // SAFETY: an activate command is this struct, readable per this
+            // function's contract.
             let channels = unsafe { command.cast::<Activate>().read_unaligned() }.channels;
             tracing::debug!(stream, channels, "Opus stream activated");
             result.error = if decoder.is_some() {
@@ -289,10 +308,13 @@ pub extern "system" fn XApuEnqueueCommand(
         }
         NOTIFY => {}
         PROCESS => {
-            // SAFETY: a process command is this struct.
+            // SAFETY: a process command is this struct, readable per this
+            // function's contract.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                // SAFETY: the command's buffers are valid, per this function's
+                // contract.
+                Some(d) => unsafe { process(d, connection.options, &command, &mut result) },
                 None => result.error = INVALID_STREAM,
             }
         }
@@ -302,7 +324,7 @@ pub extern "system" fn XApuEnqueueCommand(
     state.commands = state.commands.wrapping_add(1);
     state.results.push_back(result);
     if !total.is_null() {
-        // SAFETY: optional out parameter.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { total.write(state.commands) };
     }
     if id.options & SIGNAL != 0 && !connection.event.is_null() {
@@ -314,7 +336,18 @@ pub extern "system" fn XApuEnqueueCommand(
 
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+///
+/// # Safety
+///
+/// `command.input` is null or valid for reads of `command.input_length`
+/// bytes, and `command.output` is null or valid for writes of
+/// `command.output_length` bytes, for the duration of the call.
+unsafe fn process(
+    decoder: &mut OpusDecoder,
+    options: u32,
+    command: &Process,
+    result: &mut ApuResult,
+) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -325,7 +358,8 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         result.error = E_INVALIDARG;
         return;
     }
-    // SAFETY: the title's packet in its connection memory.
+    // SAFETY: non-null, and `input_length` readable bytes, per this
+    // function's contract.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
     let mut pcm = vec![0f32; MAX_FRAMES * channels];
     let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
@@ -340,7 +374,8 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
     let kept = &pcm[first * channels..(first + frames) * channels];
-    // SAFETY: the title's output buffer holds `output_length` bytes.
+    // SAFETY: non-null, and `output_length` writable bytes (at least
+    // `frames * channels` floats), per this function's contract.
     let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
     if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
         for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
@@ -353,11 +388,19 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     result.output_length = (frames * channels * 4) as u32;
 }
 
-pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuResult) -> HRESULT {
+/// # Safety
+///
+/// `handle` is null or a live connection `XApuConnect` made. `out` is null
+/// or valid for a write of an [`ApuResult`] (unaligned).
+pub unsafe extern "system" fn XApuDequeueResult(
+    handle: *mut Connection,
+    out: *mut ApuResult,
+) -> HRESULT {
     if handle.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: a connection from `XApuConnect`.
+    // SAFETY: checked non-null, so a live connection, per this function's
+    // contract.
     let mut state = lock(unsafe { &*handle });
     let Some(result) = state.results.pop_front() else {
         return PENDING_RESULTS;
@@ -365,19 +408,24 @@ pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuR
     let stream = result.id.stream as usize;
     state.queued[stream] -= 1;
     state.dequeued = state.dequeued.wrapping_add(1);
-    // SAFETY: the title passes room for one result.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write_unaligned(result) };
     S_OK
 }
 
-pub extern "system" fn XApuGetResultCount(handle: *mut Connection, total: *mut u32) -> u32 {
+/// # Safety
+///
+/// `handle` is null or a live connection `XApuConnect` made. `total` is
+/// null or valid for a write of a `u32`.
+pub unsafe extern "system" fn XApuGetResultCount(handle: *mut Connection, total: *mut u32) -> u32 {
     if handle.is_null() {
         return 0;
     }
-    // SAFETY: a connection from `XApuConnect`.
+    // SAFETY: checked non-null, so a live connection, per this function's
+    // contract.
     let state = lock(unsafe { &*handle });
     if !total.is_null() {
-        // SAFETY: optional out parameter.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { total.write(state.dequeued) };
     }
     state.results.len() as u32
@@ -421,7 +469,8 @@ mod tests {
         let mut output =
             ConnectOutput { memory: std::ptr::null_mut(), result_event: std::ptr::null_mut() };
         let mut handle = std::ptr::null_mut();
-        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        // SAFETY: locals for all three pointers.
+        assert_eq!(unsafe { XApuConnect(&input, &mut output, &mut handle) }, S_OK);
         let base = output.memory.cast::<u8>();
 
         let activate = Activate {
@@ -433,10 +482,12 @@ mod tests {
             processing_length: 0,
             processing: std::ptr::null_mut(),
         };
-        assert_eq!(
-            XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()),
-            S_OK
-        );
+        // SAFETY: `handle` is the live connection; `activate` is a whole
+        // activate command.
+        let queued = unsafe {
+            XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut())
+        };
+        assert_eq!(queued, S_OK);
 
         // A 20 ms stereo packet of a 440 Hz tone.
         let tone: Vec<f32> = (0..960 * 2)
@@ -459,19 +510,27 @@ mod tests {
             output: base.wrapping_add(0x14000),
         };
         let mut total = 0;
-        assert_eq!(XApuEnqueueCommand(handle, (&raw const process).cast(), &mut total), S_OK);
+        // SAFETY: `process` is a whole process command whose buffers lie in
+        // the connection memory; `total` is a local.
+        let queued = unsafe { XApuEnqueueCommand(handle, (&raw const process).cast(), &mut total) };
+        assert_eq!(queued, S_OK);
         assert_eq!(total, 2);
         // Two results queued for stream 3: its queue is full.
-        assert_eq!(XApuEnqueueCommand(handle, (&raw const process).cast(), &mut total), QUEUE_FULL);
-        assert_eq!(XApuGetResultCount(handle, std::ptr::null_mut()), 2);
+        // SAFETY: as above.
+        let full = unsafe { XApuEnqueueCommand(handle, (&raw const process).cast(), &mut total) };
+        assert_eq!(full, QUEUE_FULL);
+        // SAFETY: `handle` is live; a null total is tolerated.
+        assert_eq!(unsafe { XApuGetResultCount(handle, std::ptr::null_mut()) }, 2);
 
         let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
-        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+        // SAFETY: `handle` is live; `result` has room for one.
+        assert_eq!(unsafe { XApuDequeueResult(handle, result.as_mut_ptr()) }, S_OK);
         // SAFETY: written above.
         let first = unsafe { result.assume_init() };
         let (kind, error, context) = (first.id.kind, first.error, first.id.context);
         assert_eq!((kind, error, context), (ACTIVATE, S_OK, 0x1234));
-        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+        // SAFETY: as above.
+        assert_eq!(unsafe { XApuDequeueResult(handle, result.as_mut_ptr()) }, S_OK);
         // SAFETY: written above.
         let decoded = unsafe { result.assume_init() };
         let (kind, error, frames, length) =
@@ -482,19 +541,26 @@ mod tests {
             unsafe { std::slice::from_raw_parts(base.wrapping_add(0x14000).cast::<f32>(), 1920) };
         let energy: f32 = pcm.iter().map(|s| s * s).sum::<f32>() / 1920.0;
         assert!(energy > 0.01, "decoded a tone, energy {energy}");
-        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), PENDING_RESULTS);
+        // SAFETY: as above.
+        assert_eq!(unsafe { XApuDequeueResult(handle, result.as_mut_ptr()) }, PENDING_RESULTS);
         let mut dequeued = 0;
-        assert_eq!(XApuGetResultCount(handle, &mut dequeued), 0);
+        // SAFETY: `handle` is live, `dequeued` a local to write.
+        assert_eq!(unsafe { XApuGetResultCount(handle, &mut dequeued) }, 0);
         assert_eq!(dequeued, 2);
 
         // A process on a stream that was never activated fails in its result.
         let mut stray = process;
         stray.id.stream = 4;
-        assert_eq!(XApuEnqueueCommand(handle, (&raw const stray).cast(), &mut total), S_OK);
-        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+        // SAFETY: `stray` is a whole process command; the rest as above.
+        let queued = unsafe { XApuEnqueueCommand(handle, (&raw const stray).cast(), &mut total) };
+        assert_eq!(queued, S_OK);
+        // SAFETY: as above.
+        assert_eq!(unsafe { XApuDequeueResult(handle, result.as_mut_ptr()) }, S_OK);
         // SAFETY: written above.
         let error = unsafe { result.assume_init() }.error;
         assert_eq!(error, INVALID_STREAM);
-        assert_eq!(XApuDisconnect(handle), S_OK);
+        // SAFETY: `handle` is live and disconnected once; nothing uses its
+        // memory afterwards.
+        assert_eq!(unsafe { XApuDisconnect(handle) }, S_OK);
     }
 }
