@@ -4,10 +4,6 @@
 //! device methods in PC order); console additions follow. Methods we have
 //! not written log their table offset and fail, so a run shows what to
 //! write next.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::c_void;
 
@@ -43,7 +39,11 @@ const LEVEL_IIDS: [Iid; 9] = [
 ];
 
 /// Whether `iid` names the device: its first interface or a newer level.
-pub(crate) fn is_device(iid: *const Iid) -> bool {
+///
+/// # Safety
+///
+/// `iid` is null or points to an interface id valid for reads.
+pub(crate) unsafe fn is_device(iid: *const Iid) -> bool {
     object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
 }
 
@@ -79,7 +79,14 @@ pub(crate) fn device() -> This {
 /// Device creation: `(adapter, parameters, iid, out)`. The parameters start
 /// with the interface version; the rest (ring and scratch sizes, features
 /// to leave out) does not matter to us yet.
-pub extern "system" fn create(
+///
+/// # Safety
+///
+/// `parameters` is null or valid for a read of a `u32` (the interface
+/// version), `iid` is null or points to an interface id, and `out` is null
+/// or valid for a write of an object pointer, all for the duration of the
+/// call.
+pub unsafe extern "system" fn create(
     _adapter: *const c_void,
     parameters: *const u32,
     iid: *const Iid,
@@ -88,7 +95,7 @@ pub extern "system" fn create(
     if parameters.is_null() || iid.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: checked non-null; the title passes its parameters and an id.
+    // SAFETY: both checked non-null; readable, per this function's contract.
     let (version, iid) = unsafe { (parameters.read(), &*iid) };
     tracing::info!(version = format_args!("{version:#x}"), "D3D12.X device");
     if version != CHECKED_VERSION {
@@ -97,7 +104,8 @@ pub extern "system" fn create(
             "device layouts were checked against {CHECKED_VERSION:#x} only"
         );
     }
-    if !is_device(iid) {
+    // SAFETY: `iid` is a reference.
+    if !unsafe { is_device(iid) } {
         tracing::warn!(iid = %guid_text(iid), "device created as an unknown interface");
         return E_NOINTERFACE;
     }
@@ -123,8 +131,15 @@ pub(crate) fn newer() -> bool {
 }
 
 /// The device, or its DXGI side.
-extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let found = if is_device(iid) {
+///
+/// # Safety
+///
+/// `this` is the device. `iid` is null or points to an interface id valid
+/// for reads, and `out` is null or valid for a write of an object pointer,
+/// for the duration of the call.
+unsafe extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    // SAFETY: `iid` is null or readable, per this function's contract.
+    let found = if unsafe { is_device(iid) } {
         Some(this)
     } else if object::is(iid, &dxgi::DEVICE_IIDS) {
         Some(dxgi::device())
@@ -151,8 +166,13 @@ const _: () = assert!(size_of::<VirtualMemory>() == 0x20);
 /// `d3d12_xs!D3D12ConfigureVirtualMemoryX`, called before any graphics
 /// allocation. The inputs size console structures we do not have; the
 /// range out is all of user space, since GPU addresses are CPU addresses.
-pub extern "system" fn configure_virtual_memory(config: *mut VirtualMemory) -> HRESULT {
-    // SAFETY: the title passes its configuration (null is tolerated).
+///
+/// # Safety
+///
+/// `config` is null or valid for reads and writes of a [`VirtualMemory`].
+pub unsafe extern "system" fn configure_virtual_memory(config: *mut VirtualMemory) -> HRESULT {
+    // SAFETY: `config` is null or readable and writable, per this
+    // function's contract.
     let Some(config) = (unsafe { config.as_mut() }) else {
         return E_INVALIDARG;
     };
@@ -213,7 +233,12 @@ const OPTIONS: [u32; 16] = [
     2,  // resource heap tier
 ];
 
-extern "system" fn check_feature_support(
+/// # Safety
+///
+/// `data` is null or valid for reads and writes of `size` bytes, and for
+/// the queries that carry a pointer (the requested feature levels), that
+/// pointer is valid for as many entries as its count says.
+unsafe extern "system" fn check_feature_support(
     _: This,
     feature: u32,
     data: *mut c_void,
@@ -271,17 +296,22 @@ extern "system" fn check_feature_support(
             q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
             S_OK
         }
-        _ => feature_levels(data),
+        // SAFETY: checked size and non-null, as `feature_levels` needs.
+        _ => unsafe { feature_levels(data) },
     }
 }
 
-fn feature_levels(data: *mut c_void) -> HRESULT {
-    // SAFETY: the caller checked size and non-null.
+/// # Safety
+///
+/// `data` is valid for reads and writes of a [`FeatureLevels`], and its
+/// `requested` is null or valid for reads of `count` levels.
+unsafe fn feature_levels(data: *mut c_void) -> HRESULT {
+    // SAFETY: `data` is a `FeatureLevels`, per this function's contract.
     let query = unsafe { &mut *data.cast::<FeatureLevels>() };
     if query.requested.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: the title passes `count` levels.
+    // SAFETY: non-null, and `count` levels, per this function's contract.
     let requested = unsafe { std::slice::from_raw_parts(query.requested, query.count as usize) };
     match requested.iter().copied().filter(|&l| l <= HIGHEST_FEATURE_LEVEL).max() {
         Some(level) => {
@@ -358,7 +388,8 @@ mod tests {
     fn create_as(iid: &Iid) -> (HRESULT, This) {
         let version = CHECKED_VERSION;
         let mut device = std::ptr::null();
-        let hr = create(std::ptr::null(), &version, iid, &mut device);
+        // SAFETY: locals for the version and the output; `iid` is a reference.
+        let hr = unsafe { create(std::ptr::null(), &version, iid, &mut device) };
         (hr, device)
     }
 
@@ -382,7 +413,8 @@ mod tests {
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
         let mut same = std::ptr::null();
-        assert_eq!(query_interface(device, &LEVEL_IIDS[4], &mut same), S_OK);
+        // SAFETY: `device` is our device; a static id and a local to write.
+        assert_eq!(unsafe { query_interface(device, &LEVEL_IIDS[4], &mut same) }, S_OK);
         assert_eq!(same, device);
         // A Device8 method we have not written fails without crashing.
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0x3a0);
@@ -452,16 +484,18 @@ mod tests {
             lowest: 0,
             highest: 0,
         };
-        assert_eq!(configure_virtual_memory(&mut config), S_OK);
+        // SAFETY: `config` is a local.
+        assert_eq!(unsafe { configure_virtual_memory(&mut config) }, S_OK);
         assert!(0 < config.lowest && config.lowest < config.highest);
         let heap = Box::new(0u8);
         assert!((config.lowest..=config.highest).contains(&(&raw const *heap as u64)));
-        assert_eq!(configure_virtual_memory(std::ptr::null_mut()), E_INVALIDARG);
+        // SAFETY: null is tolerated.
+        assert_eq!(unsafe { configure_virtual_memory(std::ptr::null_mut()) }, E_INVALIDARG);
     }
 
     #[test]
     fn feature_levels_pick_the_highest_supported() {
-        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        type Check = unsafe extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
         let device = device();
         let check = slot::<Check>(device, 0x68);
         let query = |levels: &[u32], size| {
@@ -470,7 +504,9 @@ mod tests {
                 requested: levels.as_ptr(),
                 highest: 0,
             };
-            let hr = check(device, 2, (&raw mut query).cast(), size);
+            // SAFETY: `query` is a local `FeatureLevels` of 0x18 bytes
+            // whose `requested` points into `levels`.
+            let hr = unsafe { check(device, 2, (&raw mut query).cast(), size) };
             (hr, query.highest)
         };
         let levels = [0xb000, 0xb100, 0xc000, 0xc100, 0xd000];

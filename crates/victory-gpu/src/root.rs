@@ -4,10 +4,6 @@
 //! versioned form): the description is laid out as on PC, and the blob it
 //! returns works as the console's, whose two methods sit in the same slots.
 //! The console's own flags (bit 24 and up) are dropped first.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{CStr, c_void};
 use std::sync::OnceLock;
@@ -83,13 +79,20 @@ fn without_console_flags(desc: Desc) -> Desc {
 }
 
 /// `d3d12_xs!D3D12SerializeRootSignature`.
-pub extern "system" fn serialize(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a [`Desc`] whose `parameters` and
+/// `samplers` point to as many entries as their counts say. `blob` and
+/// `error` are each null or valid for a write of a pointer; they go to the
+/// host.
+pub unsafe extern "system" fn serialize(
     desc: *const Desc,
     version: u32,
     blob: *mut *mut c_void,
     error: *mut *mut c_void,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -98,7 +101,8 @@ pub extern "system" fn serialize(
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
-    // SAFETY: the export has this signature; it takes what the title passed.
+    // SAFETY: the export has this signature; the pointers are as this
+    // function's contract gives them.
     unsafe {
         std::mem::transmute::<usize, Serialize>(address)(
             &without_console_flags(desc),
@@ -110,12 +114,19 @@ pub extern "system" fn serialize(
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
-pub extern "system" fn serialize_versioned(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a [`VersionedDesc`] whose
+/// `parameters` and `samplers` point to as many entries as their counts
+/// say. `blob` and `error` are each null or valid for a write of a pointer;
+/// they go to the host.
+pub unsafe extern "system" fn serialize_versioned(
     desc: *const VersionedDesc,
     blob: *mut *mut c_void,
     error: *mut *mut c_void,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -125,7 +136,8 @@ pub extern "system" fn serialize_versioned(
         return E_NOTIMPL;
     };
     let desc = VersionedDesc { desc: without_console_flags(desc.desc), ..desc };
-    // SAFETY: the export has this signature; it takes what the title passed.
+    // SAFETY: the export has this signature; the pointers are as this
+    // function's contract gives them.
     unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
 }
 
@@ -136,7 +148,14 @@ type Deserialize =
 /// host's serialization, so the host's deserializer reads them, and its
 /// object (IUnknown, then the description getter) is laid out as the
 /// console's. Grand Theft Auto VI's upscaler asks with the PC interface id.
-pub extern "system" fn create_deserializer(
+///
+/// # Safety
+///
+/// `blob` is null or valid for reads of `size` bytes. `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of a pointer, for the duration of the call. They go to the
+/// host.
+pub unsafe extern "system" fn create_deserializer(
     blob: *const u8,
     size: usize,
     iid: *const Iid,
@@ -150,7 +169,8 @@ pub extern "system" fn create_deserializer(
         tracing::warn!("no host d3d12.dll to deserialize root signatures");
         return E_NOTIMPL;
     };
-    // SAFETY: the export has this signature; it takes what the title passed.
+    // SAFETY: the export has this signature; the pointers are as this
+    // function's contract gives them.
     unsafe { std::mem::transmute::<usize, Deserialize>(address)(blob, size, iid, out) }
 }
 
@@ -162,7 +182,13 @@ struct RootSignature {
 }
 
 /// Device method.
-pub(crate) extern "system" fn create(
+///
+/// # Safety
+///
+/// `blob` is null or valid for reads of `size` bytes. `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of a pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create(
     _: This,
     _nodes: u32,
     blob: *const u8,
@@ -173,18 +199,33 @@ pub(crate) extern "system" fn create(
     if blob.is_null() || size == 0 {
         return E_INVALIDARG;
     }
-    // SAFETY: the title passes `size` bytes.
+    // SAFETY: non-null, and `size` readable bytes, per this function's
+    // contract.
     let blob = unsafe { std::slice::from_raw_parts(blob, size) }.to_vec();
     tracing::debug!(size, "root signature");
     let root = Box::new(RootSignature { object: Object::new(&FUNCTIONS), blob });
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// `QueryInterface`.
+///
+/// # Safety
+///
+/// `this` is a live root signature this module created. `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of a pointer, for the duration of the call.
+unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
     object::answer(ROOT_SIGNATURE, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+/// `Release`.
+///
+/// # Safety
+///
+/// `this` is a live root signature this module created, holding the
+/// reference the caller gives up; it must not be used after the last one is
+/// released.
+unsafe extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<RootSignature>(this)
 }
 
@@ -229,15 +270,22 @@ mod tests {
             flags: 0x0100_0001,
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize(&desc, 1, &mut blob, &mut error), S_OK);
+        // SAFETY: `desc` and its parameter array are locals that outlive the
+        // call; `blob` and `error` are locals to write.
+        assert_eq!(unsafe { serialize(&desc, 1, &mut blob, &mut error) }, S_OK);
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
         assert!(size > 0);
         let null = std::ptr::null();
         let mut root = null;
-        assert_eq!(create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root), S_OK);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
+        // SAFETY: the host's blob holds `size` bytes at `data`; a static id
+        // and a local to write.
+        let created = unsafe { create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root) };
+        assert_eq!(created, S_OK);
+        let release = slot::<unsafe extern "system" fn(This) -> u32>(root, 0x10);
+        // SAFETY: `root` is live; this releases its only reference.
+        assert_eq!(unsafe { release(root) }, 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }
 
@@ -258,7 +306,8 @@ mod tests {
             },
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        // SAFETY: `desc` is a local; `blob` and `error` are locals to write.
+        assert_eq!(unsafe { serialize_versioned(&desc, &mut blob, &mut error) }, S_OK);
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
@@ -270,7 +319,9 @@ mod tests {
             iid[8..16].try_into().unwrap(),
         );
         let mut out = std::ptr::null_mut();
-        assert_eq!(create_deserializer(data, size, &iid, &mut out), S_OK);
+        // SAFETY: the host's blob holds `size` bytes at `data`; `iid` and
+        // `out` are locals.
+        assert_eq!(unsafe { create_deserializer(data, size, &iid, &mut out) }, S_OK);
         // SAFETY: the host handed out this interface.
         let deserializer = unsafe { ID3D12RootSignatureDeserializer::from_raw(out) };
         // SAFETY: valid while the deserializer lives.
@@ -294,13 +345,15 @@ mod tests {
             },
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        // SAFETY: `desc` is a local; `blob` and `error` are locals to write.
+        assert_eq!(unsafe { serialize_versioned(&desc, &mut blob, &mut error) }, S_OK);
         let blob = blob.cast_const().cast::<Object>();
         assert!(slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob) > 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
-        assert_eq!(
-            serialize_versioned(std::ptr::null(), &mut blob.cast_mut().cast(), &mut error),
-            E_INVALIDARG
-        );
+        // SAFETY: a null description is tolerated; the outputs are locals.
+        let refused = unsafe {
+            serialize_versioned(std::ptr::null(), &mut blob.cast_mut().cast(), &mut error)
+        };
+        assert_eq!(refused, E_INVALIDARG);
     }
 }

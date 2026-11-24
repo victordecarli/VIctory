@@ -1420,10 +1420,11 @@ mod tests {
             guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
         let (mut queue, mut allocator, mut list) = (null, null, null);
         let queue_desc = [0u32; 4];
-        assert_eq!(
-            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
-            S_OK
-        );
+        // SAFETY: a local description of 4 words, a local id and output.
+        let created = unsafe {
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue)
+        };
+        assert_eq!(created, S_OK);
         assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
         assert_eq!(
             crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
