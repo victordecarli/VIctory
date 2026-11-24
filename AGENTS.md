@@ -128,8 +128,11 @@ expectation is itself a warning, and CI runs `-D warnings`.
 ## Citations
 
 `cargo xtask citations` (a CI step, and the `agents_md_citations_resolve`
-test) fails when a path this file cites stops existing, so a rename or
-deletion has to update the contract in the same commit. What it checks:
+test) fails when a path this file or a crate `AGENTS.md` it points to
+cites stops existing, so a rename or deletion has to update the contract
+in the same commit. The documents are listed in `CONTRACT_DOCS`
+(`xtask/src/citations.rs`); a new crate `AGENTS.md` is added there. What it
+checks:
 
 - An inline code span (outside fenced blocks) made only of letters,
   digits, `_`, `-`, `.` and at least one `/` is a citation, optionally
