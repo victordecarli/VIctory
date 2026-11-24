@@ -1,10 +1,6 @@
 //! XPackage: the title's own installation, complete and launchable, with
 //! every chunk ready; no other package (content, add-ons) is installed.
 //! The package is the folder of the title's executable (`G:` to the title).
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{c_char, c_void};
 use std::path::Path;
@@ -37,7 +33,13 @@ pub fn identifier() -> String {
     format!("{:08X}", runtime::title().id)
 }
 
-fn is_ours(id: *const c_char) -> bool {
+/// Whether `id` names our installation.
+///
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call.
+unsafe fn is_ours(id: *const c_char) -> bool {
     text(id).is_some_and(|id| id == identifier())
 }
 
@@ -65,7 +67,10 @@ fn package_bytes() -> u64 {
 
 type This = *const Object;
 
-extern "system" fn current_identifier(_: This, size: usize, buffer: *mut u8) -> HRESULT {
+/// # Safety
+///
+/// `buffer` is null or valid for writes of `size` bytes.
+unsafe extern "system" fn current_identifier(_: This, size: usize, buffer: *mut u8) -> HRESULT {
     put_string(&identifier(), size, buffer, std::ptr::null_mut())
 }
 
@@ -80,7 +85,12 @@ fn monitor() -> *const c_void {
     (&raw const MONITOR).cast()
 }
 
-extern "system" fn create_monitor(
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call. `out` is null or valid for a write of a
+/// handle.
+unsafe extern "system" fn create_monitor(
     _: This,
     id: *const c_char,
     _selector_count: u32,
@@ -89,7 +99,9 @@ extern "system" fn create_monitor(
     _queue: *const c_void,
     out: *mut *const c_void,
 ) -> HRESULT {
-    if !is_ours(id) {
+    // SAFETY: `id` is null or a NUL-terminated string, per this function's
+    // contract.
+    if !unsafe { is_ours(id) } {
         return NO_PACKAGE;
     }
     put(out, monitor())
@@ -106,7 +118,10 @@ pub struct Progress {
     pub completed: bool,
 }
 
-extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
+/// # Safety
+///
+/// `out` is null or valid for a write of a [`Progress`].
+unsafe extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
     let bytes = package_bytes();
     put(
         out,
@@ -121,7 +136,11 @@ extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
 }
 
 /// The installation is complete, so progress never changes.
-extern "system" fn register_progress(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe extern "system" fn register_progress(
     _: This,
     _monitor: *const c_void,
     _context: *mut c_void,
@@ -132,36 +151,56 @@ extern "system" fn register_progress(
 }
 
 /// 0: ready.
+///
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call. `out` is null or valid for a write of a
+/// `u32`.
 // shortcut: every selector counts as installed, including ones the
 // package's layout does not have (the console answers those with an
 // invalid-selector error); Grand Theft Auto VI asks only about its own
 // chunks, which a full install has.
-extern "system" fn find_availability(
+unsafe extern "system" fn find_availability(
     _: This,
     id: *const c_char,
     _selector_count: u32,
     _selectors: *const c_void,
     out: *mut u32,
 ) -> HRESULT {
-    if !is_ours(id) {
+    // SAFETY: `id` is null or a NUL-terminated string, per this function's
+    // contract.
+    if !unsafe { is_ours(id) } {
         return NO_PACKAGE;
     }
     put(out, 0)
 }
 
-extern "system" fn change_order(
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call.
+unsafe extern "system" fn change_order(
     _: This,
     id: *const c_char,
     _count: u32,
     _selectors: *const c_void,
 ) -> HRESULT {
-    if is_ours(id) { S_OK } else { NO_PACKAGE }
+    // SAFETY: `id` is null or a NUL-terminated string, per this function's
+    // contract.
+    if unsafe { is_ours(id) } { S_OK } else { NO_PACKAGE }
 }
 
 static INSTALL: u8 = 0;
 
 /// Everything is installed: done at once, the result is a monitor.
-extern "system" fn install_chunks_async(
+///
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call. `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn install_chunks_async(
     _: This,
     id: *const c_char,
     _count: u32,
@@ -170,10 +209,18 @@ extern "system" fn install_chunks_async(
     _suppress_confirmation: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = if is_ours(id) { Ok(xasync::bytes(monitor())) } else { Err(NO_PACKAGE) };
+    // SAFETY: `id` is null or a NUL-terminated string, per this function's
+    // contract.
+    let ours = unsafe { is_ours(id) };
+    let result = if ours { Ok(xasync::bytes(monitor())) } else { Err(NO_PACKAGE) };
     xasync::finished_with(block, (&raw const INSTALL).cast(), result)
 }
-extern "system" fn install_chunks_result(
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a
+/// handle.
+unsafe extern "system" fn install_chunks_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut *const c_void,
@@ -182,7 +229,13 @@ extern "system" fn install_chunks_result(
 }
 
 /// Nothing to download.
-extern "system" fn estimate_download(
+///
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call. `bytes` is null or valid for a write of a
+/// `u64`, and `confirm` is null or valid for a write of a `bool`.
+unsafe extern "system" fn estimate_download(
     _: This,
     id: *const c_char,
     _count: u32,
@@ -190,26 +243,36 @@ extern "system" fn estimate_download(
     bytes: *mut u64,
     confirm: *mut bool,
 ) -> HRESULT {
-    if !is_ours(id) {
+    // SAFETY: `id` is null or a NUL-terminated string, per this function's
+    // contract.
+    if !unsafe { is_ours(id) } {
         return NO_PACKAGE;
     }
     if !confirm.is_null() {
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { confirm.write(false) };
     }
     put(bytes, 0)
 }
 
+/// Accepted without removing anything.
+///
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call.
 // shortcut: accepted but nothing is removed (the package folder is the
 // user's), so the chunks stay ready; Grand Theft Auto VI's one call site
 // (title+0x293b4b0, its chunk manager) would then see them still installed.
-extern "system" fn uninstall_chunks(
+unsafe extern "system" fn uninstall_chunks(
     _: This,
     id: *const c_char,
     _count: u32,
     _selectors: *const c_void,
 ) -> HRESULT {
-    if is_ours(id) { S_OK } else { NO_PACKAGE }
+    // SAFETY: `id` is null or a NUL-terminated string, per this function's
+    // contract.
+    if unsafe { is_ours(id) } { S_OK } else { NO_PACKAGE }
 }
 
 /// Mount handles only come from mounting another package, and there is
@@ -220,18 +283,37 @@ extern "system" fn mount_path(_: This, _: *const c_void, _: usize, _: *mut u8) -
 extern "system" fn close_mount(_: This, _: *const c_void) {}
 
 /// Only other packages are uninstalled this way, and none is installed.
-extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
+///
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call.
+unsafe extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
     tracing::info!(id = text(id).unwrap_or_default(), "package uninstall refused");
     false
 }
 
 static MOUNT: u8 = 0;
 
-extern "system" fn mount_async(_: This, id: *const c_char, block: *mut AsyncBlock) -> HRESULT {
+/// # Safety
+///
+/// `id` is null or points to a NUL-terminated string valid for reads for the
+/// duration of the call. `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn mount_async(
+    _: This,
+    id: *const c_char,
+    block: *mut AsyncBlock,
+) -> HRESULT {
     tracing::info!(id = text(id).unwrap_or_default(), "package mount: not installed");
     xasync::finished(block, (&raw const MOUNT).cast(), NO_PACKAGE)
 }
-extern "system" fn mount_result(
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a
+/// handle.
+unsafe extern "system" fn mount_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut *const c_void,
@@ -304,24 +386,29 @@ mod tests {
     #[test]
     fn the_installation_is_complete_and_alone() {
         let this: This = &OBJECT;
-        type Id = extern "system" fn(This, usize, *mut u8) -> HRESULT;
+        type Id = unsafe extern "system" fn(This, usize, *mut u8) -> HRESULT;
         let mut id = [0u8; 33];
-        assert_eq!(method::<Id>(&OBJECT, 0x18)(this, 33, id.as_mut_ptr()), S_OK);
+        // SAFETY: `id` holds 33 bytes.
+        assert_eq!(unsafe { method::<Id>(&OBJECT, 0x18)(this, 33, id.as_mut_ptr()) }, S_OK);
         let len = id.iter().position(|&b| b == 0).unwrap();
         assert_eq!(std::str::from_utf8(&id[..len]).unwrap(), identifier());
         assert!(method::<extern "system" fn(This) -> bool>(&OBJECT, 0x20)(this));
 
         type Find =
-            extern "system" fn(This, *const c_char, u32, *const c_void, *mut u32) -> HRESULT;
+            unsafe extern "system" fn(This, *const c_char, u32, *const c_void, *mut u32) -> HRESULT;
         let mut availability = 9;
         let ours = format!("{}\0", identifier());
         let find = method::<Find>(&OBJECT, 0x60);
         let none = std::ptr::null();
-        assert_eq!(find(this, ours.as_ptr().cast(), 0, none, &mut availability), S_OK);
+        // SAFETY: `ours` is NUL-terminated, `availability` a local to write.
+        let found = unsafe { find(this, ours.as_ptr().cast(), 0, none, &mut availability) };
+        assert_eq!(found, S_OK);
         assert_eq!(availability, 0, "ready");
-        assert_eq!(find(this, c"dlc".as_ptr(), 0, none, &mut availability), NO_PACKAGE);
+        // SAFETY: a NUL-terminated literal, and the same local.
+        let other = unsafe { find(this, c"dlc".as_ptr(), 0, none, &mut availability) };
+        assert_eq!(other, NO_PACKAGE);
 
-        type Progress_ = extern "system" fn(This, *const c_void, *mut Progress);
+        type Progress_ = unsafe extern "system" fn(This, *const c_void, *mut Progress);
         let mut p = Progress {
             total_bytes: 1,
             installed_bytes: 0,
@@ -329,17 +416,20 @@ mod tests {
             launchable: false,
             completed: false,
         };
-        method::<Progress_>(&OBJECT, 0x38)(this, monitor(), &mut p);
+        // SAFETY: `p` is a local to write.
+        unsafe { method::<Progress_>(&OBJECT, 0x38)(this, monitor(), &mut p) };
         assert!(p.completed && p.launchable && p.installed_bytes == p.total_bytes);
 
-        type Mount = extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type Mount = unsafe extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
         let mut block = AsyncBlock {
             queue: std::ptr::null(),
             context: std::ptr::null_mut(),
             callback: None,
             internal: [0; 4],
         };
-        assert_eq!(method::<Mount>(&OBJECT, 0x128)(this, c"dlc".as_ptr(), &mut block), S_OK);
+        let mount = method::<Mount>(&OBJECT, 0x128);
+        // SAFETY: a NUL-terminated literal; `block` outlives the call.
+        assert_eq!(unsafe { mount(this, c"dlc".as_ptr(), &mut block) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
     }
 }

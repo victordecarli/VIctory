@@ -7,10 +7,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`RegisterAppStateChangeNotification`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 #![allow(clippy::too_many_arguments, reason = "the signature is fixed by the API title code calls")]
 
 use std::ffi::c_void;
@@ -39,7 +35,11 @@ const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
-pub extern "system" fn RegisterAppStateChangeNotification(
+/// # Safety
+///
+/// `registration` is null or valid for a write of a `usize`. `context` is
+/// only kept and handed back to `routine`.
+pub unsafe extern "system" fn RegisterAppStateChangeNotification(
     routine: Option<Routine>,
     context: *mut c_void,
     registration: *mut usize,
@@ -53,7 +53,7 @@ pub extern "system" fn RegisterAppStateChangeNotification(
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     routines().push((id, routine, context as usize));
-    // SAFETY: checked non-null; the title passes room for its registration.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { registration.write(id) };
     0
 }
@@ -65,7 +65,15 @@ pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize)
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
-pub extern "system" fn CreateWindowExW(
+/// Creates a window, fitted to the screen and hooked.
+///
+/// # Safety
+///
+/// `class` and `name` are each null, an atom or a NUL-terminated string
+/// valid for reads, and `param` is what the window class expects at
+/// creation, as `CreateWindowEx` requires. The parent, menu and instance
+/// handles are ones the system accepts.
+pub unsafe extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
     name: PCWSTR,
@@ -80,7 +88,8 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    // SAFETY: the title's own arguments, forwarded as this function's
+    // contract gives them (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -91,7 +100,14 @@ pub extern "system" fn CreateWindowExW(
 }
 
 /// See [`CreateWindowExW`].
-pub extern "system" fn CreateWindowExA(
+///
+/// # Safety
+///
+/// `class` and `name` are each null, an atom or a NUL-terminated string
+/// valid for reads, and `param` is what the window class expects at
+/// creation, as `CreateWindowEx` requires. The parent, menu and instance
+/// handles are ones the system accepts.
+pub unsafe extern "system" fn CreateWindowExA(
     ex_style: u32,
     class: PCSTR,
     name: PCSTR,
@@ -106,7 +122,8 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    // SAFETY: the title's own arguments, forwarded as this function's
+    // contract gives them (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -313,8 +330,14 @@ mod tests {
     #[test]
     fn registrations_come_and_go() {
         let (mut a, mut b) = (0, 0);
-        assert_eq!(RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut a), 0);
-        assert_eq!(RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut b), 0);
+        // SAFETY: `a` and `b` are locals to write; the context is unused.
+        let (first, second) = unsafe {
+            (
+                RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut a),
+                RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut b),
+            )
+        };
+        assert_eq!((first, second), (0, 0));
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
@@ -331,20 +354,23 @@ mod tests {
     #[test]
     fn hooked_windows_still_reach_the_title_procedure() {
         let null = std::ptr::null_mut();
-        let hwnd = CreateWindowExW(
-            0,
-            w!("STATIC"),
-            w!("before"),
-            0,
-            0,
-            0,
-            10,
-            10,
-            null,
-            null,
-            null,
-            std::ptr::null(),
-        );
+        // SAFETY: literal NUL-terminated names, null handles and parameter.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("before"),
+                0,
+                0,
+                0,
+                10,
+                10,
+                null,
+                null,
+                null,
+                std::ptr::null(),
+            )
+        };
         assert!(!hwnd.is_null());
         let mut text = [0u16; 16];
         // SAFETY: our window; the buffer holds 16 characters.
@@ -381,20 +407,23 @@ mod tests {
     #[test]
     fn the_keyboard_menu_never_reaches_the_title() {
         let null = std::ptr::null_mut();
-        let hwnd = CreateWindowExW(
-            0,
-            w!("STATIC"),
-            w!("menu"),
-            0,
-            0,
-            0,
-            10,
-            10,
-            null,
-            null,
-            null,
-            std::ptr::null(),
-        );
+        // SAFETY: literal NUL-terminated names, null handles and parameter.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("menu"),
+                0,
+                0,
+                0,
+                10,
+                10,
+                null,
+                null,
+                null,
+                std::ptr::null(),
+            )
+        };
         assert!(!hwnd.is_null());
         // SAFETY: our window, owned by this thread, so each message is
         // handled before SendMessageW returns. `recording` stands in for the

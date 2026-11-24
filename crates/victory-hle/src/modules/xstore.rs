@@ -3,10 +3,6 @@
 //! needs the store service (catalog, consumables, purchase and update
 //! pages, collection ids, update checks) fails with the documented store
 //! network error.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{c_char, c_void};
 
@@ -54,32 +50,60 @@ static QUERY_CALL: u8 = 0;
 static LICENSE_CALL: u8 = 0;
 static GAME_LICENSE: u8 = 0;
 
-fn offline(block: *mut AsyncBlock, what: &str) -> HRESULT {
+/// Fails the call as the store network being unreachable.
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe fn offline(block: *mut AsyncBlock, what: &str) -> HRESULT {
     tracing::info!(what, "store call: offline");
     xasync::finished(block, (&raw const FAILED).cast(), NETWORK_ERROR)
 }
 /// The result functions of calls that failed: their status.
-extern "system" fn status(_: This, block: *mut AsyncBlock) -> HRESULT {
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes.
+unsafe extern "system" fn status(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
 
-extern "system" fn create_context(_: This, _user: *const c_void, out: *mut Handle) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a handle.
+unsafe extern "system" fn create_context(
+    _: This,
+    _user: *const c_void,
+    out: *mut Handle,
+) -> HRESULT {
     put(out, handle(&CONTEXT))
 }
 extern "system" fn close(_: This, _: Handle) {}
 
-extern "system" fn associated_products_async(
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn associated_products_async(
     _: This,
     _: Handle,
     _kinds: u32,
     _per_page: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    offline(block, "associated products")
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "associated products") }
 }
 
 /// The user owns no add-ons: an empty query.
-extern "system" fn entitled_products_async(
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn entitled_products_async(
     _: This,
     _: Handle,
     _kinds: u32,
@@ -88,7 +112,16 @@ extern "system" fn entitled_products_async(
 ) -> HRESULT {
     xasync::finished_with(block, (&raw const QUERY_CALL).cast(), Ok(xasync::bytes(handle(&QUERY))))
 }
-extern "system" fn query_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a
+/// handle.
+unsafe extern "system" fn query_result(
+    _: This,
+    block: *mut AsyncBlock,
+    out: *mut Handle,
+) -> HRESULT {
     xasync::result(block, (&raw const QUERY_CALL).cast(), out)
 }
 /// Empty, so the callback never runs.
@@ -104,35 +137,71 @@ extern "system" fn has_more_pages(_: This, _: Handle) -> bool {
     false
 }
 /// There is no next page to ask for.
-extern "system" fn next_page_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn next_page_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
     xasync::finished(block, (&raw const QUERY_CALL).cast(), E_ILLEGAL_METHOD_CALL)
 }
 
-fn license_for(owned: bool, block: *mut AsyncBlock) -> HRESULT {
+/// The licence handle of a call that completes at once.
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe fn license_for(owned: bool, block: *mut AsyncBlock) -> HRESULT {
     let license = handle(if owned { &VALID } else { &INVALID });
     xasync::finished_with(block, (&raw const LICENSE_CALL).cast(), Ok(xasync::bytes(license)))
 }
 /// Only the game's own package is installed, so only its licence is valid.
-extern "system" fn license_for_package_async(
+///
+/// # Safety
+///
+/// `package` is null or points to a NUL-terminated string valid for reads
+/// for the duration of the call. `block` is null or an async block valid
+/// for reads and writes until the call this starts has completed and its
+/// result has been read.
+unsafe extern "system" fn license_for_package_async(
     _: This,
     _: Handle,
     package: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let ours = text(package).is_some_and(|p| p == xpackage::identifier());
-    license_for(ours, block)
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { license_for(ours, block) }
 }
 /// The user owns no durables: their licences are not valid.
-extern "system" fn license_for_durables_async(
+///
+/// # Safety
+///
+/// `store_id` is null or points to a NUL-terminated string valid for reads
+/// for the duration of the call. `block` is null or an async block valid
+/// for reads and writes until the call this starts has completed and its
+/// result has been read.
+unsafe extern "system" fn license_for_durables_async(
     _: This,
     _: Handle,
     store_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
     tracing::debug!(store_id = text(store_id).unwrap_or_default(), "durable not owned");
-    license_for(false, block)
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { license_for(false, block) }
 }
-extern "system" fn license_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a
+/// handle.
+unsafe extern "system" fn license_result(
+    _: This,
+    block: *mut AsyncBlock,
+    out: *mut Handle,
+) -> HRESULT {
     xasync::result(block, (&raw const LICENSE_CALL).cast(), out)
 }
 extern "system" fn is_license_valid(_: This, license: Handle) -> bool {
@@ -172,11 +241,24 @@ fn game_license() -> GameLicense {
     }
 }
 
-extern "system" fn game_license_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn game_license_async(
+    _: This,
+    _: Handle,
+    block: *mut AsyncBlock,
+) -> HRESULT {
     let license = xasync::bytes(game_license());
     xasync::finished_with(block, (&raw const GAME_LICENSE).cast(), Ok(license))
 }
-extern "system" fn game_license_result(
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a
+/// [`GameLicense`].
+unsafe extern "system" fn game_license_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut GameLicense,
@@ -184,15 +266,26 @@ extern "system" fn game_license_result(
     xasync::result(block, (&raw const GAME_LICENSE).cast(), out)
 }
 
-extern "system" fn consumable_balance_async(
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read. `_store_id`
+/// is not read.
+unsafe extern "system" fn consumable_balance_async(
     _: This,
     _: Handle,
     _store_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    offline(block, "consumable balance")
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "consumable balance") }
 }
-extern "system" fn report_fulfillment_async(
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read. The store
+/// id and tracking id are not read.
+unsafe extern "system" fn report_fulfillment_async(
     _: This,
     _: Handle,
     _store_id: *const c_char,
@@ -200,22 +293,42 @@ extern "system" fn report_fulfillment_async(
     _tracking_id: *const c_void,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    offline(block, "consumable fulfillment")
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "consumable fulfillment") }
 }
 /// Collections and purchase ids alike.
-extern "system" fn user_id_async(
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read. The ticket
+/// and publisher user id are not read.
+unsafe extern "system" fn user_id_async(
     _: This,
     _: Handle,
     _ticket: *const c_char,
     _publisher_user_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    offline(block, "user store id")
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "user store id") }
 }
-extern "system" fn size_status(_: This, block: *mut AsyncBlock, _out: *mut usize) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `_out` is not written.
+unsafe extern "system" fn size_status(
+    _: This,
+    block: *mut AsyncBlock,
+    _out: *mut usize,
+) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
-extern "system" fn string_status(
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. The buffer is not written.
+unsafe extern "system" fn string_status(
     _: This,
     block: *mut AsyncBlock,
     _: usize,
@@ -223,10 +336,18 @@ extern "system" fn string_status(
 ) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
-extern "system" fn count_status(_: This, block: *mut AsyncBlock, _out: *mut u32) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `_out` is not written.
+unsafe extern "system" fn count_status(_: This, block: *mut AsyncBlock, _out: *mut u32) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
-extern "system" fn array_status(
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. The buffer is not written.
+unsafe extern "system" fn array_status(
     _: This,
     block: *mut AsyncBlock,
     _: u32,
@@ -235,7 +356,12 @@ extern "system" fn array_status(
     xasync::XAsyncGetStatus(block, false)
 }
 
-extern "system" fn purchase_ui_async(
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read. The strings
+/// are not read.
+unsafe extern "system" fn purchase_ui_async(
     _: This,
     _: Handle,
     _store_id: *const c_char,
@@ -243,17 +369,29 @@ extern "system" fn purchase_ui_async(
     _json: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    offline(block, "purchase page")
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "purchase page") }
 }
-extern "system" fn product_page_ui_async(
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read. `_store_id`
+/// is not read.
+unsafe extern "system" fn product_page_ui_async(
     _: This,
     _: Handle,
     _store_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    offline(block, "product page")
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "product page") }
 }
-extern "system" fn redeem_ui_async(
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read. The token
+/// and allowed lists are not read.
+unsafe extern "system" fn redeem_ui_async(
     _: This,
     _: Handle,
     _token: *const c_char,
@@ -262,25 +400,44 @@ extern "system" fn redeem_ui_async(
     _disallow_csv: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    offline(block, "redeem page")
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "redeem page") }
 }
-extern "system" fn updates_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
-    offline(block, "update check")
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn updates_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "update check") }
 }
 /// Installing updates or packages by id alike.
-extern "system" fn install_async(
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read. The id list
+/// is not read.
+unsafe extern "system" fn install_async(
     _: This,
     _: Handle,
     _ids: *const *const c_char,
     _count: usize,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    offline(block, "package download")
+    // SAFETY: `block` is as this function's contract gives it.
+    unsafe { offline(block, "package download") }
 }
 
 /// The game's own store id maps to its installation; nothing else is
 /// installed.
-extern "system" fn package_identifier(
+///
+/// # Safety
+///
+/// `store_id` is null or points to a NUL-terminated string valid for reads
+/// for the duration of the call. `buffer` is null or valid for writes of
+/// `size` bytes.
+unsafe extern "system" fn package_identifier(
     _: This,
     store_id: *const c_char,
     size: usize,
@@ -296,7 +453,11 @@ extern "system" fn package_identifier(
 }
 
 /// Licences never change offline, so these callbacks never run.
-extern "system" fn register(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe extern "system" fn register(
     _: This,
     _: Handle,
     _queue: *const c_void,
@@ -407,31 +568,43 @@ mod tests {
     fn the_game_is_licensed_and_the_store_is_offline() {
         let this: This = &OBJECT;
         assert_eq!(size_of::<GameLicense>(), 104);
-        type Begin = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
-        type Result = extern "system" fn(This, *mut AsyncBlock, *mut GameLicense) -> HRESULT;
+        type Begin = unsafe extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
+        type Result = unsafe extern "system" fn(This, *mut AsyncBlock, *mut GameLicense) -> HRESULT;
         let mut b = block();
-        assert_eq!(method::<Begin>(&OBJECT, 0xe0)(this, handle(&CONTEXT), &mut b), S_OK);
+        let begin = method::<Begin>(&OBJECT, 0xe0);
+        // SAFETY: `b` outlives the call, which completes before it is read.
+        assert_eq!(unsafe { begin(this, handle(&CONTEXT), &mut b) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         let mut license = std::mem::MaybeUninit::<GameLicense>::zeroed();
-        assert_eq!(method::<Result>(&OBJECT, 0xe8)(this, &mut b, license.as_mut_ptr()), S_OK);
+        let get = method::<Result>(&OBJECT, 0xe8);
+        // SAFETY: `b` is the block just started; `license` has room for one.
+        assert_eq!(unsafe { get(this, &mut b, license.as_mut_ptr()) }, S_OK);
         // SAFETY: written by the call.
         let license = unsafe { license.assume_init() };
         assert!(license.is_active && !license.is_trial);
 
         let mut b = block();
-        assert_eq!(method::<Begin>(&OBJECT, 0x1b8)(this, handle(&CONTEXT), &mut b), S_OK);
+        let updates = method::<Begin>(&OBJECT, 0x1b8);
+        // SAFETY: `b` outlives the call, which completes before it is read.
+        assert_eq!(unsafe { updates(this, handle(&CONTEXT), &mut b) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
-        type Count = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
-        assert_eq!(method::<Count>(&OBJECT, 0x1c0)(this, &mut b, &mut 0), NETWORK_ERROR);
+        type Count = unsafe extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        let count = method::<Count>(&OBJECT, 0x1c0);
+        // SAFETY: `b` is the block just started, the count a temporary.
+        assert_eq!(unsafe { count(this, &mut b, &mut 0) }, NETWORK_ERROR);
 
-        type Durable = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
-        type License = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type Durable =
+            unsafe extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type License = unsafe extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
         let mut b = block();
         let durable = method::<Durable>(&OBJECT, 0x238);
-        assert_eq!(durable(this, handle(&CONTEXT), c"9XYZ".as_ptr(), &mut b), S_OK);
+        // SAFETY: a NUL-terminated literal; `b` outlives the call.
+        assert_eq!(unsafe { durable(this, handle(&CONTEXT), c"9XYZ".as_ptr(), &mut b) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         let mut l = std::ptr::null();
-        assert_eq!(method::<License>(&OBJECT, 0x240)(this, &mut b, &mut l), S_OK);
+        let license_result = method::<License>(&OBJECT, 0x240);
+        // SAFETY: `b` is the block just started, `l` a local to write.
+        assert_eq!(unsafe { license_result(this, &mut b, &mut l) }, S_OK);
         assert!(!method::<extern "system" fn(This, Handle) -> bool>(&OBJECT, 0xb0)(this, l));
     }
 }

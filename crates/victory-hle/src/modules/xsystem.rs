@@ -1,10 +1,6 @@
 //! XSystem: the console's identity and sandbox, and how analytics describe
 //! the device. Fixed values: one offline retail console, the model the user
 //! chose ([`victory_gpu::console`]).
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
@@ -45,14 +41,46 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+/// The console id.
+///
+/// # Safety
+///
+/// `buffer` is null or valid for writes of `size` bytes, and `used` is null
+/// or valid for a write of a `usize`.
+unsafe extern "system" fn console_id(
+    _: This,
+    size: usize,
+    buffer: *mut u8,
+    used: *mut usize,
+) -> HRESULT {
     put_string(CONSOLE_ID, size, buffer, used)
 }
-extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+/// The sandbox id.
+///
+/// # Safety
+///
+/// `buffer` is null or valid for writes of `size` bytes, and `used` is null
+/// or valid for a write of a `usize`.
+unsafe extern "system" fn sandbox_id(
+    _: This,
+    size: usize,
+    buffer: *mut u8,
+    used: *mut usize,
+) -> HRESULT {
     put_string(SANDBOX, size, buffer, used)
 }
 /// The device id this title sees (titles see different ones).
-extern "system" fn device_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+///
+/// # Safety
+///
+/// `buffer` is null or valid for writes of `size` bytes, and `used` is null
+/// or valid for a write of a `usize`.
+unsafe extern "system" fn device_id(
+    _: This,
+    size: usize,
+    buffer: *mut u8,
+    used: *mut usize,
+) -> HRESULT {
     put_string(DEVICE_ID, size, buffer, used)
 }
 
@@ -84,14 +112,18 @@ fn text(s: &str) -> [u8; 64] {
 
 /// A struct this large comes back through the caller's buffer, whose
 /// address is also the return value.
-extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut AnalyticsInfo {
+///
+/// # Safety
+///
+/// `out` is valid for a write of an [`AnalyticsInfo`].
+unsafe extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut AnalyticsInfo {
     let info = AnalyticsInfo {
         os: OS,
         hosting_os: OS,
         family: text("Xbox"),
         form: text(victory_gpu::console::current().name()),
     };
-    // SAFETY: the caller passes room for the struct.
+    // SAFETY: `out` is writable, per this function's contract.
     unsafe { out.write(info) };
     out
 }
@@ -156,11 +188,17 @@ mod device_type {
         }
     }
 
-    fn is(text: *const u16, expected: &str) -> bool {
+    /// Whether `text` is `expected`, ignoring ASCII case.
+    ///
+    /// # Safety
+    ///
+    /// `text` is null or points to a NUL-terminated UTF-16 string valid for reads.
+    unsafe fn is(text: *const u16, expected: &str) -> bool {
         if text.is_null() {
             return false;
         }
-        // SAFETY: the title passes a NUL-terminated string.
+        // SAFETY: non-null, so a NUL-terminated string, per this function's
+        // contract.
         let text = unsafe {
             let len = (0..).take_while(|&i| *text.add(i) != 0).count();
             String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
@@ -170,12 +208,20 @@ mod device_type {
 
     /// Opens our key for its path; the key has no subkeys. `None`: not
     /// ours, ask the host.
-    fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
+    ///
+    /// # Safety
+    ///
+    /// `sub` is null or points to a NUL-terminated UTF-16 string valid for reads, and `out` is
+    /// null or valid for a write of a key handle.
+    unsafe fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
         if root == oem() {
             return Some(FILE_NOT_FOUND);
         }
-        if root == LOCAL_MACHINE && is(sub, KEY) && !out.is_null() {
-            // SAFETY: checked non-null; the title passes room for a key.
+        // SAFETY: `sub` is null or a NUL-terminated string, per this
+        // function's contract.
+        if root == LOCAL_MACHINE && unsafe { is(sub, KEY) } && !out.is_null() {
+            // SAFETY: checked non-null; writable, per this function's
+            // contract.
             unsafe { out.write(oem()) };
             return Some(SUCCESS);
         }
@@ -184,8 +230,16 @@ mod device_type {
 
     // Our titles import only these registry functions (and `RegOpenKeyExW`
     // below), so no other call can reach the host with our key.
-    pub extern "system" fn RegOpenKeyW(root: Key, sub: *const u16, out: *mut Key) -> u32 {
-        open(root, sub, out).unwrap_or_else(|| {
+    /// `RegOpenKeyW`.
+    ///
+    /// # Safety
+    ///
+    /// `sub` is null or points to a NUL-terminated UTF-16 string valid for reads, and `out` is
+    /// null or valid for a write of a key handle. A key that is not ours is handed to the
+    /// host with the same pointers, which need to be valid for it too.
+    pub unsafe extern "system" fn RegOpenKeyW(root: Key, sub: *const u16, out: *mut Key) -> u32 {
+        // SAFETY: the pointers are the ones this function's contract covers.
+        unsafe { open(root, sub, out) }.unwrap_or_else(|| {
             match try_host!("advapi32.dll", "RegOpenKeyW": extern "system" fn(Key, *const u16, *mut Key) -> u32) {
                 Some(f) => f(root, sub, out),
                 None => PROC_NOT_FOUND,
@@ -193,14 +247,22 @@ mod device_type {
         })
     }
 
-    pub extern "system" fn RegOpenKeyExW(
+    /// `RegOpenKeyExW`.
+    ///
+    /// # Safety
+    ///
+    /// `sub` is null or points to a NUL-terminated UTF-16 string valid for reads, and `out` is
+    /// null or valid for a write of a key handle. A key that is not ours is handed to the
+    /// host with the same pointers, which need to be valid for it too.
+    pub unsafe extern "system" fn RegOpenKeyExW(
         root: Key,
         sub: *const u16,
         options: u32,
         access: u32,
         out: *mut Key,
     ) -> u32 {
-        open(root, sub, out).unwrap_or_else(|| {
+        // SAFETY: the pointers are the ones this function's contract covers.
+        unsafe { open(root, sub, out) }.unwrap_or_else(|| {
             match try_host!("advapi32.dll", "RegOpenKeyExW": extern "system" fn(
                 Key, *const u16, u32, u32, *mut Key,
             ) -> u32)
@@ -211,7 +273,17 @@ mod device_type {
         })
     }
 
-    pub extern "system" fn RegQueryValueExW(
+    /// `RegQueryValueExW`.
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or points to a NUL-terminated UTF-16 string valid for reads. `reserved` is
+    /// null, as the API requires, and is only handed to the host. `kind` is
+    /// null or valid for a write of a `u32`, `size` is null or valid for a
+    /// read and a write of a `u32`, and `data` is null or valid for writes
+    /// of `*size` bytes. A key that is not ours is handed to the host with
+    /// the same pointers, which need to be valid for it too.
+    pub unsafe extern "system" fn RegQueryValueExW(
         key: Key,
         name: *const u16,
         reserved: *mut u32,
@@ -228,13 +300,16 @@ mod device_type {
                 None => PROC_NOT_FOUND,
             };
         }
-        if !is(name, VALUE) {
+        // SAFETY: `name` is null or a NUL-terminated string, per this
+        // function's contract.
+        if !unsafe { is(name, VALUE) } {
             return FILE_NOT_FOUND;
         }
         if !data.is_null() && size.is_null() {
             return INVALID_PARAMETER;
         }
-        // SAFETY: the title passes valid or null pointers, sized by `size`.
+        // SAFETY: each pointer is null (checked) or valid for what is done
+        // with it, sized by `size`, per this function's contract.
         unsafe {
             if !kind.is_null() {
                 kind.write(DWORD);
@@ -293,11 +368,23 @@ mod device_type {
             assert_eq!(console_mode(Console::SeriesS), 0x60);
             let mut key = std::ptr::null_mut();
             let path = w(&KEY.to_ascii_lowercase());
-            assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+            // SAFETY: `path` is a NUL-terminated local, `key` a local to write.
+            assert_eq!(unsafe { RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key) }, SUCCESS);
             let (mut kind, mut value, mut size) = (0, 0u32, 4);
             let name = w(VALUE);
             let query = |data: *mut u32, size: *mut u32, kind: *mut u32| {
-                RegQueryValueExW(key, name.as_ptr(), std::ptr::null_mut(), kind, data.cast(), size)
+                // SAFETY: `name` is a NUL-terminated local, and the callers
+                // pass locals for `data`, `size` and `kind`.
+                unsafe {
+                    RegQueryValueExW(
+                        key,
+                        name.as_ptr(),
+                        std::ptr::null_mut(),
+                        kind,
+                        data.cast(),
+                        size,
+                    )
+                }
             };
             assert_eq!(query(&mut value, &mut size, &mut kind), SUCCESS);
             assert_eq!((kind, size), (DWORD, 4));
@@ -306,22 +393,28 @@ mod device_type {
             assert_eq!(query(&mut value, &mut small, &mut kind), MORE_DATA);
             assert_eq!(small, 4);
             let other = w("Other");
-            assert_eq!(
+            // SAFETY: `other` is a NUL-terminated local; `kind` and `size`
+            // are locals.
+            let missing = unsafe {
                 RegQueryValueExW(
                     key,
                     other.as_ptr(),
                     std::ptr::null_mut(),
                     &mut kind,
                     std::ptr::null_mut(),
-                    &mut size
-                ),
-                FILE_NOT_FOUND
-            );
+                    &mut size,
+                )
+            };
+            assert_eq!(missing, FILE_NOT_FOUND);
             let mut sub = std::ptr::null_mut();
-            assert_eq!(RegOpenKeyExW(key, other.as_ptr(), 0, 1, &mut sub), FILE_NOT_FOUND);
+            // SAFETY: `other` is a NUL-terminated local, `sub` a local to write.
+            let nested = unsafe { RegOpenKeyExW(key, other.as_ptr(), 0, 1, &mut sub) };
+            assert_eq!(nested, FILE_NOT_FOUND);
             assert_eq!(RegCloseKey(key), SUCCESS);
             let mut again = std::ptr::null_mut();
-            assert_eq!(RegOpenKeyExW(LOCAL_MACHINE, path.as_ptr(), 0, 1, &mut again), SUCCESS);
+            // SAFETY: `path` is a NUL-terminated local, `again` a local to write.
+            let reopened = unsafe { RegOpenKeyExW(LOCAL_MACHINE, path.as_ptr(), 0, 1, &mut again) };
+            assert_eq!(reopened, SUCCESS);
             assert_eq!(again, oem());
         }
 
@@ -329,20 +422,22 @@ mod device_type {
         fn other_keys_reach_the_host() {
             let mut key = std::ptr::null_mut();
             let path = w(r"Software\Microsoft\Windows NT\CurrentVersion");
-            assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+            // SAFETY: `path` is a NUL-terminated local, `key` a local to write.
+            assert_eq!(unsafe { RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key) }, SUCCESS);
             assert_ne!(key, oem());
             let (mut size, name) = (0, w("ProductName"));
-            assert_eq!(
+            // SAFETY: `name` is a NUL-terminated local, `size` a local.
+            let queried = unsafe {
                 RegQueryValueExW(
                     key,
                     name.as_ptr(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size
-                ),
-                SUCCESS
-            );
+                    &mut size,
+                )
+            };
+            assert_eq!(queried, SUCCESS);
             assert!(size > 0);
             assert_eq!(RegCloseKey(key), SUCCESS);
         }
@@ -358,13 +453,14 @@ mod tests {
 
     #[test]
     fn identity_strings_fit_the_documented_sizes() {
-        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        type Get = unsafe extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
         let this: This = &OBJECT;
         let mut buffer = [0u8; 64];
         let mut used = 0;
         for (slot, size) in [(0x18, 39), (0x20, 16), (0x28, 45)] {
             let get = method::<Get>(&OBJECT, slot);
-            assert_eq!(get(this, size, buffer.as_mut_ptr(), &mut used), S_OK);
+            // SAFETY: `buffer` holds 64 bytes, at least `size`; `used` is a local.
+            assert_eq!(unsafe { get(this, size, buffer.as_mut_ptr(), &mut used) }, S_OK);
             assert!(used <= size && buffer[used - 1] == 0, "slot {slot:#x}");
         }
         assert_eq!(&buffer[..7], b"VkljdG9");
@@ -372,10 +468,11 @@ mod tests {
 
     #[test]
     fn analytics_info_comes_back_through_the_buffer() {
-        type Get = extern "system" fn(This, *mut AnalyticsInfo) -> *mut AnalyticsInfo;
+        type Get = unsafe extern "system" fn(This, *mut AnalyticsInfo) -> *mut AnalyticsInfo;
         let mut info = std::mem::MaybeUninit::<AnalyticsInfo>::uninit();
         let get = method::<Get>(&ANALYTICS_OBJECT, 0x18);
-        let back = get(&ANALYTICS_OBJECT, info.as_mut_ptr());
+        // SAFETY: `info` has room for an `AnalyticsInfo`.
+        let back = unsafe { get(&ANALYTICS_OBJECT, info.as_mut_ptr()) };
         assert_eq!(back, info.as_mut_ptr());
         // SAFETY: written by the call.
         let info = unsafe { info.assume_init() };
