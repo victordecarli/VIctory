@@ -3,6 +3,9 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::walk::Skip;
 
 /// Reason → occurrences and the first example.
 pub(super) type Reasons = BTreeMap<String, (usize, String)>;
@@ -12,6 +15,9 @@ pub(super) type Reasons = BTreeMap<String, (usize, String)>;
 pub(super) struct Tally {
     /// Files read whole.
     pub(super) files: usize,
+    /// Files above the size limit: not read, and not a failure, since a
+    /// game directory can hold archives that large.
+    pub(super) oversized: usize,
     pub(super) containers: usize,
     pub(super) duplicates: usize,
     pub(super) programs: usize,
@@ -87,6 +93,20 @@ impl Tally {
         note(&mut self.infra, lines, reason, example);
     }
 
+    /// Records a file the walk could not hand over: an oversized one is
+    /// counted and logged, anything else is an infrastructure failure.
+    pub(super) fn unread(&mut self, path: &Path, skip: Skip) {
+        match skip {
+            Skip::TooLarge => {
+                tracing::warn!(path = %path.display(), "file above the size limit skipped");
+                self.oversized += 1;
+            }
+            Skip::Unreadable(_) | Skip::Walk(_) => {
+                self.infra(skip.reason(), || path.display().to_string());
+            }
+        }
+    }
+
     /// Runs `body` on a tally of its own, merged only if it returns: a
     /// panic halfway would otherwise leave a program counted as translated
     /// but never structured, and the stages would stop adding up.
@@ -118,6 +138,7 @@ impl Tally {
         // Destructured in full so that a new field cannot be left out.
         let Tally {
             files,
+            oversized,
             containers,
             duplicates,
             programs,
@@ -162,6 +183,7 @@ impl Tally {
             lines,
         } = other;
         self.files += files;
+        self.oversized += oversized;
         self.containers += containers;
         self.duplicates += duplicates;
         self.programs += programs;
@@ -266,6 +288,23 @@ mod tests {
         t.infra("file: too large".into(), || "b".into());
         assert_eq!(t.failed, reasons(&[("unsupported: v_foo", 1, "a")]));
         assert_eq!(t.infra, reasons(&[("file: too large", 1, "b")]));
+    }
+
+    #[test]
+    fn an_oversized_file_is_counted_not_a_failure() {
+        let mut t = Tally::default();
+        t.unread(Path::new("big.pak"), Skip::TooLarge);
+        assert_eq!(t.oversized, 1);
+        assert!(t.infra.is_empty());
+        assert!(t.verdict().is_ok());
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_infrastructure_failure() {
+        let mut t = Tally::default();
+        t.unread(Path::new("a"), Skip::Unreadable(std::io::ErrorKind::NotFound));
+        assert_eq!(t.infra, reasons(&[("file: unreadable: NotFound", 1, "a")]));
+        assert!(t.verdict().is_err());
     }
 
     #[test]

@@ -102,7 +102,7 @@ pub fn run(
         let data = match data {
             Ok(data) => data,
             Err(skip) => {
-                lock(&total).infra(skip.reason(), || path.display().to_string());
+                lock(&total).unread(&path, skip);
                 continue;
             }
         };
@@ -124,7 +124,7 @@ pub fn run(
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     let verdict = t.verdict();
-    println!("files        {} read", t.files);
+    println!("files        {} read, {} above the size limit skipped", t.files, t.oversized);
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
