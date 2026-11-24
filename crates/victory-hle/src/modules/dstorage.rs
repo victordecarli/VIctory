@@ -117,15 +117,19 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
-    let handle = super::files::CreateFileW(
-        path,
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        std::ptr::null(),
-        OPEN_EXISTING,
-        0,
-        std::ptr::null_mut(),
-    );
+    // SAFETY: `path` is non-null (checked above) and the title's
+    // NUL-terminated path; the other pointers are null.
+    let handle = unsafe {
+        super::files::CreateFileW(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();

@@ -11,10 +11,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`XGSuggestSwizzleMode`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -74,13 +70,17 @@ fn suggested(desc: &ResourceDesc) -> Swizzle {
 
 /// `(desc, flags, out layout)`; the title passes flags 0 and puts the
 /// result in the description's layout field.
-pub extern "system" fn XGSuggestSwizzleMode(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a [`ResourceDesc`], and `out` is
+/// null or valid for a write of a `u32`, for the duration of the call.
+pub unsafe extern "system" fn XGSuggestSwizzleMode(
     desc: *const ResourceDesc,
     _flags: u32,
     out: *mut u32,
 ) -> HRESULT {
-    // SAFETY: the title passes a description and room for the layout
-    // (either may be null).
+    // SAFETY: each is null or valid, per this function's contract.
     match unsafe { (desc.as_ref(), out.as_mut()) } {
         (Some(desc), Some(out)) => {
             *out = SWIZZLED | suggested(desc).0;
@@ -101,16 +101,24 @@ pub struct Computer {
 
 type This = *mut Computer;
 
-fn computer<'a>(this: This) -> &'a Computer {
-    // SAFETY: called from computer methods only.
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made, and it stays
+/// alive for `'a`.
+unsafe fn computer<'a>(this: This) -> &'a Computer {
+    // SAFETY: `this` is a live computer, per this function's contract.
     unsafe { &*this }
 }
 
-pub extern "system" fn XGCreateTextureComputer(
+/// # Safety
+///
+/// `desc` is null or valid for reads of a [`ResourceDesc`] for the duration
+/// of the call, and `out` is null or valid for a write of a pointer.
+pub unsafe extern "system" fn XGCreateTextureComputer(
     desc: *const ResourceDesc,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description and room for a pointer.
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
         return E_INVALIDARG;
     };
@@ -129,7 +137,7 @@ pub extern "system" fn XGCreateTextureComputer(
     let mips = texture.planes[0].layout.mips.len() as u32;
     let computer =
         Box::new(Computer { vtable: &VTABLE, refs: AtomicU32::new(1), desc, mips, texture });
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(Box::into_raw(computer)) };
     S_OK
 }
@@ -275,12 +283,24 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
     out
 }
 
-extern "system" fn add_ref(this: This) -> u32 {
-    computer(this).refs.fetch_add(1, Ordering::Relaxed) + 1
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made.
+unsafe extern "system" fn add_ref(this: This) -> u32 {
+    // SAFETY: `this` is a live computer, per this function's contract.
+    let c = unsafe { computer(this) };
+    c.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-extern "system" fn release(this: This) -> u32 {
-    let left = computer(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made, holding the
+/// reference the caller gives up; it must not be used after the last one is
+/// released.
+unsafe extern "system" fn release(this: This) -> u32 {
+    // SAFETY: `this` is a live computer, per this function's contract.
+    let c = unsafe { computer(this) };
+    let left = c.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
         // SAFETY: made by `Box::into_raw` in `XGCreateTextureComputer`; the
         // last reference is gone.
@@ -289,13 +309,18 @@ extern "system" fn release(this: This) -> u32 {
     left
 }
 
-extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made. `out` is null
+/// or valid for a write of a [`LayoutOut`].
+unsafe extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
-    let c = computer(this);
-    // SAFETY: the title passes room for the layout; every field is plain
-    // data, so zeroes are a valid start.
+    // SAFETY: `this` is a live computer, per this function's contract.
+    let c = unsafe { computer(this) };
+    // SAFETY: checked non-null; writable, per this function's contract.
+    // Every field is plain data, so zeroes are a valid start.
     let out = unsafe {
         out.write_bytes(0, 1);
         &mut *out
@@ -366,7 +391,15 @@ fn result(r: Result<(), Error>) -> HRESULT {
 }
 
 /// `(tiled base, plane, subresource, linear, row pitch, depth pitch)`.
-extern "system" fn copy_into(
+///
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made. `tiled` is
+/// null or the base of the texture's tiled memory, valid for writes of the
+/// whole texture (its size from the layout), and `linear` is null or valid
+/// for reads of the rows the copy touches, laid out by the row and depth
+/// pitches given.
+unsafe extern "system" fn copy_into(
     this: This,
     tiled: *mut u8,
     plane: u32,
@@ -375,7 +408,8 @@ extern "system" fn copy_into(
     row: u32,
     depth: u32,
 ) -> HRESULT {
-    let c = computer(this);
+    // SAFETY: `this` is a live computer, per this function's contract.
+    let c = unsafe { computer(this) };
     let Some(a) = copy_args(c, plane, subresource, row, depth) else {
         return E_INVALIDARG;
     };
@@ -383,7 +417,8 @@ extern "system" fn copy_into(
         return E_INVALIDARG;
     }
     let offset = c.texture.planes[plane as usize].offset as usize;
-    // SAFETY: the title's memory holds the whole texture and its rows.
+    // SAFETY: both checked non-null; the whole texture and the rows,
+    // per this function's contract.
     let (tiled, linear) = unsafe {
         (
             std::slice::from_raw_parts_mut(tiled.add(offset), a.tiled - offset),
@@ -400,7 +435,14 @@ extern "system" fn copy_into(
 /// `(linear, plane, subresource, sample, tiled base, row pitch, depth
 /// pitch)`.
 #[allow(clippy::too_many_arguments, reason = "the signature is fixed by the API title code calls")]
-extern "system" fn copy_from(
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made. `linear` is
+/// null or valid for writes of the rows the copy touches, laid out by the
+/// row and depth pitches given, and `tiled` is null or the base of the
+/// texture's tiled memory, valid for reads of the whole texture (its size
+/// from the layout).
+unsafe extern "system" fn copy_from(
     this: This,
     linear: *mut u8,
     plane: u32,
@@ -410,7 +452,8 @@ extern "system" fn copy_from(
     row: u32,
     depth: u32,
 ) -> HRESULT {
-    let c = computer(this);
+    // SAFETY: `this` is a live computer, per this function's contract.
+    let c = unsafe { computer(this) };
     let Some(a) = copy_args(c, plane, subresource, row, depth) else {
         return E_INVALIDARG;
     };
@@ -418,7 +461,8 @@ extern "system" fn copy_from(
         return E_INVALIDARG;
     }
     let offset = c.texture.planes[plane as usize].offset as usize;
-    // SAFETY: the title's memory holds the whole texture and its rows.
+    // SAFETY: both checked non-null; the whole texture and the rows,
+    // per this function's contract.
     let (tiled, linear) = unsafe {
         (
             std::slice::from_raw_parts(tiled.add(offset), a.tiled - offset),
@@ -457,7 +501,14 @@ const TILE: u64 = 64 << 10;
 /// every slice in turn. With a tail the console's library lists two slices
 /// at most and zeroes all but the first; so do we (the title reads slice 0
 /// only).
-extern "system" fn tiling(
+///
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made. `tiles`,
+/// `packed`, `shape` and `count` are each null or valid for a write
+/// (`count` also for a read), and `out` is valid for writes of `*count`
+/// entries when `count` is non-null.
+unsafe extern "system" fn tiling(
     this: This,
     tiles: *mut u32,
     packed: *mut PackedMips,
@@ -466,7 +517,8 @@ extern "system" fn tiling(
     first: u32,
     out: *mut SubresourceTiling,
 ) -> HRESULT {
-    let c = computer(this);
+    // SAFETY: `this` is a live computer, per this function's contract.
+    let c = unsafe { computer(this) };
     let l = &c.texture.planes[0].layout;
     if l.alignment != TILE {
         return E_FAIL;
@@ -482,8 +534,8 @@ extern "system" fn tiling(
         _ => 0,
     };
     let block = l.desc.block;
-    // SAFETY: each output is null or room for its value; `out` has room
-    // for `*count` entries.
+    // SAFETY: each output is null or writable, and `out` has room for
+    // `*count` entries, per this function's contract.
     unsafe {
         if let Some(t) = tiles.as_mut() {
             *t = (l.size / TILE) as u32;
@@ -527,7 +579,12 @@ extern "system" fn tiling(
 /// element's byte offset from the texture's start. Grand Theft Auto VI reads
 /// texels of a 128x4 `4KB_S` texture on the CPU through it (title+0x5151c90);
 /// an error returned as an offset made it read wild memory. 0 if outside.
-extern "system" fn element_offset(
+///
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made. `bit` is null
+/// or valid for a write of a `u32`.
+unsafe extern "system" fn element_offset(
     this: This,
     plane: u32,
     mip: u32,
@@ -538,10 +595,11 @@ extern "system" fn element_offset(
     bit: *mut u32,
 ) -> u64 {
     if !bit.is_null() {
-        // SAFETY: the caller passes room for the bit position or null.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { bit.write(0) };
     }
-    let Some(p) = computer(this).texture.planes.get(plane as usize) else {
+    // SAFETY: `this` is a live computer, per this function's contract.
+    let Some(p) = unsafe { computer(this) }.texture.planes.get(plane as usize) else {
         return 0;
     };
     let x = u32::try_from(x).unwrap_or(u32::MAX);
@@ -556,8 +614,14 @@ extern "system" fn element_offset(
 
 /// Slots the title does not call: size, alignment, offsets, coordinates,
 /// view descriptor, tiled-resource query.
-extern "system" fn unused(this: This) -> HRESULT {
-    tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
+///
+/// # Safety
+///
+/// `this` is a live computer `XGCreateTextureComputer` made.
+unsafe extern "system" fn unused(this: This) -> HRESULT {
+    // SAFETY: `this` is a live computer, per this function's contract.
+    let desc = unsafe { computer(this) }.desc;
+    tracing::warn!(?desc, "unimplemented texture computer method");
     E_NOTIMPL
 }
 
@@ -616,36 +680,51 @@ mod tests {
         unsafe { std::mem::transmute_copy(&(*c).vtable.0[index]) }
     }
 
+    fn try_create(d: &ResourceDesc, c: &mut This) -> HRESULT {
+        // SAFETY: valid references for both pointers.
+        unsafe { XGCreateTextureComputer(d, c) }
+    }
+
     fn create(d: &ResourceDesc) -> This {
         let mut c = std::ptr::null_mut();
-        assert_eq!(XGCreateTextureComputer(d, &mut c), S_OK);
+        assert_eq!(try_create(d, &mut c), S_OK);
         c
+    }
+
+    fn suggest(d: &ResourceDesc, out: &mut u32) -> HRESULT {
+        // SAFETY: valid references for both pointers.
+        unsafe { XGSuggestSwizzleMode(d, 0, out) }
     }
 
     /// Element offsets: linear rows of 1 KiB (128 elements), 0 outside.
     #[test]
     fn element_offsets_follow_the_layout() {
-        type Offset = extern "system" fn(This, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
+        type Offset =
+            unsafe extern "system" fn(This, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
         let c = create(&desc(128, 4, 1, 11, 0x100));
         let offset: Offset = slot(c, 6);
         let mut bit = 7;
-        assert_eq!(offset(c, 0, 0, 3, 1, 0, 0, &mut bit), (128 + 3) * 8);
+        // SAFETY: `c` is live and `bit` a local to write.
+        assert_eq!(unsafe { offset(c, 0, 0, 3, 1, 0, 0, &mut bit) }, (128 + 3) * 8);
         assert_eq!(bit, 0);
-        assert_eq!(offset(c, 0, 0, 128, 0, 0, 0, std::ptr::null_mut()), 0);
-        slot::<extern "system" fn(This) -> u32>(c, 1)(c);
+        // SAFETY: as above; a null bit position is tolerated.
+        assert_eq!(unsafe { offset(c, 0, 0, 128, 0, 0, 0, std::ptr::null_mut()) }, 0);
+        let release = slot::<unsafe extern "system" fn(This) -> u32>(c, 1);
+        // SAFETY: `c` is live; this releases its only reference.
+        unsafe { release(c) };
     }
 
     #[test]
     fn suggestions_follow_the_use() {
         let mut out = 0;
         let mut d = desc(256, 256, 1, 98, 0);
-        assert_eq!(XGSuggestSwizzleMode(&d, 0, &mut out), S_OK);
+        assert_eq!(suggest(&d, &mut out), S_OK);
         assert_eq!(out, 0x105);
         d.flags = ALLOW_RENDER_TARGET;
-        XGSuggestSwizzleMode(&d, 0, &mut out);
+        suggest(&d, &mut out);
         assert_eq!(out, 0x11b);
         d.flags = ALLOW_DEPTH_STENCIL;
-        XGSuggestSwizzleMode(&d, 0, &mut out);
+        suggest(&d, &mut out);
         assert_eq!(out, 0x118);
     }
 
@@ -656,30 +735,37 @@ mod tests {
         let c = create(&desc(256, 256, 0, 98, 0x10a));
         // SAFETY: plain data, filled by the call.
         let mut l: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
-        let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
-        assert_eq!(get(c, &mut *l), S_OK);
+        let get: unsafe extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
+        // SAFETY: `c` is live and `l` has room for a layout.
+        assert_eq!(unsafe { get(c, &mut *l) }, S_OK);
         assert_eq!((l.size, l.alignment, l.mips, l.planes), (131072, 65536, 9, 1));
         let p = &l.plane[0];
         assert_eq!((p.standard_mips, p.tail_mips, p.element_bytes), (1, 8, 16));
         assert_eq!((p.mips[0].offset, p.mips[0].pitch_bytes), (65536, 1024));
         assert_eq!((p.mips[1].offset, p.mips[1].in_tail), (32768, 1));
 
-        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type Into =
+            unsafe extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
         type From =
-            extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+            unsafe extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
         let (into, from): (Into, From) = (slot(c, 8), slot(c, 9));
         let mut tiled = vec![0u8; l.size as usize];
         for mip in 0..9u32 {
             let m = &p.mips[mip as usize];
             let row = m.elements[0] * 16;
             let rows: Vec<u8> = (0..row * m.elements[1]).map(|i| (i ^ mip) as u8).collect();
-            assert_eq!(into(c, tiled.as_mut_ptr(), 0, mip, rows.as_ptr(), row, 0), S_OK);
+            // SAFETY: `tiled` holds the whole texture and `rows` the mip's
+            // rows, at the pitch given.
+            let copied = unsafe { into(c, tiled.as_mut_ptr(), 0, mip, rows.as_ptr(), row, 0) };
+            assert_eq!(copied, S_OK);
             let mut back = vec![0u8; rows.len()];
-            assert_eq!(from(c, back.as_mut_ptr(), 0, mip, 0, tiled.as_ptr(), row, 0), S_OK);
+            // SAFETY: as above, `back` having room for the same rows.
+            let read = unsafe { from(c, back.as_mut_ptr(), 0, mip, 0, tiled.as_ptr(), row, 0) };
+            assert_eq!(read, S_OK);
             assert_eq!(back, rows, "mip {mip}");
         }
         // 0x50: one tile for the tail, one for mip 0.
-        type Tiling = extern "system" fn(
+        type Tiling = unsafe extern "system" fn(
             This,
             *mut u32,
             *mut PackedMips,
@@ -693,31 +779,35 @@ mod tests {
         let mut packed = PackedMips { standard: 0, packed: 0, tiles: 0, start: 0 };
         let mut subs: Vec<SubresourceTiling> =
             (0..4).map(|_| SubresourceTiling { width: 0, height: 0, depth: 0, start: 0 }).collect();
-        assert_eq!(
-            tiling(c, &mut tiles, &mut packed, &mut shape, &mut n, 0, subs.as_mut_ptr()),
-            S_OK
-        );
+        // SAFETY: `c` is live; locals for every output, and `subs` holds the
+        // 4 entries `n` allows.
+        let listed =
+            unsafe { tiling(c, &mut tiles, &mut packed, &mut shape, &mut n, 0, subs.as_mut_ptr()) };
+        assert_eq!(listed, S_OK);
         assert_eq!((tiles, packed.standard, packed.packed, packed.tiles), (2, 1, 8, 1));
         assert_eq!((shape, n, subs[0].start), ([256, 256, 1], 1, 1));
-        assert_eq!(release(c), 0);
+        // SAFETY: `c` is live; this releases its only reference.
+        assert_eq!(unsafe { release(c) }, 0);
 
         // 4 KiB modes have no 64 KiB tiling.
         let null = std::ptr::null_mut::<u8>();
         let c = create(&desc(256, 256, 0, 98, 0x105));
-        assert_eq!(
-            tiling(c, &mut tiles, null.cast(), null.cast(), null.cast(), 0, null.cast()),
-            E_FAIL
-        );
-        assert_eq!(release(c), 0);
+        // SAFETY: `c` is live; null outputs are tolerated and `tiles` is a
+        // local.
+        let refused =
+            unsafe { tiling(c, &mut tiles, null.cast(), null.cast(), null.cast(), 0, null.cast()) };
+        assert_eq!(refused, E_FAIL);
+        // SAFETY: `c` is live; this releases its only reference.
+        assert_eq!(unsafe { release(c) }, 0);
     }
 
     #[test]
     fn bad_descriptions_fail() {
         let mut c = std::ptr::null_mut();
         let bad = desc(256, 256, 1, 0, 0x10a);
-        assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
+        assert_eq!(try_create(&bad, &mut c), E_INVALIDARG);
         let bad = desc(256, 256, 1, 28, 0x103);
-        assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
+        assert_eq!(try_create(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
     }
 }
