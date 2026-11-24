@@ -2,10 +2,6 @@
 //! privilege. Served as the user provider's objects from `QueryApiImpl`;
 //! adding a user completes through `xasync` like any other async call. No
 //! input device is associated with the user (there are none, `gameinput`).
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{c_char, c_void};
 
@@ -62,7 +58,12 @@ fn user() -> Handle {
     &USER
 }
 
-fn found(found: bool, out: *mut Handle) -> HRESULT {
+/// `out` gets the user if `found`.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a user handle.
+unsafe fn found(found: bool, out: *mut Handle) -> HRESULT {
     if found { put(out, user()) } else { USER_NOT_FOUND }
 }
 
@@ -80,7 +81,12 @@ pub const INTERFACES: &[Interface] = &[
 ];
 
 type This = *const Object;
-extern "system" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
+/// Duplicates a user handle.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a user handle.
+unsafe extern "system" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
     put(out, user())
 }
 extern "system" fn close(_: This, _: Handle) {}
@@ -107,7 +113,12 @@ extern "system" fn add_provider(op: u32, data: *const ProviderData) -> HRESULT {
 static ADD: u8 = 0;
 
 /// Any options add the one user, silently.
-extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> HRESULT {
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> HRESULT {
     tracing::info!(options, "XUserAddAsync: the offline local user");
     xasync::XAsyncBegin(
         block,
@@ -117,7 +128,14 @@ extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> H
         Some(add_provider),
     )
 }
-extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+/// The user added by [`add_async`].
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a user
+/// handle.
+unsafe extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
     xasync::XAsyncGetResult(
         block,
         (&raw const ADD).cast(),
@@ -126,29 +144,55 @@ extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle)
         std::ptr::null_mut(),
     )
 }
-extern "system" fn get_local_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe extern "system" fn get_local_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
     put(out, LOCAL_ID)
 }
-extern "system" fn find_by_local_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
-    found(id == LOCAL_ID, out)
+/// # Safety
+///
+/// `out` is null or valid for a write of a user handle.
+unsafe extern "system" fn find_by_local_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
+    // SAFETY: `out` is null or writable, per this function's contract.
+    unsafe { found(id == LOCAL_ID, out) }
 }
-extern "system" fn get_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe extern "system" fn get_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
     put(out, XUID)
 }
-extern "system" fn find_by_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
-    found(id == XUID, out)
+/// # Safety
+///
+/// `out` is null or valid for a write of a user handle.
+unsafe extern "system" fn find_by_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
+    // SAFETY: `out` is null or writable, per this function's contract.
+    unsafe { found(id == XUID, out) }
 }
-extern "system" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a `bool`.
+unsafe extern "system" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HRESULT {
     put(out, false)
 }
 /// 0: signed in.
-extern "system" fn get_state(_: This, _: Handle, out: *mut u32) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u32`.
+unsafe extern "system" fn get_state(_: This, _: Handle, out: *mut u32) -> HRESULT {
     put(out, 0)
 }
 /// The user's gamertag as the component asked for (`XUserGamertagComponent`):
 /// it has no suffix, so the modern suffix is empty and every other component
 /// (classic, modern, unique modern) is the name itself.
-extern "system" fn get_gamertag(
+///
+/// # Safety
+///
+/// `buffer` is null or valid for writes of `size` bytes, and `used` is null
+/// or valid for a write of a `usize`.
+unsafe extern "system" fn get_gamertag(
     _: This,
     _: Handle,
     component: u32,
@@ -164,7 +208,12 @@ extern "system" fn get_gamertag(
     put_string(text, size, buffer, used)
 }
 /// Granted; deny reason 0 (none).
-extern "system" fn check_privilege(
+///
+/// # Safety
+///
+/// `has` is null or valid for a write of a `bool`, and `reason` is null or
+/// valid for a write of a `u32`.
+unsafe extern "system" fn check_privilege(
     _: This,
     _: Handle,
     _options: u32,
@@ -173,14 +222,18 @@ extern "system" fn check_privilege(
     reason: *mut u32,
 ) -> HRESULT {
     if !reason.is_null() {
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { reason.write(0) };
     }
     put(has, true)
 }
 
 /// 3: adult.
-extern "system" fn get_age_group(_: This, _: Handle, out: *mut u32) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u32`.
+unsafe extern "system" fn get_age_group(_: This, _: Handle, out: *mut u32) -> HRESULT {
     put(out, 3)
 }
 
@@ -188,7 +241,12 @@ static RESOLVE: u8 = 0;
 static TOKEN: u8 = 0;
 
 /// Every privilege is granted, so there is nothing to resolve.
-extern "system" fn resolve_privilege_async(
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn resolve_privilege_async(
     _: This,
     _: Handle,
     _options: u32,
@@ -197,7 +255,13 @@ extern "system" fn resolve_privilege_async(
 ) -> HRESULT {
     xasync::finished(block, (&raw const RESOLVE).cast(), S_OK)
 }
-extern "system" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+/// The result of [`resolve_privilege_async`].
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes.
+unsafe extern "system" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const RESOLVE).cast(), 0, none, none.cast())
 }
@@ -206,7 +270,15 @@ extern "system" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> 
 pub const FAILED_TO_GET_TOKEN: HRESULT = 0x8924_5111_u32 as i32;
 
 #[allow(clippy::too_many_arguments, reason = "the signature is fixed by the API title code calls")]
-extern "system" fn token_async(
+/// Gets a token and signature for a request: offline, never.
+///
+/// # Safety
+///
+/// `url` is null or points to a NUL-terminated string valid for reads for
+/// the duration of the call. `block` is null or an async block valid for
+/// reads and writes until the call this starts has completed and its result
+/// has been read. The method, headers and body are not read.
+unsafe extern "system" fn token_async(
     _: This,
     _: Handle,
     _options: u32,
@@ -221,10 +293,24 @@ extern "system" fn token_async(
     tracing::info!(url = text(url).unwrap_or_default(), "token and signature: offline");
     xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN)
 }
-extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
+/// The size of the token result.
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a
+/// `usize`.
+unsafe extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     xasync::XAsyncGetResultSize(block, out)
 }
-extern "system" fn token_result(
+/// The token result.
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `buffer` is null or valid for writes of
+/// `size` bytes, and `used` is null or valid for a write of a `usize`.
+unsafe extern "system" fn token_result(
     _: This,
     block: *mut AsyncBlock,
     size: usize,
@@ -237,7 +323,11 @@ extern "system" fn token_result(
 
 /// The user never changes and no device is ever associated, so these
 /// callbacks are never called.
-extern "system" fn register(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe extern "system" fn register(
     _: This,
     _queue: *const c_void,
     _context: *mut c_void,
@@ -320,7 +410,7 @@ mod tests {
     #[test]
     fn a_gamertag_without_a_suffix_has_an_empty_modern_suffix() {
         type Gamertag =
-            extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
+            unsafe extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
         let this: This = &OBJECT;
         let user = std::ptr::null();
         // Classic, modern, modern suffix, unique modern; through both slots.
@@ -329,7 +419,8 @@ mod tests {
             let get = slot::<Gamertag>(object, at);
             for (component, expected) in (0..).zip(expected) {
                 let (mut name, mut used) = ([0xff_u8; 16], 0);
-                let hr = get(this, user, component, 16, name.as_mut_ptr(), &mut used);
+                // SAFETY: `name` holds 16 bytes, `used` is a local to write.
+                let hr = unsafe { get(this, user, component, 16, name.as_mut_ptr(), &mut used) };
                 assert_eq!(hr, S_OK);
                 assert_eq!(&name[..used], expected, "component {component}");
             }
@@ -338,11 +429,11 @@ mod tests {
 
     #[test]
     fn startup_adds_the_user_and_reads_its_id() {
-        type Add = extern "system" fn(This, u32, *mut AsyncBlock) -> HRESULT;
-        type AddResult = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
-        type GetId = extern "system" fn(This, Handle, *mut u64) -> HRESULT;
+        type Add = unsafe extern "system" fn(This, u32, *mut AsyncBlock) -> HRESULT;
+        type AddResult = unsafe extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type GetId = unsafe extern "system" fn(This, Handle, *mut u64) -> HRESULT;
         type Gamertag =
-            extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
+            unsafe extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
         let this: This = &OBJECT;
         let mut block = AsyncBlock {
             queue: std::ptr::null(),
@@ -350,27 +441,35 @@ mod tests {
             callback: None,
             internal: [0; 4],
         };
-        assert_eq!(slot::<Add>(&OBJECT, 0x38)(this, 1, &mut block), S_OK);
+        // SAFETY: `block` outlives the call, which completes before it is read.
+        assert_eq!(unsafe { slot::<Add>(&OBJECT, 0x38)(this, 1, &mut block) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), S_OK);
         let mut handle = std::ptr::null();
-        assert_eq!(slot::<AddResult>(&OBJECT, 0x40)(this, &mut block, &mut handle), S_OK);
+        let add_result = slot::<AddResult>(&OBJECT, 0x40);
+        // SAFETY: `block` is the block just started, `handle` a local to write.
+        assert_eq!(unsafe { add_result(this, &mut block, &mut handle) }, S_OK);
         assert!(!handle.is_null());
         let mut xuid = 0;
-        assert_eq!(slot::<GetId>(&OBJECT, 0x58)(this, handle, &mut xuid), S_OK);
+        // SAFETY: `xuid` is a local to write.
+        assert_eq!(unsafe { slot::<GetId>(&OBJECT, 0x58)(this, handle, &mut xuid) }, S_OK);
         assert_eq!(xuid, XUID);
 
         let mut name = [0u8; 16];
         let mut used = 0;
         let get = slot::<Gamertag>(&GAMERTAG_OBJECT, 0x18);
-        assert_eq!(get(this, handle, 0, 16, name.as_mut_ptr(), &mut used), S_OK);
+        // SAFETY: `name` holds 16 bytes (at least `size`), `used` is a local.
+        assert_eq!(unsafe { get(this, handle, 0, 16, name.as_mut_ptr(), &mut used) }, S_OK);
         assert_eq!(&name[..used], b"Player\0");
-        assert_eq!(get(this, handle, 0, 2, name.as_mut_ptr(), &mut used), E_NOT_SUFFICIENT_BUFFER);
+        // SAFETY: as above, with a smaller size.
+        let small = unsafe { get(this, handle, 0, 2, name.as_mut_ptr(), &mut used) };
+        assert_eq!(small, E_NOT_SUFFICIENT_BUFFER);
 
-        type Age = extern "system" fn(This, Handle, *mut u32) -> HRESULT;
+        type Age = unsafe extern "system" fn(This, Handle, *mut u32) -> HRESULT;
         let mut age = 0;
-        assert_eq!(slot::<Age>(&OBJECT, 0x98)(this, handle, &mut age), S_OK);
+        // SAFETY: `age` is a local to write.
+        assert_eq!(unsafe { slot::<Age>(&OBJECT, 0x98)(this, handle, &mut age) }, S_OK);
         assert_eq!(age, 3, "adult");
-        type Token = extern "system" fn(
+        type Token = unsafe extern "system" fn(
             This,
             Handle,
             u32,
@@ -384,10 +483,12 @@ mod tests {
         ) -> HRESULT;
         let (null, url) = (std::ptr::null(), c"https://example.invalid/");
         let token = slot::<Token>(&OBJECT, 0xb8);
-        assert_eq!(
-            token(this, handle, 0, c"GET".as_ptr(), url.as_ptr(), 0, null, 0, null, &mut block),
-            S_OK
-        );
+        // SAFETY: NUL-terminated literals and null for the rest; `block`
+        // outlives the call.
+        let begun = unsafe {
+            token(this, handle, 0, c"GET".as_ptr(), url.as_ptr(), 0, null, 0, null, &mut block)
+        };
+        assert_eq!(begun, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), FAILED_TO_GET_TOKEN);
     }
 }
