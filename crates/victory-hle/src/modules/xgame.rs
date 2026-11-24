@@ -1,10 +1,6 @@
 //! The title's own id (from its manifest), which runtime areas exist, and
 //! game invites and events. Offline no invite arrives and events go
 //! nowhere.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{CStr, c_char, c_void};
 
@@ -120,7 +116,12 @@ extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
 }
 
 /// Accepted and dropped; the name goes to the debug log.
-extern "system" fn write_event(
+///
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated string valid for reads for
+/// the duration of the call, as the event writer requires.
+unsafe extern "system" fn write_event(
     _: This,
     _user: *const c_void,
     _service_config: *const c_char,
@@ -130,7 +131,8 @@ extern "system" fn write_event(
     _measurements: *const c_char,
 ) -> HRESULT {
     if !name.is_null() {
-        // SAFETY: a non-null name is a NUL-terminated string.
+        // SAFETY: non-null, so a NUL-terminated string, per this
+        // function's contract.
         let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
         tracing::debug!(%name, "game event dropped");
     }
