@@ -37,7 +37,12 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
+/// The title id from the manifest.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u32`.
+unsafe extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
     put(out, runtime::title().id)
 }
 
@@ -47,7 +52,12 @@ extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
 /// arguments from its configuration. The new `victory run` gets the same
 /// options, the new executable, and the title's arguments after `--`
 /// (the title reads the whole command line).
-extern "system" fn launch_new_game(
+///
+/// # Safety
+///
+/// `exe` and `args` are each null or point to a NUL-terminated string
+/// valid for reads for the duration of the call.
+unsafe extern "system" fn launch_new_game(
     _: This,
     exe: *const c_char,
     args: *const c_char,
@@ -102,7 +112,11 @@ extern "system" fn is_feature_available(_: This, feature: u32) -> bool {
 }
 
 /// Nothing raises these events offline, so the callback never runs.
-extern "system" fn register(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe extern "system" fn register(
     _: This,
     _queue: *const c_void,
     _context: *mut c_void,
@@ -197,7 +211,7 @@ mod tests {
         assert!(check(&FEATURES_OBJECT, 18), "users");
         assert!(!check(&FEATURES_OBJECT, 21), "game streaming");
 
-        type Register = extern "system" fn(
+        type Register = unsafe extern "system" fn(
             This,
             *const c_void,
             *mut c_void,
@@ -208,7 +222,8 @@ mod tests {
         let null = std::ptr::null();
         let mut token = 0;
         let register = method::<Register>(&INVITES_OBJECT, 0x18);
-        assert_eq!(register(&INVITES_OBJECT, null, null as _, null, &mut token), S_OK);
+        // SAFETY: `token` is a local to write; the other pointers are unused.
+        assert_eq!(unsafe { register(&INVITES_OBJECT, null, null as _, null, &mut token) }, S_OK);
         assert_ne!(token, 0);
         assert!(method::<Unregister>(&INVITES_OBJECT, 0x20)(&INVITES_OBJECT, token, true));
     }
