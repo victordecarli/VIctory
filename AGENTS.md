@@ -11,6 +11,10 @@ rules below are the filter, so they are strict on purpose.
 
 ## Project map
 
+Before changing `crates/victory-shader/`, `crates/victory-gpu/` or
+`crates/victory-hle/`, read that crate's `AGENTS.md`: how its code is laid
+out and the gotchas local to it. This file still applies there.
+
 | Crate | Owns | Must not contain | Builds off Windows |
 |-------|------|------------------|--------------------|
 | `victory-core` | config, `ensure_outside_repo`, logging setup | title-specific logic | yes |
