@@ -45,7 +45,12 @@ fn folder() -> Option<String> {
     None
 }
 
-extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
+/// The size of the storage path, with its NUL.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `usize`.
+unsafe extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
     match folder() {
         Some(path) => put(out, path.len() + 1),
         None => NOT_SUPPORTED,
@@ -54,7 +59,12 @@ extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
 
 /// A buffer too small for the path fails with `E_FAIL`, the documented
 /// Xbox result (a PC gets `ERROR_INSUFFICIENT_BUFFER`).
-extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+///
+/// # Safety
+///
+/// `buffer` is null or valid for writes of `size` bytes, and `used` is null
+/// or valid for a write of a `usize`.
+unsafe extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     match folder() {
         Some(path) if size <= path.len() => E_FAIL,
         Some(path) => put_string(&path, size, buffer, used),
@@ -126,7 +136,12 @@ fn space() -> SpaceInfo {
     }
 }
 
-extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
+/// The quota and what is used of it.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a [`SpaceInfo`].
+unsafe extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
     put(out, space())
 }
 
@@ -134,12 +149,23 @@ extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
 static PROMPT: u8 = 0;
 
 /// There is nobody to ask: granted when the quota has room, else declined.
-extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
     let hr = if bytes <= space().total_free { S_OK } else { E_ABORT };
     xasync::finished(block, (&raw const PROMPT).cast(), hr)
 }
 
-extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+/// The answer from [`prompt_for_space`].
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes.
+unsafe extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast())
 }
@@ -162,11 +188,11 @@ mod tests {
 
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
-        type Size = extern "system" fn(This, *mut usize) -> HRESULT;
-        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
-        type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
-        type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
-        type Result = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type Size = unsafe extern "system" fn(This, *mut usize) -> HRESULT;
+        type Get = unsafe extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        type Space = unsafe extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
+        type Prompt = unsafe extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
+        type Result = unsafe extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
         let this: This = &OBJECT;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
@@ -179,12 +205,15 @@ mod tests {
 
         // The path is a drive root, never the host folder.
         let mut size = 0;
-        assert_eq!(method::<Size>(&OBJECT, 0x18)(this, &mut size), S_OK);
+        // SAFETY: `size` is a local to write.
+        assert_eq!(unsafe { method::<Size>(&OBJECT, 0x18)(this, &mut size) }, S_OK);
         assert_eq!(size, 4, "X:\\ and its NUL");
         let (mut buffer, mut used) = ([0u8; 4], 0);
         let get = method::<Get>(&OBJECT, 0x20);
-        assert_eq!(get(this, 4, buffer.as_mut_ptr(), &mut used), S_OK);
-        assert_eq!(get(this, 3, buffer.as_mut_ptr(), &mut used), E_FAIL);
+        // SAFETY: `buffer` holds 4 bytes, `used` is a local to write.
+        assert_eq!(unsafe { get(this, 4, buffer.as_mut_ptr(), &mut used) }, S_OK);
+        // SAFETY: as above, with a smaller size.
+        assert_eq!(unsafe { get(this, 3, buffer.as_mut_ptr(), &mut used) }, E_FAIL);
         let drive = std::str::from_utf8(&buffer[..3]).unwrap();
         assert!(drive.ends_with(":\\"), "{drive}");
         // Title file calls on it reach the folder.
@@ -195,7 +224,8 @@ mod tests {
         assert_ne!(get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()), 0);
 
         let mut info = SpaceInfo { available_free: 0, total_free: 0, used: 0, total: 0 };
-        assert_eq!(method::<Space>(&OBJECT, 0x28)(this, &mut info), S_OK);
+        // SAFETY: `info` is a local to write.
+        assert_eq!(unsafe { method::<Space>(&OBJECT, 0x28)(this, &mut info) }, S_OK);
         assert_eq!((info.used, info.total_free, info.total), (100, 900, 1000));
 
         let prompt = method::<Prompt>(&OBJECT, 0x30);
@@ -207,9 +237,11 @@ mod tests {
                 callback: None,
                 internal: [0; 4],
             };
-            assert_eq!(prompt(this, bytes, &mut block), S_OK);
+            // SAFETY: `block` outlives the call, which completes before it is read.
+            assert_eq!(unsafe { prompt(this, bytes, &mut block) }, S_OK);
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
-            assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
+            // SAFETY: `block` is the block just started.
+            assert_eq!(unsafe { result(this, &mut block) }, expect, "{bytes} bytes");
         }
     }
 }
