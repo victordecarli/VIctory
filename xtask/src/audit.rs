@@ -15,6 +15,7 @@
 //! contract with whatever reads it. Raise [`SCHEMA`] when a field changes
 //! meaning or goes away.
 
+mod grade;
 mod lints;
 mod text;
 
@@ -22,9 +23,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 
+use self::grade::Indices;
 use self::lints::LintCounts;
 use self::text::TextCounts;
 use crate::citations;
@@ -101,6 +103,16 @@ pub struct CrateReport {
     pub text: TextLayer,
     /// The lint layer, or `null` without `--lints`.
     pub lints: Option<LintCounts>,
+    /// Risk levels computed from the layers above by the rules in
+    /// xtask/src/audit/grade.rs, each with its reasons.
+    pub indices: Indices,
+}
+
+/// A crate's text layer, before the lint layer and the grading.
+struct Scanned {
+    name: String,
+    root: String,
+    text: TextLayer,
 }
 
 /// What the text layer measured for one crate.
@@ -158,7 +170,7 @@ fn measure(root: &Path, with_lints: bool) -> Result<Report> {
     let commit = git(root, &["rev-parse", "HEAD"])?.trim().to_owned();
     let commit_date = git(root, &["show", "-s", "--format=%cI", "HEAD"])?.trim().to_owned();
     let dirty = !git(root, &["status", "--porcelain", "--untracked-files=no"])?.trim().is_empty();
-    let (mut crates, mut repo) = scan_files(root)?;
+    let (scanned, mut repo) = scan_files(root)?;
     let (citations_checked, citation_problems) =
         citations::find_problems(root, &citations::CONTRACT_DOCS.map(String::from))?;
     repo.citations_checked = citations_checked;
@@ -166,16 +178,22 @@ fn measure(root: &Path, with_lints: bool) -> Result<Report> {
 
     let mut layers = vec!["text"];
     let mut unattributed = None;
+    let mut by_crate = None;
     if with_lints {
         layers.push("lints");
         let tally = lints::run(root)?;
         unattributed = Some(tally.unattributed);
-        let mut by_crate = tally.crates;
-        for krate in &mut crates {
-            krate.lints = Some(by_crate.remove(&krate.name).unwrap_or_default());
-        }
-        // Every finding's crate comes from a tracked file, so none is left.
-        ensure!(by_crate.is_empty(), "lint findings in untracked crates: {:?}", by_crate.keys());
+        by_crate = Some(tally.crates);
+    }
+    let mut crates = Vec::new();
+    for Scanned { name, root, text } in scanned {
+        let lints = by_crate.as_mut().map(|c| c.remove(&name).unwrap_or_default());
+        let indices = grade::grade(&text, lints.as_ref(), &repo);
+        crates.push(CrateReport { name, root, text, lints, indices });
+    }
+    // Every finding's crate comes from a tracked file, so none is left.
+    if let Some(left) = by_crate.filter(|c| !c.is_empty()) {
+        bail!("lint findings in crates with no tracked file: {:?}", left.keys());
     }
     let totals = totals(&crates, unattributed);
     Ok(Report { schema: SCHEMA, commit, commit_date, dirty, layers, repo, crates, totals })
@@ -183,9 +201,9 @@ fn measure(root: &Path, with_lints: bool) -> Result<Report> {
 
 /// Reads every tracked file once: text counts and markers per crate,
 /// decision-record citations everywhere.
-fn scan_files(root: &Path) -> Result<(Vec<CrateReport>, RepoChecks)> {
+fn scan_files(root: &Path) -> Result<(Vec<Scanned>, RepoChecks)> {
     let listing = git(root, &["ls-files", "-z"])?;
-    let mut crates: BTreeMap<String, CrateReport> = BTreeMap::new();
+    let mut crates: BTreeMap<String, Scanned> = BTreeMap::new();
     let mut repo = RepoChecks {
         citations_checked: 0,
         citation_problems: Vec::new(),
@@ -205,11 +223,10 @@ fn scan_files(root: &Path) -> Result<(Vec<CrateReport>, RepoChecks)> {
             repo.decision_records.push(Location { path: path.to_owned(), line });
         }
         let Some(name) = text::crate_of(path) else { continue };
-        let krate = crates.entry(name.to_owned()).or_insert_with(|| CrateReport {
+        let krate = crates.entry(name.to_owned()).or_insert_with(|| Scanned {
             name: name.to_owned(),
             root: crate_root(path, name).to_owned(),
             text: TextLayer::default(),
-            lints: None,
         });
         add_file(&mut krate.text, path, &content);
     }
@@ -291,6 +308,17 @@ fn print_table(report: &Report) {
             t.files_over_1200.len(),
             t.largest_file.path,
             t.largest_file.lines
+        );
+    }
+    println!(
+        "risk indices (rules in xtask/src/audit/grade.rs; * = lower bound, run with --lints):"
+    );
+    for krate in &report.crates {
+        let i = &krate.indices;
+        let partial = if i.code_smell.complete { "" } else { "*" };
+        println!(
+            "{:<18} tests {:?}, code smell {:?}{partial}, hallucination {:?}",
+            krate.name, i.tests.level, i.code_smell.level, i.hallucination.level
         );
     }
     if let Some(l) = &report.totals.lints {

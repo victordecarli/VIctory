@@ -87,8 +87,9 @@ expectation is itself a warning, and CI runs `-D warnings`.
 `cargo xtask audit-metrics [--json] [--lints]` measures and verifies
 nothing: it is not in CI and none of its numbers gate a change. It prints
 per-crate counts (text counts always; with `--lints`, clippy's counts
-outside tests, using `wincheck`'s setup). The JSON format is documented
-in `xtask/src/audit.rs`.
+outside tests, using `wincheck`'s setup), and grades each crate by the
+written rules in `xtask/src/audit/grade.rs`, giving a reason for each
+level. The JSON format is documented in `xtask/src/audit.rs`.
 
 Claude Code sessions run `.claude/hooks/check_edit.ps1` before every file
 edit and shell command (configured in `.claude/settings.json`; needs
