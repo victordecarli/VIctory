@@ -80,6 +80,14 @@ prove by reading and by `wincheck`. Never use `#[expect(...)]` in code you
 could not compile for every configuration CI builds: an unfulfilled
 expectation is itself a warning, and CI runs `-D warnings`.
 
+Claude Code sessions run `.claude/hooks/check_edit.ps1` before every file
+edit and shell command (configured in `.claude/settings.json`; needs
+`pwsh`). It rejects what CI would fail later: `#[expect(...)]`,
+`cfg(all(test, ...))`, `#[allow]` without `reason`, citations of decision
+records, and `git commit` with `--no-verify` or `-n`. It checks only the
+text being written, so it shortens the loop; it replaces none of the
+commands above.
+
 ## Hard rules
 
 1. **Asset policy.** Nothing from the game or any other proprietary title,
