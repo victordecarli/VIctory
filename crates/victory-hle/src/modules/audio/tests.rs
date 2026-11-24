@@ -1,5 +1,11 @@
 use super::*;
 
+/// A pointer an export wrote out, checked non-null before the test goes
+/// through it.
+fn valid<T>(p: *mut T) -> *mut T {
+    std::ptr::NonNull::new(p).expect("the export wrote a pointer").as_ptr()
+}
+
 #[test]
 fn heap_maps_every_byte_of_a_block() {
     let _serial = lock(&CONTEXT_TESTS);
@@ -91,7 +97,7 @@ fn xma_contexts_decode_into_their_output_rings() {
     // SAFETY: this test's own locals, valid for the call.
     assert_eq!(unsafe { ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2) }, S_OK);
     // SAFETY: the ring was just allocated.
-    unsafe { output.cast::<u8>().write_bytes(0x55, 0x400) };
+    unsafe { valid(output).cast::<u8>().write_bytes(0x55, 0x400) };
 
     // As the title sets one up: two packets, input 0 valid, a ring of
     // four blocks, writable, 48 kHz mono, reading from the first frame.
@@ -105,7 +111,7 @@ fn xma_contexts_decode_into_their_output_rings() {
     // SAFETY: this test's own locals, valid for the call.
     assert_eq!(unsafe { AcpHalCreate(&mut acp) }, S_OK);
     // SAFETY: just created.
-    let m = unsafe { (*acp).vtable };
+    let m = unsafe { (*valid(acp)).vtable };
     // SAFETY: this test's own locals, valid for the call.
     assert_eq!(unsafe { (m.connect)(acp, 0x1000, 0x1000) }, S_OK);
     let submit = |command: u32, words: &[u32]| {
@@ -162,7 +168,7 @@ fn full_message_queues_count_drops() {
     // SAFETY: this test's own locals, valid for the call.
     assert_eq!(unsafe { AcpHalCreate(&mut acp) }, S_OK);
     // SAFETY: just created.
-    let m = unsafe { (*acp).vtable };
+    let m = unsafe { (*valid(acp)).vtable };
     // SAFETY: this test's own locals, valid for the call.
     assert_eq!(unsafe { (m.connect)(acp, 16, 2) }, S_OK);
     let mask = COMMAND_COMPLETED;
@@ -208,7 +214,7 @@ fn startup_as_fmod_does_it() {
     assert!(!arrays[0].is_null() && !arrays[3].is_null() && !arrays[4].is_null());
     assert!(arrays[1].is_null());
     // SAFETY: 0x200 rate-conversion contexts of 32 bytes were allocated.
-    unsafe { arrays[0].cast::<u8>().write_bytes(0, 0x200 << 5) };
+    unsafe { valid(arrays[0]).cast::<u8>().write_bytes(0, 0x200 << 5) };
 
     // Connect, register every message but frame starts, then wait for
     // the registration to be acknowledged.
@@ -216,7 +222,7 @@ fn startup_as_fmod_does_it() {
     // SAFETY: this test's own locals, valid for the call.
     assert_eq!(unsafe { AcpHalCreate(&mut acp) }, S_OK);
     // SAFETY: just created.
-    let m = unsafe { (*acp).vtable };
+    let m = unsafe { (*valid(acp)).vtable };
     // SAFETY: this test's own locals, valid for the call.
     assert_eq!(unsafe { (m.connect)(acp, 0x804, 0x804) }, S_OK);
     let mask = 0xfe_u32;

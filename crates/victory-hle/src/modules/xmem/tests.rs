@@ -1,5 +1,11 @@
 use super::*;
 
+/// A pointer an export wrote out, checked non-null before the test goes
+/// through it.
+fn valid<T>(p: *mut T) -> *mut T {
+    std::ptr::NonNull::new(p).expect("the export wrote a pointer").as_ptr()
+}
+
 fn query(address: *const c_void) -> BasicInformation {
     // SAFETY: plain data; zero is a valid value.
     let mut info: BasicInformation = unsafe { std::mem::zeroed() };
@@ -18,7 +24,7 @@ fn alloc_honours_alignment_and_frees() {
         assert!(!p.is_null());
         assert_eq!(p as usize % align, 0, "field {field:#x}");
         // SAFETY: 100 bytes were allocated.
-        unsafe { p.cast::<u8>().write_bytes(0xab, 100) };
+        unsafe { valid(p).cast::<u8>().write_bytes(0xab, 100) };
         // SAFETY: the arguments are this test's locals, valid for the call.
         unsafe { XMemFree(p, attributes) };
     }
@@ -157,7 +163,7 @@ fn physical_pages_map_alias_and_unmap() {
     unsafe {
         at(a, 2).cast::<u8>().write(7);
         assert_eq!(at(b, 1).cast::<u8>().read(), 7);
-        a.cast::<u8>().write(1);
+        valid(a).cast::<u8>().write(1);
     }
     // Writes into pages (DirectStorage's) show through their views.
     assert!(write_physical(&pages[2..], 1, &[9]));
@@ -206,7 +212,7 @@ fn mapping_no_pages_changes_nothing() {
     // SAFETY: the arguments are this test's locals, valid for the call.
     assert_eq!(unsafe { XMemMapPhysicalPages(a, 2, pages.as_ptr()) }, a);
     // SAFETY: both pages are mapped read-write.
-    unsafe { a.cast::<u8>().write(5) };
+    unsafe { valid(a).cast::<u8>().write(5) };
     let second = a.wrapping_byte_add(PAGE);
 
     // A count of 0 at the start of a view, inside it and past it: with
