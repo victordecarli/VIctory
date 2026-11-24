@@ -20,6 +20,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+/// The contract documents checked by default: the root one and the crate
+/// ones it points to.
+pub const CONTRACT_DOCS: [&str; 4] = [
+    "AGENTS.md",
+    "crates/victory-shader/AGENTS.md",
+    "crates/victory-gpu/AGENTS.md",
+    "crates/victory-hle/AGENTS.md",
+];
+
 /// One path cited by a document.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Citation {
@@ -140,7 +149,7 @@ fn check(root: &Path, citation: &Citation) -> Option<String> {
 mod tests {
     use std::path::Path;
 
-    use super::{Citation, check, extract};
+    use super::{CONTRACT_DOCS, Citation, check, extract};
 
     fn cite(doc_line: usize, path: &str, line: Option<usize>) -> Citation {
         Citation { doc_line, path: path.to_owned(), line }
@@ -149,7 +158,7 @@ mod tests {
     /// Enforces the citations wherever tests run, so Windows CI checks them too.
     #[test]
     fn agents_md_citations_resolve() {
-        super::run(&crate::workspace_root().unwrap(), &["AGENTS.md".to_owned()]).unwrap();
+        super::run(&crate::workspace_root().unwrap(), &CONTRACT_DOCS.map(String::from)).unwrap();
     }
 
     #[test]
