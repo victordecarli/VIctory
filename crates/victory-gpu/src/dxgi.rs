@@ -60,7 +60,8 @@ unsafe fn query(
 /// interface id valid for reads, and `out` is null or valid for a write of
 /// an object pointer, for the duration of the call.
 unsafe extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    if crate::device::is_device(iid) {
+    // SAFETY: `iid` is null or readable, per this function's contract.
+    if unsafe { crate::device::is_device(iid) } {
         return object::answer(DXGI_DEVICE, iid, Some(crate::device::device()), out);
     }
     // SAFETY: the pointers are forwarded as this function's contract gives them.

@@ -11,7 +11,13 @@ use crate::{HleExport, HleModule};
 
 /// Device creation; first hands the device the title's general allocator
 /// (`XMemAlloc`, which honours the title's hooks) for resource memory.
-extern "system" fn create_device(
+///
+/// # Safety
+///
+/// As `victory_gpu::device::create`: `parameters` is null or valid for a read
+/// of a `u32`, `iid` is null or points to an interface id, and `out` is null
+/// or valid for a write of an object pointer, for the duration of the call.
+unsafe extern "system" fn create_device(
     adapter: *const c_void,
     parameters: *const u32,
     iid: *const Iid,
@@ -21,7 +27,8 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
-    device::create(adapter, parameters, iid, out)
+    // SAFETY: the pointers are as this function's contract gives them.
+    unsafe { device::create(adapter, parameters, iid, out) }
 }
 
 /// A host GPU failure ends the run like a crash: reported to the crash log,

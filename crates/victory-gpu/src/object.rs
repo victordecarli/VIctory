@@ -223,7 +223,10 @@ pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT 
 /// the interfaces the device itself answers to.
 pub(crate) extern "system" fn parent_device(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let device = crate::device::device();
-    answer(DEVICE, iid, crate::device::is_device(iid).then_some(device), out)
+    // SAFETY: the title's id (null is tolerated), as for any method that
+    // takes one.
+    let is_device = unsafe { crate::device::is_device(iid) };
+    answer(DEVICE, iid, is_device.then_some(device), out)
 }
 
 pub(crate) const DEVICE: usize = 0;
