@@ -46,18 +46,34 @@ fn only_loopback_is_reachable() {
     // Connects.
     let s = socket(2, 1, 6);
     assert_ne!(s, INVALID_SOCKET);
-    assert_eq!(connect(s, v4(AWAY, 80).as_ptr(), 16), SOCKET_ERROR);
+    // SAFETY: this test's own locals and strings, valid for the call.
+    assert_eq!(unsafe { connect(s, v4(AWAY, 80).as_ptr(), 16) }, SOCKET_ERROR);
     assert_eq!(last_error(), WSAENETUNREACH);
     let n = null.cast();
     assert_eq!(
-        WSAConnectByNameA(s, c"example.com".as_ptr(), c"80".as_ptr(), n, null, n, null, null, null),
+        // SAFETY: this test's own locals and strings, valid for the call.
+        unsafe {
+            WSAConnectByNameA(
+                s,
+                c"example.com".as_ptr(),
+                c"80".as_ptr(),
+                n,
+                null,
+                n,
+                null,
+                null,
+                null,
+            )
+        },
         0
     );
     assert_eq!(last_error(), WSAHOST_NOT_FOUND);
-    assert_eq!(connect(s, v4(HOME, port).as_ptr(), 16), 0);
+    // SAFETY: this test's own locals and strings, valid for the call.
+    assert_eq!(unsafe { connect(s, v4(HOME, port).as_ptr(), 16) }, 0);
     listener.accept().unwrap();
     // A stream socket sends to its vetted peer whatever `to` says.
-    assert_eq!(sendto(s, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16), 1);
+    // SAFETY: this test's own locals and strings, valid for the call.
+    assert_eq!(unsafe { sendto(s, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16) }, 1);
     close(s);
 
     // `ConnectEx` from `WSAIoctl` is the vetted one.
@@ -77,45 +93,68 @@ fn only_loopback_is_reachable() {
         null,
     );
     assert_eq!((got, f), (0, connect_ex as *const () as usize));
-    assert_eq!(connect_ex(s, v4(AWAY, 80).as_ptr(), 16, null, 0, n, null), 0);
+    // SAFETY: this test's own locals and strings, valid for the call.
+    assert_eq!(unsafe { connect_ex(s, v4(AWAY, 80).as_ptr(), 16, null, 0, n, null) }, 0);
     assert_eq!(last_error(), WSAENETUNREACH);
     close(s);
 
     // Datagram sends.
     let u = socket(2, 2, 17);
-    assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16), SOCKET_ERROR);
+    // SAFETY: this test's own locals and strings, valid for the call.
+    assert_eq!(unsafe { sendto(u, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16) }, SOCKET_ERROR);
     assert_eq!(last_error(), WSAENETUNREACH);
-    assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, v4(HOME, port).as_ptr(), 16), 1);
+    // SAFETY: this test's own locals and strings, valid for the call.
+    assert_eq!(unsafe { sendto(u, b"x".as_ptr(), 1, 0, v4(HOME, port).as_ptr(), 16) }, 1);
     close(u);
 
     // Forward and reverse lookups.
     let mut result = null;
     assert_eq!(
-        getaddrinfo(c"example.com".as_ptr(), std::ptr::null(), std::ptr::null(), &mut result),
+        // SAFETY: this test's own locals and strings, valid for the call.
+        unsafe {
+            getaddrinfo(c"example.com".as_ptr(), std::ptr::null(), std::ptr::null(), &mut result)
+        },
         WSAHOST_NOT_FOUND
     );
     let name: Vec<u16> = "example.com\0".encode_utf16().collect();
     assert_eq!(
-        GetAddrInfoW(name.as_ptr(), std::ptr::null(), std::ptr::null(), &mut result),
+        // SAFETY: this test's own locals and strings, valid for the call.
+        unsafe { GetAddrInfoW(name.as_ptr(), std::ptr::null(), std::ptr::null(), &mut result) },
         WSAHOST_NOT_FOUND
     );
     let mut text = [0 as c_char; 64];
     let away = v4(AWAY, 80);
     assert_eq!(
-        getnameinfo(away.as_ptr(), 16, text.as_mut_ptr(), 64, std::ptr::null_mut(), 0, 0),
+        // SAFETY: this test's own locals and strings, valid for the call.
+        unsafe {
+            getnameinfo(away.as_ptr(), 16, text.as_mut_ptr(), 64, std::ptr::null_mut(), 0, 0)
+        },
         0
     );
     // SAFETY: NUL-terminated by `getnameinfo`.
     let numeric = unsafe { CStr::from_ptr(text.as_ptr()) };
     assert_eq!(numeric.to_str(), Ok("192.0.2.1"));
     assert_eq!(
-        getnameinfo(away.as_ptr(), 16, text.as_mut_ptr(), 64, std::ptr::null_mut(), 0, NI_NAMEREQD),
+        // SAFETY: this test's own locals and strings, valid for the call.
+        unsafe {
+            getnameinfo(
+                away.as_ptr(),
+                16,
+                text.as_mut_ptr(),
+                64,
+                std::ptr::null_mut(),
+                0,
+                NI_NAMEREQD,
+            )
+        },
         WSAHOST_NOT_FOUND
     );
-    assert!(gethostbyaddr(AWAY.as_ptr().cast(), 4, 2).is_null());
+    // SAFETY: this test's own locals and strings, valid for the call.
+    assert!(unsafe { gethostbyaddr(AWAY.as_ptr().cast(), 4, 2) }.is_null());
 
     // WinHTTP.
-    assert!(WinHttpConnect(null, name.as_ptr(), 443, 0).is_null());
+    // SAFETY: this test's own locals and strings, valid for the call.
+    assert!(unsafe { WinHttpConnect(null, name.as_ptr(), 443, 0) }.is_null());
     // SAFETY: no arguments.
     let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
     assert_eq!(error, ERROR_WINHTTP_CANNOT_CONNECT);
