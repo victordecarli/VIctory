@@ -296,6 +296,8 @@ mod tests {
         let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
         // SAFETY: `dsp` is the live connection, the rest are locals.
         assert_eq!(unsafe { XDspActivate(dsp, &desc, &mut status, &mut stream) }, S_OK);
+        let (mut status, mut stream) =
+            (crate::test_support::valid(status), crate::test_support::valid_mut(stream));
         let mut output = vec![1f32; 0x800];
         let input = vec![0.5f32; 0x800];
         let command = Command {

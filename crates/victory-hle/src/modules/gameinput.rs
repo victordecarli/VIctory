@@ -1291,7 +1291,7 @@ mod tests {
 
     fn result(hr: HRESULT, out: *const c_void) -> Result<*const Reading, HRESULT> {
         if hr == S_OK {
-            Ok(out.cast())
+            Ok(crate::test_support::valid(out).cast())
         } else {
             assert!(out.is_null());
             Err(hr)

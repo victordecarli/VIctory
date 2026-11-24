@@ -1342,9 +1342,11 @@ mod tests {
         let null = std::ptr::null();
         let mut allocator = null;
         assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let allocator = crate::test_support::valid(allocator);
         let mut list = null;
         let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
         assert_eq!(hr, S_OK);
+        let list = crate::test_support::valid(list);
         // What the title's inline draw checks: put < draw limit.
         // SAFETY: the list is 0x560 bytes.
         let (put, draw_limit, api_limit) = unsafe {
@@ -1362,6 +1364,7 @@ mod tests {
         // List-owned upload memory: aligned, writable, gone at reset.
         let p = allocate_upload(list, 40, 0x100);
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
+        let p = crate::test_support::valid_mut(p);
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");

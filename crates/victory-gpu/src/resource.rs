@@ -1270,7 +1270,7 @@ mod tests {
         let desc = HeapDesc { size, properties: PROPERTIES, alignment: 0, flags: 0 };
         let mut heap = std::ptr::null();
         assert_eq!(create_heap(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap), S_OK);
-        heap
+        crate::test_support::valid(heap)
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(test)]
+mod test_support;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

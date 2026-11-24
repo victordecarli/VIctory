@@ -384,6 +384,7 @@ static FUNCTIONS: Table<160> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+    use crate::test_support::valid;
 
     fn create_as(iid: &Iid) -> (HRESULT, This) {
         let version = CHECKED_VERSION;
@@ -397,6 +398,7 @@ mod tests {
     fn creation_hands_out_the_device() {
         let (hr, device) = create_as(&IID);
         assert_eq!(hr, S_OK);
+        let device = valid(device);
         assert_eq!(device, super::device());
         // The title tests byte 0x18 before inlining a device call.
         // SAFETY: the device is 0x58 bytes.
@@ -412,6 +414,7 @@ mod tests {
         // ID3D12Device11, as Grand Theft Auto VI asks for it.
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
+        let device = valid(device);
         let mut same = std::ptr::null();
         // SAFETY: `device` is our device; a static id and a local to write.
         assert_eq!(unsafe { query_interface(device, &LEVEL_IIDS[4], &mut same) }, S_OK);

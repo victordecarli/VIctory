@@ -163,9 +163,10 @@ impl Validator {
                 *mut Object,
             ) -> Hresult = method(self.object, 3);
             let hr = validate(self.object, &mut blob, IN_PLACE_EDIT, &mut result);
-            if hr < 0 || result.is_null() {
-                return Err(format!("Validate failed: {hr:#x}"));
-            }
+            let result = match std::ptr::NonNull::new(result) {
+                Some(result) if hr >= 0 => result.as_ptr(),
+                _ => return Err(format!("Validate failed: {hr:#x}")),
+            };
             let mut status = 0;
             let get_status: unsafe extern "system" fn(Object, *mut Hresult) -> Hresult =
                 method(result, 3);
@@ -175,7 +176,9 @@ impl Validator {
                 let mut errors: Object = std::ptr::null_mut();
                 let get_errors: unsafe extern "system" fn(Object, *mut Object) -> Hresult =
                     method(result, 5);
-                if get_errors(result, &mut errors) >= 0 && !errors.is_null() {
+                let got = get_errors(result, &mut errors) >= 0;
+                if let Some(errors) = std::ptr::NonNull::new(errors).filter(|_| got) {
+                    let errors = errors.as_ptr();
                     let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
                     let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
                     let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));

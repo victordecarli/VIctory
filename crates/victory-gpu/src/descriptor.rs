@@ -437,7 +437,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
 /// `desc` is null or valid for reads (unaligned) of `N` words.
 unsafe fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     // SAFETY: non-null, so `N` readable words, per this function's contract.
-    (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
+    std::ptr::NonNull::new(desc.cast_mut()).map(|desc| unsafe { desc.as_ptr().read_unaligned() })
 }
 
 /// Device method.
