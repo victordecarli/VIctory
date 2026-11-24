@@ -4,7 +4,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Files above this size are skipped (read whole into memory for now).
+/// Files above this size are skipped (read whole into memory for now);
+/// `victory translate` counts them and does not fail on them.
 pub(crate) const MAX_FILE: u64 = 2 << 30;
 
 /// Why a file under the roots was not read.

@@ -101,4 +101,9 @@ to the per-lane load or choice that gives each lane its own (a mask's
 the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
-lists what they cannot handle yet.
+lists what they cannot handle yet. The command exits 1 when it could not
+measure everything: an unreadable file, a failed directory walk or a panic
+in a program is an infrastructure failure (every count is then a lower
+bound). Files above 2 GiB are skipped with a warning and counted in the
+`files` line; they do not change the exit code, nor do shaders the
+translator cannot handle.

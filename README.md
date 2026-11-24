@@ -98,6 +98,13 @@ victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 victory config
 ```
 
+`victory translate` exits 1 when it could not measure everything it was
+given: an unreadable file, a failed directory walk or a panic in a program
+each count as an infrastructure failure and are listed at the end. Files
+above 2 GiB are not read and are not failures: they are logged and counted
+in the `files` line. Shaders the translator cannot handle yet do not change
+the exit code.
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
