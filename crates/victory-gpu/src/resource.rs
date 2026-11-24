@@ -496,7 +496,12 @@ pub(crate) struct Memory {
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
-pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
+/// Frees a block of `AllocRoutine` with the attributes it was allocated with.
+///
+/// # Safety
+///
+/// The address is null or such a block, not freed since.
+pub type FreeRoutine = unsafe extern "system" fn(*mut c_void, u64);
 static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
 
 /// Committed resources get their memory from the title's general
@@ -580,7 +585,11 @@ impl Memory {
 impl Drop for Memory {
     fn drop(&mut self) {
         match (self.attributes, ALLOCATOR.get()) {
-            (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
+            // SAFETY: the block came from the paired allocator with these
+            // attributes, and is freed once, here.
+            (Some(attributes), Some(&(_, free))) => unsafe {
+                free(self.ptr.as_ptr().cast(), attributes)
+            },
             // SAFETY: allocated in `new` with this layout.
             _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
         }
