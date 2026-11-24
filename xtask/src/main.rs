@@ -34,8 +34,9 @@ enum Cmd {
     /// Check that every path a contract document cites (`path`, `path:line`
     /// in inline code) exists from the repository root.
     Citations {
-        /// Documents to check, relative to the repository root.
-        #[arg(default_value = "AGENTS.md")]
+        /// Documents to check, relative to the repository root (default:
+        /// the root and crate AGENTS.md files).
+        #[arg(default_values_t = citations::CONTRACT_DOCS.map(String::from))]
         docs: Vec<String>,
     },
     /// Type-check and lint the whole workspace for x86_64-pc-windows-msvc

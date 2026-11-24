@@ -11,6 +11,10 @@ rules below are the filter, so they are strict on purpose.
 
 ## Project map
 
+Before changing `crates/victory-shader/`, `crates/victory-gpu/` or
+`crates/victory-hle/`, read that crate's `AGENTS.md`: how its code is laid
+out and the gotchas local to it. This file still applies there.
+
 | Crate | Owns | Must not contain | Builds off Windows |
 |-------|------|------------------|--------------------|
 | `victory-core` | config, `ensure_outside_repo`, logging setup | title-specific logic | yes |
@@ -80,6 +84,14 @@ prove by reading and by `wincheck`. Never use `#[expect(...)]` in code you
 could not compile for every configuration CI builds: an unfulfilled
 expectation is itself a warning, and CI runs `-D warnings`.
 
+Claude Code sessions run `.claude/hooks/check_edit.ps1` before every file
+edit and shell command (configured in `.claude/settings.json`; needs
+`pwsh`). It rejects what CI would fail later: `#[expect(...)]`,
+`cfg(all(test, ...))`, `#[allow]` without `reason`, citations of decision
+records, and `git commit` with `--no-verify` or `-n`. It checks only the
+text being written, so it shortens the loop; it replaces none of the
+commands above.
+
 ## Hard rules
 
 1. **Asset policy.** Nothing from the game or any other proprietary title,
@@ -124,8 +136,11 @@ expectation is itself a warning, and CI runs `-D warnings`.
 ## Citations
 
 `cargo xtask citations` (a CI step, and the `agents_md_citations_resolve`
-test) fails when a path this file cites stops existing, so a rename or
-deletion has to update the contract in the same commit. What it checks:
+test) fails when a path this file or a crate `AGENTS.md` it points to
+cites stops existing, so a rename or deletion has to update the contract
+in the same commit. The documents are listed in `CONTRACT_DOCS`
+(`xtask/src/citations.rs`); a new crate `AGENTS.md` is added there. What it
+checks:
 
 - An inline code span (outside fenced blocks) made only of letters,
   digits, `_`, `-`, `.` and at least one `/` is a citation, optionally
