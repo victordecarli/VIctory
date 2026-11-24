@@ -680,15 +680,14 @@ mod tests {
         unsafe { std::mem::transmute_copy(&(*c).vtable.0[index]) }
     }
 
-    fn try_create(d: &ResourceDesc, c: &mut This) -> HRESULT {
-        // SAFETY: valid references for both pointers.
+    fn try_create(d: &ResourceDesc, c: *mut This) -> HRESULT {
+        // SAFETY: a valid reference and room for the pointer.
         unsafe { XGCreateTextureComputer(d, c) }
     }
 
     fn create(d: &ResourceDesc) -> This {
         let mut c = std::mem::MaybeUninit::<This>::uninit();
-        // SAFETY: valid references for `d`, and room for the pointer.
-        assert_eq!(unsafe { XGCreateTextureComputer(d, c.as_mut_ptr()) }, S_OK);
+        assert_eq!(try_create(d, c.as_mut_ptr()), S_OK);
         // SAFETY: written by the call, which returned success.
         crate::test_support::valid_mut(unsafe { c.assume_init() })
     }
@@ -805,11 +804,11 @@ mod tests {
 
     #[test]
     fn bad_descriptions_fail() {
-        let mut c = std::ptr::null_mut();
+        let mut c = std::mem::MaybeUninit::<This>::uninit();
         let bad = desc(256, 256, 1, 0, 0x10a);
-        assert_eq!(try_create(&bad, &mut c), E_INVALIDARG);
+        assert_eq!(try_create(&bad, c.as_mut_ptr()), E_INVALIDARG);
         let bad = desc(256, 256, 1, 28, 0x103);
-        assert_eq!(try_create(&bad, &mut c), E_INVALIDARG);
+        assert_eq!(try_create(&bad, c.as_mut_ptr()), E_INVALIDARG);
         assert!(module().exports.len() == 2);
     }
 }
