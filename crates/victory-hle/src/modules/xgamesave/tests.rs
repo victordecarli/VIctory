@@ -266,9 +266,12 @@ fn saves_persist_across_providers() {
     let mut b = block();
     assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
     assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
-    close_update(this, update);
-    close_container(this, container);
-    close_provider(this, provider);
+    // SAFETY: this test's own locals, valid for the call.
+    unsafe { close_update(this, update) };
+    // SAFETY: this test's own locals, valid for the call.
+    unsafe { close_container(this, container) };
+    // SAFETY: this test's own locals, valid for the call.
+    unsafe { close_provider(this, provider) };
 
     // A new provider sees the container and reads both blobs back.
     let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
@@ -286,14 +289,20 @@ fn saves_persist_across_providers() {
     }
     let mut found: Vec<(String, String, u32, u64)> = Vec::new();
     let context = (&raw mut found).cast();
-    assert_eq!(enumerate_containers(this, provider, context, Some(seen)), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { enumerate_containers(this, provider, context, Some(seen)) }, S_OK);
     assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 2, 7)]);
 
     let mut container = std::ptr::null_mut();
-    assert_eq!(create_container(this, provider, c"Slot_1".as_ptr(), &mut container), S_OK);
+    assert_eq!(
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { create_container(this, provider, c"Slot_1".as_ptr(), &mut container) },
+        S_OK
+    );
     let mut b = block();
     let wanted = [c"world".as_ptr(), c"player.dat".as_ptr()];
-    assert_eq!(read_async(this, container, wanted.as_ptr(), 2, &mut b), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { read_async(this, container, wanted.as_ptr(), 2, &mut b) }, S_OK);
     assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
     let mut size = 0;
     assert_eq!(xasync::XAsyncGetResultSize(&mut b, &mut size), S_OK);
@@ -301,10 +310,15 @@ fn saves_persist_across_providers() {
     let mut buffer = vec![0u64; size.div_ceil(8)];
     let mut count = 0;
     assert_eq!(
-        read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count),
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count) },
         BUFFER_TOO_SMALL
     );
-    assert_eq!(read_result(this, &mut b, size, buffer.as_mut_ptr().cast(), &mut count), S_OK);
+    assert_eq!(
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { read_result(this, &mut b, size, buffer.as_mut_ptr().cast(), &mut count) },
+        S_OK
+    );
     assert_eq!(count, 2);
     let blob = |i: usize| {
         // SAFETY: the layout the call wrote.
@@ -344,17 +358,24 @@ fn saves_persist_across_providers() {
 
     // Quota counts the blobs; deleting the container frees it.
     let mut b = block();
-    assert_eq!(quota_async(this, provider, &mut b), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { quota_async(this, provider, &mut b) }, S_OK);
     let mut left = 0i64;
-    assert_eq!(quota_result(this, &mut b, &mut left), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { quota_result(this, &mut b, &mut left) }, S_OK);
     assert!(left as u64 <= QUOTA - 7);
     let mut b = block();
-    assert_eq!(delete_async(this, provider, c"Slot_1".as_ptr(), &mut b), S_OK);
-    assert_eq!(delete_result(this, &mut b), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { delete_async(this, provider, c"Slot_1".as_ptr(), &mut b) }, S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { delete_result(this, &mut b) }, S_OK);
     found.clear();
     let context = (&raw mut found).cast();
-    assert_eq!(enumerate_containers(this, provider, context, Some(seen)), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { enumerate_containers(this, provider, context, Some(seen)) }, S_OK);
     assert!(found.is_empty());
-    close_container(this, container);
-    close_provider(this, provider);
+    // SAFETY: this test's own locals, valid for the call.
+    unsafe { close_container(this, container) };
+    // SAFETY: this test's own locals, valid for the call.
+    unsafe { close_provider(this, provider) };
 }

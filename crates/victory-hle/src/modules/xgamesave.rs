@@ -17,10 +17,6 @@
 //! shortened) plus a hash of the exact name, so names differing only in
 //! case get different folders. Offline there is no cloud copy, so nothing
 //! ever needs a sync.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{CString, c_char, c_void};
 use std::io::Write as _;
@@ -329,14 +325,24 @@ struct Update {
 }
 
 /// A handle we gave out.
-fn get<'a, T>(handle: *const T) -> Option<&'a T> {
-    // SAFETY: handles are boxes we created and the title has not closed.
+///
+/// # Safety
+///
+/// `handle` is null or a handle this module gave out and the title has not
+/// closed, and nothing frees it while the reference lives.
+unsafe fn get<'a, T>(handle: *const T) -> Option<&'a T> {
+    // SAFETY: a handle is a box we created and the title has not closed, per
+    // this function's contract.
     unsafe { handle.as_ref() }
 }
 fn give<T>(value: T) -> *mut T {
     Box::into_raw(Box::new(value))
 }
-fn take<T>(handle: *mut T) {
+/// # Safety
+///
+/// `handle` is null or a handle this module gave out, closed once and not
+/// used afterwards.
+unsafe fn take<T>(handle: *mut T) {
     if !handle.is_null() {
         // SAFETY: as in `get`; closing ends the handle.
         drop(unsafe { Box::from_raw(handle) });
@@ -513,11 +519,16 @@ fn layout(blobs: &[(String, Vec<u8>)], base: usize) -> Vec<u8> {
 }
 
 /// The names a title passes (`count` strings, or all blobs if null).
-fn names(names: *const *const c_char, count: u32) -> Option<Vec<String>> {
+///
+/// # Safety
+///
+/// `names` is null or valid for reads of `count` pointers, each a
+/// NUL-terminated string or null.
+unsafe fn names(names: *const *const c_char, count: u32) -> Option<Vec<String>> {
     if names.is_null() {
         return None;
     }
-    // SAFETY: the title passes `count` strings.
+    // SAFETY: non-null, and `count` strings, per this function's contract.
     let names = unsafe { std::slice::from_raw_parts(names, count as usize) };
     Some(names.iter().map(|&n| text(n).unwrap_or_default()).collect())
 }
@@ -544,7 +555,12 @@ pub struct BlobInfo {
 
 /// Calls `callback` with the information of each container that passes
 /// `keep` until it returns false; never under our lock (it may call us).
-fn report(
+///
+/// # Safety
+///
+/// `context` is whatever `callback`, a function of the title's, accepts as
+/// its second argument, and `callback` is valid to call with it.
+unsafe fn report(
     root: &Path,
     keep: impl Fn(&str) -> bool,
     context: *mut c_void,
@@ -593,7 +609,12 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
-extern "system" fn initialize_async(
+/// # Safety
+///
+/// `_user`, `config`, `block` are null or valid as the API this stands in
+/// for requires: a structure or block of its type, a NUL-terminated string,
+/// or a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn initialize_async(
     _: This,
     _user: *const c_void,
     config: *const c_char,
@@ -608,87 +629,144 @@ extern "system" fn initialize_async(
     };
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
-extern "system" fn initialize_result(
+/// # Safety
+///
+/// `block`, `out` are null or valid as the API this stands in for requires:
+/// a structure or block of its type, a NUL-terminated string, or a buffer
+/// for its stated size, for the duration of the call.
+unsafe extern "system" fn initialize_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
     xasync::result(block, (&raw const INIT).cast(), out)
 }
-extern "system" fn close_provider(_: This, provider: *mut Provider) {
-    take(provider);
+/// # Safety
+///
+/// `provider` is null or valid as the API this stands in for requires: a
+/// structure or block of its type, a NUL-terminated string, or a buffer for
+/// its stated size, for the duration of the call.
+unsafe extern "system" fn close_provider(_: This, provider: *mut Provider) {
+    // SAFETY: as this function's contract gives them.
+    unsafe { take(provider) };
 }
 
-extern "system" fn quota_async(
+/// # Safety
+///
+/// `provider`, `block` are null or valid as the API this stands in for
+/// requires: a structure or block of its type, a NUL-terminated string, or
+/// a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn quota_async(
     _: This,
     provider: *const Provider,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = get(provider).ok_or(E_INVALIDARG).map(|p| xasync::bytes(p.remaining() as i64));
+    // SAFETY: as this function's contract gives them.
+    let result =
+        unsafe { get(provider) }.ok_or(E_INVALIDARG).map(|p| xasync::bytes(p.remaining() as i64));
     xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
 }
-extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
+/// # Safety
+///
+/// `block`, `out` are null or valid as the API this stands in for requires:
+/// a structure or block of its type, a NUL-terminated string, or a buffer
+/// for its stated size, for the duration of the call.
+unsafe extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
-extern "system" fn delete_async(
+/// # Safety
+///
+/// `provider`, `name`, `block` are null or valid as the API this stands in
+/// for requires: a structure or block of its type, a NUL-terminated string,
+/// or a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn delete_async(
     _: This,
     provider: *const Provider,
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let hr = match (get(provider), text(name)) {
+    // SAFETY: as this function's contract gives them.
+    let hr = match (unsafe { get(provider) }, text(name)) {
         (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
         (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
         _ => E_INVALIDARG,
     };
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
-extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or valid as the API this stands in for requires: a
+/// structure or block of its type, a NUL-terminated string, or a buffer for
+/// its stated size, for the duration of the call.
+unsafe extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast())
 }
 
 /// Reports the container if it exists; a missing one is no error, the
 /// callback just does not run.
-extern "system" fn container_info(
+///
+/// # Safety
+///
+/// `provider`, `name`, `context` are null or valid as the API this stands
+/// in for requires: a structure or block of its type, a NUL-terminated
+/// string, or a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn container_info(
     _: This,
     provider: *const Provider,
     name: *const c_char,
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
-    let (Some(p), Some(name), Some(callback)) = (get(provider), text(name), callback) else {
+    // SAFETY: as this function's contract gives them.
+    let (Some(p), Some(name), Some(callback)) = (unsafe { get(provider) }, text(name), callback)
+    else {
         return E_INVALIDARG;
     };
     if !valid_container(&name) {
         return INVALID_CONTAINER_NAME;
     }
-    report(&p.root, |n| n == name, context, callback);
+    // SAFETY: as this function's contract gives them.
+    unsafe { report(&p.root, |n| n == name, context, callback) };
     S_OK
 }
 
-extern "system" fn enumerate_containers(
+/// # Safety
+///
+/// `provider`, `context` are null or valid as the API this stands in for
+/// requires: a structure or block of its type, a NUL-terminated string, or
+/// a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn enumerate_containers(
     _: This,
     provider: *const Provider,
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
-    let (Some(p), Some(callback)) = (get(provider), callback) else {
+    // SAFETY: as this function's contract gives them.
+    let (Some(p), Some(callback)) = (unsafe { get(provider) }, callback) else {
         return E_INVALIDARG;
     };
-    report(&p.root, |_| true, context, callback);
+    // SAFETY: as this function's contract gives them.
+    unsafe { report(&p.root, |_| true, context, callback) };
     S_OK
 }
 
 /// The container exists once an update to it is submitted.
-extern "system" fn create_container(
+///
+/// # Safety
+///
+/// `provider`, `name`, `out` are null or valid as the API this stands in
+/// for requires: a structure or block of its type, a NUL-terminated string,
+/// or a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn create_container(
     _: This,
     provider: *const Provider,
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
-    let (Some(p), Some(name)) = (get(provider), text(name)) else {
+    // SAFETY: as this function's contract gives them.
+    let (Some(p), Some(name)) = (unsafe { get(provider) }, text(name)) else {
         return E_INVALIDARG;
     };
     if !valid_container(&name) {
@@ -696,18 +774,31 @@ extern "system" fn create_container(
     }
     put(out, give(p.container(&name)))
 }
-extern "system" fn close_container(_: This, container: *mut Container) {
-    take(container);
+/// # Safety
+///
+/// `container` is null or valid as the API this stands in for requires: a
+/// structure or block of its type, a NUL-terminated string, or a buffer for
+/// its stated size, for the duration of the call.
+unsafe extern "system" fn close_container(_: This, container: *mut Container) {
+    // SAFETY: as this function's contract gives them.
+    unsafe { take(container) };
 }
 
-extern "system" fn enumerate_blobs(
+/// # Safety
+///
+/// `container`, `prefix`, `context` are null or valid as the API this
+/// stands in for requires: a structure or block of its type, a
+/// NUL-terminated string, or a buffer for its stated size, for the duration
+/// of the call.
+unsafe extern "system" fn enumerate_blobs(
     _: This,
     container: *const Container,
     prefix: *const c_char,
     context: *mut c_void,
     callback: Option<BlobCallback>,
 ) -> HRESULT {
-    let (Some(c), Some(callback)) = (get(container), callback) else {
+    // SAFETY: as this function's contract gives them.
+    let (Some(c), Some(callback)) = (unsafe { get(container) }, callback) else {
         return E_INVALIDARG;
     };
     let prefix = text(prefix).unwrap_or_default();
@@ -726,7 +817,13 @@ extern "system" fn enumerate_blobs(
     S_OK
 }
 
-extern "system" fn read_blobs(
+/// # Safety
+///
+/// `container`, `blob_names`, `count`, `out` are null or valid as the API
+/// this stands in for requires: a structure or block of its type, a
+/// NUL-terminated string, or a buffer for its stated size, for the duration
+/// of the call.
+unsafe extern "system" fn read_blobs(
     _: This,
     container: *const Container,
     blob_names: *const *const c_char,
@@ -734,12 +831,15 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
-    let Some(c) = get(container) else {
+    // SAFETY: as this function's contract gives them.
+    let found = unsafe { get(container) };
+    let Some(c) = found else {
         return E_INVALIDARG;
     };
-    // SAFETY: the title passes its count.
+    // SAFETY: null or readable, per this function's contract.
     let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
-    let blobs = match read(c, names(blob_names, wanted)) {
+    // SAFETY: as this function's contract gives them.
+    let blobs = match read(c, unsafe { names(blob_names, wanted) }) {
         Ok(blobs) => blobs,
         Err(hr) => return hr,
     };
@@ -747,27 +847,42 @@ extern "system" fn read_blobs(
     if out.is_null() || size < bytes.len() {
         return BUFFER_TOO_SMALL;
     }
-    // SAFETY: the buffer holds `size` bytes, checked above.
+    // SAFETY: non-null, and `size` writable bytes, per this function's
+    // contract.
     unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
     put(count, blobs.len() as u32)
 }
 
 /// Read at once; the result holds the layout with pointers relative to the
 /// title's buffer, fixed up when the title takes it.
-extern "system" fn read_async(
+///
+/// # Safety
+///
+/// `container`, `blob_names`, `block` are null or valid as the API this
+/// stands in for requires: a structure or block of its type, a
+/// NUL-terminated string, or a buffer for its stated size, for the duration
+/// of the call.
+unsafe extern "system" fn read_async(
     _: This,
     container: *const Container,
     blob_names: *const *const c_char,
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = match get(container) {
-        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
+    // SAFETY: as this function's contract gives them.
+    let result = match unsafe { get(container) } {
+        // SAFETY: as this function's contract gives them.
+        Some(c) => read(c, unsafe { names(blob_names, count) }).map(|blobs| layout(&blobs, 0)),
         None => Err(E_INVALIDARG),
     };
     xasync::finished_with(block, (&raw const READ).cast(), result)
 }
-extern "system" fn read_result(
+/// # Safety
+///
+/// `block`, `out`, `count` are null or valid as the API this stands in for
+/// requires: a structure or block of its type, a NUL-terminated string, or
+/// a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn read_result(
     _: This,
     block: *mut AsyncBlock,
     size: usize,
@@ -803,13 +918,20 @@ extern "system" fn read_result(
     put(count, blobs as u32)
 }
 
-extern "system" fn create_update(
+/// # Safety
+///
+/// `container`, `display`, `out` are null or valid as the API this stands
+/// in for requires: a structure or block of its type, a NUL-terminated
+/// string, or a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn create_update(
     _: This,
     container: *const Container,
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
-    let Some(c) = get(container) else {
+    // SAFETY: as this function's contract gives them.
+    let found = unsafe { get(container) };
+    let Some(c) = found else {
         return E_INVALIDARG;
     };
     put(
@@ -822,18 +944,30 @@ extern "system" fn create_update(
         }),
     )
 }
-extern "system" fn close_update(_: This, update: *mut Update) {
-    take(update);
+/// # Safety
+///
+/// `update` is null or valid as the API this stands in for requires: a
+/// structure or block of its type, a NUL-terminated string, or a buffer for
+/// its stated size, for the duration of the call.
+unsafe extern "system" fn close_update(_: This, update: *mut Update) {
+    // SAFETY: as this function's contract gives them.
+    unsafe { take(update) };
 }
 
-extern "system" fn write_blob(
+/// # Safety
+///
+/// `update`, `name`, `data` are null or valid as the API this stands in for
+/// requires: a structure or block of its type, a NUL-terminated string, or
+/// a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn write_blob(
     _: This,
     update: *mut Update,
     name: *const c_char,
     data: *const u8,
     size: usize,
 ) -> HRESULT {
-    // SAFETY: a handle we gave out; the title does not use it concurrently.
+    // SAFETY: a handle we gave out, per this function's contract; the title
+    // does not use it concurrently.
     let (Some(update), Some(name)) = (unsafe { update.as_mut() }, text(name)) else {
         return E_INVALIDARG;
     };
@@ -846,14 +980,24 @@ extern "system" fn write_blob(
     let data = if size == 0 {
         Vec::new()
     } else {
-        // SAFETY: the title passes `size` bytes.
+        // SAFETY: non-null, and `size` readable bytes, per this function's
+        // contract.
         unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
     };
     update.changes.push((name, Some(data)));
     S_OK
 }
 
-extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
+/// # Safety
+///
+/// `update`, `name` are null or valid as the API this stands in for
+/// requires: a structure or block of its type, a NUL-terminated string, or
+/// a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn delete_blob(
+    _: This,
+    update: *mut Update,
+    name: *const c_char,
+) -> HRESULT {
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
         (Some(update), Some(name)) if !name.is_empty() => {
@@ -864,11 +1008,26 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
-extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
-    let hr = get(update).map_or(E_INVALIDARG, Update::submit);
+/// # Safety
+///
+/// `update`, `block` are null or valid as the API this stands in for
+/// requires: a structure or block of its type, a NUL-terminated string, or
+/// a buffer for its stated size, for the duration of the call.
+unsafe extern "system" fn submit_async(
+    _: This,
+    update: *const Update,
+    block: *mut AsyncBlock,
+) -> HRESULT {
+    // SAFETY: as this function's contract gives them.
+    let hr = unsafe { get(update) }.map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
-extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or valid as the API this stands in for requires: a
+/// structure or block of its type, a NUL-terminated string, or a buffer for
+/// its stated size, for the duration of the call.
+unsafe extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
