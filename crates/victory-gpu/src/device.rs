@@ -396,7 +396,10 @@ mod tests {
         type Get = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
         let fence_iid = &crate::fence::FENCE_IIDS[0];
         let mut fence = std::ptr::null();
-        assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, fence_iid, &mut fence), S_OK);
+        // SAFETY: a static interface id and a local to write.
+        let created =
+            unsafe { crate::fence::create(std::ptr::null(), 0, 0, fence_iid, &mut fence) };
+        assert_eq!(created, S_OK);
         let get_device = slot::<Get>(fence, 0x38);
         let dxgi = dxgi::device();
         let query = slot::<Get>(dxgi, 0);
