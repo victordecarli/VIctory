@@ -43,7 +43,12 @@ extern "system" fn enumerate_voices(
 ) -> HRESULT {
     S_OK
 }
-extern "system" fn create(_: This, out: *mut *const u8) -> HRESULT {
+/// Creates a synthesizer.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a handle.
+unsafe extern "system" fn create(_: This, out: *mut *const u8) -> HRESULT {
     put(out, &raw const SYNTHESIZER)
 }
 extern "system" fn close(_: This, _: *const u8) -> HRESULT {
@@ -55,7 +60,14 @@ extern "system" fn set_default_voice(_: This, _: *const u8) -> HRESULT {
 extern "system" fn set_custom_voice(_: This, _: *const u8, _voice: *const c_char) -> HRESULT {
     S_OK
 }
-extern "system" fn create_stream(
+/// Creates a stream from text or SSML.
+///
+/// # Safety
+///
+/// `words` is null or points to a NUL-terminated string valid for reads
+/// for the duration of the call, and `out` is null or valid for a write of
+/// a handle.
+unsafe extern "system" fn create_stream(
     _: This,
     _: *const u8,
     words: *const c_char,
@@ -64,7 +76,12 @@ extern "system" fn create_stream(
     tracing::debug!(text = text(words).unwrap_or_default(), "speech (silent)");
     put(out, &raw const STREAM)
 }
-extern "system" fn stream_size(_: This, _: *const u8, out: *mut usize) -> HRESULT {
+/// The size of a stream's WAVE file.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `usize`.
+unsafe extern "system" fn stream_size(_: This, _: *const u8, out: *mut usize) -> HRESULT {
     put(out, SILENCE.len())
 }
 /// Copies the empty WAVE file into the title's buffer.
@@ -126,19 +143,25 @@ mod tests {
     #[test]
     fn streams_are_empty_wave_files() {
         let this: This = &OBJECT;
-        type Create = extern "system" fn(This, *mut *const u8) -> HRESULT;
-        type Stream = extern "system" fn(This, *const u8, *const c_char, *mut *const u8) -> HRESULT;
-        type Size = extern "system" fn(This, *const u8, *mut usize) -> HRESULT;
-        type Data = extern "system" fn(This, *const u8, usize, *mut u8, *mut usize) -> HRESULT;
+        type Create = unsafe extern "system" fn(This, *mut *const u8) -> HRESULT;
+        type Stream =
+            unsafe extern "system" fn(This, *const u8, *const c_char, *mut *const u8) -> HRESULT;
+        type Size = unsafe extern "system" fn(This, *const u8, *mut usize) -> HRESULT;
+        type Data =
+            unsafe extern "system" fn(This, *const u8, usize, *mut u8, *mut usize) -> HRESULT;
         let (mut synth, mut stream, mut size) = (std::ptr::null(), std::ptr::null(), 0);
-        assert_eq!(method::<Create>(&OBJECT, 0x48)(this, &mut synth), S_OK);
+        // SAFETY: `synth` is a local handle to write.
+        assert_eq!(unsafe { method::<Create>(&OBJECT, 0x48)(this, &mut synth) }, S_OK);
         let say = method::<Stream>(&OBJECT, 0x68);
-        assert_eq!(say(this, synth, c"Hello".as_ptr(), &mut stream), S_OK);
-        assert_eq!(method::<Size>(&OBJECT, 0x78)(this, stream, &mut size), S_OK);
+        // SAFETY: a NUL-terminated literal and a local handle to write.
+        assert_eq!(unsafe { say(this, synth, c"Hello".as_ptr(), &mut stream) }, S_OK);
+        // SAFETY: `size` is a local to write.
+        assert_eq!(unsafe { method::<Size>(&OBJECT, 0x78)(this, stream, &mut size) }, S_OK);
         let mut wav = vec![0u8; size];
         let mut used = 0;
         let data = method::<Data>(&OBJECT, 0x80);
-        assert_eq!(data(this, stream, size, wav.as_mut_ptr(), &mut used), S_OK);
+        // SAFETY: `wav` holds `size` bytes and `used` is a local to write.
+        assert_eq!(unsafe { data(this, stream, size, wav.as_mut_ptr(), &mut used) }, S_OK);
         assert_eq!(
             (&wav[..4], &wav[8..16], &wav[36..40]),
             (&b"RIFF"[..], &b"WAVEfmt "[..], &b"data"[..])
