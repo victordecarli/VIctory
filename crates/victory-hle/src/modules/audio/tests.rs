@@ -4,7 +4,8 @@ use super::*;
 fn heap_maps_every_byte_of_a_block() {
     let _serial = lock(&CONTEXT_TESTS);
     let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
-    assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 128, 1), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { ApuAlloc(&mut ptr, &mut apu, 0x100, 128, 1) }, S_OK);
     assert!(apu != 0 && apu.is_multiple_of(128));
     let inner = ptr.cast::<u8>().wrapping_add(0x40).cast_const().cast();
     assert_eq!(ApuMapVirtualAddress(inner), apu + 0x40);
@@ -12,7 +13,8 @@ fn heap_maps_every_byte_of_a_block() {
     assert_eq!(heap_unmap(apu + 4), Some(ptr.cast::<u8>().wrapping_add(4)));
     ApuFree(ptr);
     assert_eq!(ApuMapVirtualAddress(ptr), 0);
-    assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 6, 1), E_INVALIDARG);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { ApuAlloc(&mut ptr, &mut apu, 0x100, 6, 1) }, E_INVALIDARG);
 }
 
 /// The context arrays and the heap exist once per process: tests that
@@ -25,10 +27,13 @@ fn heap_reuses_freed_addresses() {
     let _serial = lock(&CONTEXT_TESTS);
     let (mut a, mut b, mut c) = (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
     let (mut apu_a, mut apu_b, mut apu_c) = (0, 0, 0);
-    assert_eq!(ApuAlloc(&mut a, &mut apu_a, 0x1000, 0x1000, 1), S_OK);
-    assert_eq!(ApuAlloc(&mut b, &mut apu_b, 0x1000, 0x1000, 1), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { ApuAlloc(&mut a, &mut apu_a, 0x1000, 0x1000, 1) }, S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { ApuAlloc(&mut b, &mut apu_b, 0x1000, 0x1000, 1) }, S_OK);
     ApuFree(a);
-    assert_eq!(ApuAlloc(&mut c, &mut apu_c, 0x800, 0x800, 1), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { ApuAlloc(&mut c, &mut apu_c, 0x800, 0x800, 1) }, S_OK);
     // The freed range is free again, whichever part `c` took.
     assert!(
         lock(&HEAP).free.iter().any(|(&s, &e)| s <= apu_a + 0x800 && apu_a + 0x1000 <= e)
@@ -72,16 +77,19 @@ fn xma_contexts_decode_into_their_output_rings() {
         arrays: [std::ptr::null_mut(); 6],
         apu: [0; 6],
     };
-    assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { AcpHalAllocateShapeContexts(&mut request) }, S_OK);
     let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
 
     let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
-    assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1) }, S_OK);
     let stream = silent_stream();
     // SAFETY: two packets were allocated.
     unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
     let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
-    assert_eq!(ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2) }, S_OK);
     // SAFETY: the ring was just allocated.
     unsafe { output.cast::<u8>().write_bytes(0x55, 0x400) };
 
@@ -94,12 +102,18 @@ fn xma_contexts_decode_into_their_output_rings() {
     context.set(7, output_apu);
 
     let mut acp = std::ptr::null_mut();
-    assert_eq!(AcpHalCreate(&mut acp), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { AcpHalCreate(&mut acp) }, S_OK);
     // SAFETY: just created.
     let m = unsafe { (*acp).vtable };
-    assert_eq!((m.connect)(acp, 0x1000, 0x1000), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { (m.connect)(acp, 0x1000, 0x1000) }, S_OK);
     let submit = |command: u32, words: &[u32]| {
-        assert_eq!((m.submit)(acp, command, 0xf1, u32::MAX, words.as_ptr().cast(), 0), S_OK);
+        assert_eq!(
+            // SAFETY: this test's own locals, valid for the call.
+            unsafe { (m.submit)(acp, command, 0xf1, u32::MAX, words.as_ptr().cast(), 0) },
+            S_OK
+        );
     };
     submit(ENABLE_XMA, &[1]);
     xma().pump();
@@ -135,7 +149,8 @@ fn xma_contexts_decode_into_their_output_rings() {
 
     submit(DISABLE_XMA, &[1]);
     assert_eq!(produced(&xma()), None);
-    (m.release)(acp);
+    // SAFETY: this test's own locals, valid for the call.
+    unsafe { (m.release)(acp) };
     ApuFree(input);
     ApuFree(output);
     assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
@@ -144,23 +159,37 @@ fn xma_contexts_decode_into_their_output_rings() {
 #[test]
 fn full_message_queues_count_drops() {
     let mut acp = std::ptr::null_mut();
-    assert_eq!(AcpHalCreate(&mut acp), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { AcpHalCreate(&mut acp) }, S_OK);
     // SAFETY: just created.
     let m = unsafe { (*acp).vtable };
-    assert_eq!((m.connect)(acp, 16, 2), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { (m.connect)(acp, 16, 2) }, S_OK);
     let mask = COMMAND_COMPLETED;
-    assert_eq!((m.submit)(acp, REGISTER_MESSAGES, 0, u32::MAX, (&raw const mask).cast(), 0), S_OK);
+    assert_eq!(
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { (m.submit)(acp, REGISTER_MESSAGES, 0, u32::MAX, (&raw const mask).cast(), 0) },
+        S_OK
+    );
     for id in 1..=4 {
-        assert_eq!((m.submit)(acp, 12, id, u32::MAX, std::ptr::null(), 0), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { (m.submit)(acp, 12, id, u32::MAX, std::ptr::null(), 0) }, S_OK);
     }
-    assert_eq!((m.message_count)(acp), 2);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { (m.message_count)(acp) }, 2);
     let mut message = Message { kind: 0, dropped: 0, usec: 0, data: [0; 16] };
-    assert!((m.pop_message)(acp, &mut message) && (m.pop_message)(acp, &mut message));
-    assert_eq!((m.submit)(acp, 12, 5, u32::MAX, std::ptr::null(), 0), S_OK);
-    assert!((m.pop_message)(acp, &mut message));
+    // SAFETY: this test's own locals, valid for the call.
+    let popped = unsafe { (m.pop_message)(acp, &mut message) };
+    // SAFETY: as above.
+    assert!(popped && unsafe { (m.pop_message)(acp, &mut message) });
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { (m.submit)(acp, 12, 5, u32::MAX, std::ptr::null(), 0) }, S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert!(unsafe { (m.pop_message)(acp, &mut message) });
     let dropped = message.dropped;
     assert_eq!(dropped, 2);
-    (m.release)(acp);
+    // SAFETY: this test's own locals, valid for the call.
+    unsafe { (m.release)(acp) };
 }
 
 #[test]
@@ -173,7 +202,8 @@ fn startup_as_fmod_does_it() {
         apu: [0; 6],
     };
     assert_eq!(size_of::<ShapeContexts>(), 0x60);
-    assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { AcpHalAllocateShapeContexts(&mut request) }, S_OK);
     let arrays = request.arrays;
     assert!(!arrays[0].is_null() && !arrays[3].is_null() && !arrays[4].is_null());
     assert!(arrays[1].is_null());
@@ -183,21 +213,29 @@ fn startup_as_fmod_does_it() {
     // Connect, register every message but frame starts, then wait for
     // the registration to be acknowledged.
     let mut acp = std::ptr::null_mut();
-    assert_eq!(AcpHalCreate(&mut acp), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { AcpHalCreate(&mut acp) }, S_OK);
     // SAFETY: just created.
     let m = unsafe { (*acp).vtable };
-    assert_eq!((m.connect)(acp, 0x804, 0x804), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { (m.connect)(acp, 0x804, 0x804) }, S_OK);
     let mask = 0xfe_u32;
     let data = (&raw const mask).cast();
-    assert_eq!((m.submit)(acp, REGISTER_MESSAGES, 1, u32::MAX, data, 0), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { (m.submit)(acp, REGISTER_MESSAGES, 1, u32::MAX, data, 0) }, S_OK);
     let mut message = Message { kind: 0, dropped: 0, usec: 0, data: [0; 16] };
-    assert!((m.pop_message)(acp, &mut message));
+    // SAFETY: this test's own locals, valid for the call.
+    assert!(unsafe { (m.pop_message)(acp, &mut message) });
     let (kind, dropped) = (message.kind, message.dropped);
     assert_eq!((kind, dropped), (COMMAND_COMPLETED, 0));
     assert_eq!(u64::from_le_bytes(message.data[4..12].try_into().unwrap()), 1);
-    assert!(!(m.pop_message)(acp, &mut message));
-    assert_eq!((m.disconnect)(acp), S_OK);
-    assert_eq!((m.message_count)(acp), 1, "disconnected");
-    (m.release)(acp);
+    // SAFETY: this test's own locals, valid for the call.
+    assert!(!unsafe { (m.pop_message)(acp, &mut message) });
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { (m.disconnect)(acp) }, S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { (m.message_count)(acp) }, 1, "disconnected");
+    // SAFETY: this test's own locals, valid for the call.
+    unsafe { (m.release)(acp) };
     assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
 }

@@ -17,10 +17,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`ApuCreateHeap`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
@@ -190,7 +186,11 @@ fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
         .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
 }
 
-pub extern "system" fn ApuAlloc(
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer, and `apu` is null or
+/// valid for a write of a `u32`.
+pub unsafe extern "system" fn ApuAlloc(
     out: *mut *mut c_void,
     apu: *mut u32,
     size: u32,
@@ -203,7 +203,8 @@ pub extern "system" fn ApuAlloc(
     let Some((ptr, address)) = heap_alloc(size as usize, align as usize) else {
         return E_OUTOFMEMORY;
     };
-    // SAFETY: checked non-null; optional out parameter checked below.
+    // SAFETY: checked non-null; writable, per this function's contract; the
+    // optional `apu` is checked below.
     unsafe {
         out.write(ptr.cast());
         if !apu.is_null() {
@@ -243,7 +244,11 @@ const CONTEXT_BYTES: [usize; 6] = [32, 256, 256, 16, 64, 256];
 
 static CONTEXTS: Mutex<Option<[usize; 6]>> = Mutex::new(None);
 
-pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts) -> HRESULT {
+/// # Safety
+///
+/// `contexts` is null or valid for reads and writes of a `ShapeContexts`,
+/// unaligned.
+pub unsafe extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts) -> HRESULT {
     if contexts.is_null() {
         return E_INVALIDARG;
     }
@@ -251,7 +256,8 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     if allocated.is_some() {
         return E_FAIL;
     }
-    // SAFETY: the title passes its request; packed fields are copied out.
+    // SAFETY: checked non-null; readable, per this function's contract;
+    // packed fields are copied out.
     let counts = unsafe { std::ptr::addr_of!((*contexts).counts).read_unaligned() };
     let mut arrays: [*mut c_void; 6] = [std::ptr::null_mut(); 6];
     let mut addresses = [0u32; 6];
@@ -265,7 +271,7 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
         };
         (arrays[i], addresses[i]) = (ptr.cast(), apu);
     }
-    // SAFETY: as above.
+    // SAFETY: as above; writable too.
     unsafe {
         std::ptr::addr_of_mut!((*contexts).arrays).write_unaligned(arrays);
         std::ptr::addr_of_mut!((*contexts).apu).write_unaligned(addresses);
@@ -762,35 +768,46 @@ pub struct Acp {
 
 #[repr(C)]
 struct AcpMethods {
-    connect: extern "system" fn(*mut Acp, u32, u32) -> HRESULT,
-    disconnect: extern "system" fn(*mut Acp) -> HRESULT,
-    submit: extern "system" fn(*mut Acp, u32, u64, u32, *const c_void, u32) -> HRESULT,
-    pop_message: extern "system" fn(*mut Acp, *mut Message) -> bool,
-    message_count: extern "system" fn(*mut Acp) -> u32,
-    release: extern "system" fn(*mut Acp),
+    connect: unsafe extern "system" fn(*mut Acp, u32, u32) -> HRESULT,
+    disconnect: unsafe extern "system" fn(*mut Acp) -> HRESULT,
+    submit: unsafe extern "system" fn(*mut Acp, u32, u64, u32, *const c_void, u32) -> HRESULT,
+    pop_message: unsafe extern "system" fn(*mut Acp, *mut Message) -> bool,
+    message_count: unsafe extern "system" fn(*mut Acp) -> u32,
+    release: unsafe extern "system" fn(*mut Acp),
 }
 
 static ACP_METHODS: AcpMethods =
     AcpMethods { connect, disconnect, submit, pop_message, message_count, release };
 
-fn state(this: *mut Acp) -> MutexGuard<'static, State> {
-    // SAFETY: title code calls methods on the object `AcpHalCreate` made,
-    // which lives until `release`.
+/// # Safety
+///
+/// `this` is the live `Acp` `AcpHalCreate` made, which lives until
+/// `release`.
+unsafe fn state(this: *mut Acp) -> MutexGuard<'static, State> {
+    // SAFETY: `this` is a live `Acp`, per this function's contract.
     lock(unsafe { &(*this).state })
 }
 
-extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRESULT {
+/// # Safety
+///
+/// `this` is the live `Acp` `AcpHalCreate` made.
+unsafe extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRESULT {
     if commands == 0 {
         return E_INVALIDARG;
     }
-    let mut state = state(this);
+    // SAFETY: `this` as this function's contract gives it.
+    let mut state = unsafe { state(this) };
     state.connected = true;
     state.capacity = messages as usize;
     S_OK
 }
 
-extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
-    let mut state = state(this);
+/// # Safety
+///
+/// `this` is the live `Acp` `AcpHalCreate` made.
+unsafe extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
+    // SAFETY: `this` as this function's contract gives it.
+    let mut state = unsafe { state(this) };
     if !state.connected {
         return E_FAIL;
     }
@@ -802,7 +819,13 @@ extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
 /// Done at once: message registrations take effect, a flowgraph completes
 /// unprocessed, a command with an id is acknowledged, and its notification
 /// word is set.
-extern "system" fn submit(
+///
+/// # Safety
+///
+/// `this` is the live `Acp` `AcpHalCreate` made. `data` is null or valid
+/// for reads of the command's words, as many as it reads (up to the
+/// command's size).
+unsafe extern "system" fn submit(
     this: *mut Acp,
     command: u32,
     id: u64,
@@ -815,9 +838,11 @@ extern "system" fn submit(
         *lock(&SEEN) |= 1 << command;
         tracing::info!(command, "first coprocessor command of this kind");
     }
-    let mut state = state(this);
+    // SAFETY: `this` as this function's contract gives it.
+    let mut state = unsafe { state(this) };
     let word = |at: usize| -> Option<u32> {
-        // SAFETY: the command's data starts with these u32 fields.
+        // SAFETY: non-null, and the command's words, per this function's
+        // contract.
         (!data.is_null()).then(|| unsafe { data.cast::<u32>().add(at).read_unaligned() })
     };
     match command {
@@ -849,27 +874,44 @@ extern "system" fn submit(
     S_OK
 }
 
-extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
-    let Some(message) = state(this).messages.pop_front() else {
+/// # Safety
+///
+/// `this` is the live `Acp` `AcpHalCreate` made. `out` is null or valid for
+/// a write of a `Message`, unaligned.
+unsafe extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
+    // SAFETY: `this` as this function's contract gives it.
+    let Some(message) = unsafe { state(this) }.messages.pop_front() else {
         return false;
     };
     if !out.is_null() {
-        // SAFETY: the title passes room for one message.
+        // SAFETY: non-null; writable, per this function's contract.
         unsafe { out.write_unaligned(message) };
     }
     true
 }
 
-extern "system" fn message_count(this: *mut Acp) -> u32 {
-    state(this).messages.len() as u32
+/// # Safety
+///
+/// `this` is the live `Acp` `AcpHalCreate` made.
+unsafe extern "system" fn message_count(this: *mut Acp) -> u32 {
+    // SAFETY: `this` as this function's contract gives it.
+    unsafe { state(this) }.messages.len() as u32
 }
 
-extern "system" fn release(this: *mut Acp) {
-    // SAFETY: made by `AcpHalCreate` with `Box::into_raw`; released once.
+/// # Safety
+///
+/// `this` is the live `Acp` `AcpHalCreate` made, holding the only
+/// reference; it must not be used after this call.
+unsafe extern "system" fn release(this: *mut Acp) {
+    // SAFETY: made by `AcpHalCreate` with `Box::into_raw`; released once, per
+    // this function's contract.
     drop(unsafe { Box::from_raw(this) });
 }
 
-pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+pub unsafe extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -884,7 +926,7 @@ pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
             since: Instant::now(),
         }),
     });
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(Box::into_raw(acp)) };
     S_OK
 }
