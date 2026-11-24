@@ -1,9 +1,5 @@
 //! The display and what the system shell does for a title: HDR mode, screen
 //! timeout deferrals, launching URIs, screenshots.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{c_char, c_void};
 
@@ -88,12 +84,19 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     put(out, request)
 }
 
+/// Ends a deferral.
+///
+/// # Safety
+///
+/// `handle` is null or a request handle `acquire_deferral` handed out that
+/// the title has not closed yet.
 #[cfg(windows)]
-extern "system" fn close_deferral(_: This, handle: *mut c_void) {
+unsafe extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
     if !handle.is_null() {
-        // SAFETY: a request from `acquire_deferral`.
+        // SAFETY: non-null, so a live request from `acquire_deferral`, per
+        // this function's contract.
         unsafe {
             PowerClearRequest(handle, PowerRequestDisplayRequired);
             CloseHandle(handle);
