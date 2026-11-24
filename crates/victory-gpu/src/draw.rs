@@ -196,7 +196,8 @@ impl State {
         self.heaps = [0; 2];
         for &h in heaps {
             if !h.is_null() {
-                let samplers = crate::descriptor::heap(h).samplers();
+                // SAFETY: `h` is a descriptor heap the title set, non-null.
+                let samplers = unsafe { crate::descriptor::heap(h) }.samplers();
                 self.heaps[usize::from(samplers)] = h as usize;
             }
         }
@@ -315,7 +316,9 @@ impl State {
         self.heaps
             .iter()
             .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
+            // SAFETY: each is a descriptor heap the title set, which it keeps
+            // alive while a list uses it.
+            .map(|&h| unsafe { crate::descriptor::heap(h as This) })
             .find(|h| h.index(handle).is_some())
     }
 
@@ -415,7 +418,9 @@ impl State {
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                // SAFETY: each is a descriptor heap the title set, which it
+                // keeps alive while a list uses it.
+                .filter_map(|&h| unsafe { crate::descriptor::heap(h as This) }.host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
@@ -564,7 +569,9 @@ impl State {
         };
         let mut text = format!("{kind} {}", p.name);
         let views = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            // SAFETY: a descriptor heap the title set, which it keeps alive
+            // while a list uses it.
+            .then(|| unsafe { crate::descriptor::heap(self.heaps[0] as This) }.host())
             .flatten();
         for stage in &p.stages {
             let t = stage.translated();

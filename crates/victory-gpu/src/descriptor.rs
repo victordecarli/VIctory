@@ -5,10 +5,6 @@
 //! image and sampler descriptors, so a title that copies descriptors itself
 //! moves whole ones. Render target and depth views are ours alone; 128 bytes
 //! leaves room for whatever stride a title assumes.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
@@ -59,8 +55,12 @@ pub(crate) struct Heap {
     pending: std::sync::Mutex<Vec<u32>>,
 }
 
-pub(crate) fn heap<'a>(this: This) -> &'a Heap {
-    // SAFETY: called from descriptor heap methods only.
+/// # Safety
+///
+/// `this` is a live descriptor heap this module created, and it stays alive
+/// for `'a`.
+pub(crate) unsafe fn heap<'a>(this: This) -> &'a Heap {
+    // SAFETY: `this` is a live heap, per this function's contract.
     unsafe { &*this.cast::<Heap>() }
 }
 
@@ -227,7 +227,13 @@ impl RtvRecord {
 }
 
 /// Device method: records the view at `handle` (descriptor memory).
-pub(crate) extern "system" fn create_rtv(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of the view description. `handle` is 0
+/// or a descriptor slot valid for writes of a render target record (at
+/// least 112 bytes).
+pub(crate) unsafe extern "system" fn create_rtv(
     _: This,
     resource: This,
     desc: *const [u32; 6],
@@ -236,7 +242,7 @@ pub(crate) extern "system" fn create_rtv(
     if handle == 0 {
         return;
     }
-    // SAFETY: the title passes a description or null.
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let described = unsafe { desc.as_ref() };
     let record = RtvRecord {
         tag: RTV_TAG,
@@ -244,18 +250,25 @@ pub(crate) extern "system" fn create_rtv(
         resource,
         desc: described.copied().unwrap_or_default(),
     };
-    // SAFETY: the handle is a descriptor slot, at least 112 bytes.
+    // SAFETY: `handle` is a descriptor slot of at least 112 bytes, per this
+    // function's contract.
     unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
 }
 
 /// Device method: a depth view, recorded as render target views are.
-pub(crate) extern "system" fn create_dsv(
+///
+/// # Safety
+///
+/// As [`create_rtv`]: `desc` is null or readable, and `handle` is 0 or a
+/// descriptor slot valid for writes of 112 bytes.
+pub(crate) unsafe extern "system" fn create_dsv(
     this: This,
     resource: This,
     desc: *const [u32; 6],
     handle: u64,
 ) {
-    create_rtv(this, resource, desc, handle);
+    // SAFETY: the same pointers, as this function's contract gives them.
+    unsafe { create_rtv(this, resource, desc, handle) };
     if handle != 0 {
         // SAFETY: just written by `create_rtv`.
         unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
@@ -338,7 +351,11 @@ impl View {
     }
 }
 
-fn record(handle: u64, view: View) {
+/// # Safety
+///
+/// `handle` is 0 or the address of a descriptor slot in a heap, valid for
+/// writes of the slot (32 bytes).
+unsafe fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
@@ -364,7 +381,8 @@ fn record(handle: u64, view: View) {
         }
     };
     let generation = views.list[i as usize].1;
-    // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+    // SAFETY: `handle` is a descriptor slot, at least 16 bytes, per this
+    // function's contract.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
     #[cfg(windows)]
@@ -413,86 +431,164 @@ pub(crate) fn view(handle: u64) -> Option<View> {
 }
 
 /// A description of `N` words, if the title passes one.
-fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
-    // SAFETY: the title passes a description or null.
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads (unaligned) of `N` words.
+unsafe fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
+    // SAFETY: non-null, so `N` readable words, per this function's contract.
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of 4 words. `handle` is 0 or the
+/// address of a descriptor slot in a heap, valid for writes of the slot (32
+/// bytes).
+pub(crate) unsafe extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+    // SAFETY: `desc` and `handle` as this function's contract gives them.
+    if let Some([lo, hi, size, _]) = unsafe { words(desc) } {
         let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
+        // SAFETY: as above.
+        unsafe { record(handle, View::Constant(address, size)) };
     }
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_srv(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of 10 words. `handle` is 0 or the
+/// address of a descriptor slot in a heap, valid for writes of the slot (32
+/// bytes).
+pub(crate) unsafe extern "system" fn create_srv(
     _: This,
     resource: This,
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    record(handle, View::Shader(resource as usize, words(desc)));
+    // SAFETY: `desc` and `handle` as this function's contract gives them.
+    unsafe { record(handle, View::Shader(resource as usize, words(desc))) };
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_uav(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of 10 words. `handle` is 0 or the
+/// address of a descriptor slot in a heap, valid for writes of the slot (32
+/// bytes).
+pub(crate) unsafe extern "system" fn create_uav(
     _: This,
     resource: This,
     counter: This,
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    let view = View::Unordered(resource as usize, counter as usize, words(desc));
-    record(handle, view);
+    // SAFETY: `desc` and `handle` as this function's contract gives them.
+    unsafe {
+        let view = View::Unordered(resource as usize, counter as usize, words(desc));
+        record(handle, view);
+    }
 }
 
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
-pub(crate) extern "system" fn create_placed_srv(
+///
+/// # Safety
+///
+/// `resource` and `desc` are each null or valid for reads of 14 and 16
+/// words. `handle` is 0 or the address of a descriptor slot in a heap,
+/// valid for writes of the slot (32 bytes).
+pub(crate) unsafe extern "system" fn create_placed_srv(
     _: This,
     resource: *const [u32; 14],
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(false, resource, desc));
+    // SAFETY: the descriptions and `handle` as this function's contract
+    // gives them.
+    if let (Some(resource), Some(desc)) = unsafe { (words(resource), words(desc)) } {
+        // SAFETY: as above.
+        unsafe { record(handle, View::Placed(false, resource, desc)) };
     }
 }
 
-pub(crate) extern "system" fn create_placed_uav(
+/// # Safety
+///
+/// `resource` and `desc` are each null or valid for reads of 14 and 16
+/// words. `handle` is 0 or the address of a descriptor slot in a heap,
+/// valid for writes of the slot (32 bytes).
+pub(crate) unsafe extern "system" fn create_placed_uav(
     _: This,
     resource: *const [u32; 14],
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(true, resource, desc));
+    // SAFETY: the descriptions and `handle` as this function's contract
+    // gives them.
+    if let (Some(resource), Some(desc)) = unsafe { (words(resource), words(desc)) } {
+        // SAFETY: as above.
+        unsafe { record(handle, View::Placed(true, resource, desc)) };
     }
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_sampler(_: This, desc: *const [u32; 13], handle: u64) {
-    if let Some(desc) = words(desc) {
-        record(handle, View::Sampler(desc));
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of 13 words. `handle` is 0 or the
+/// address of a descriptor slot in a heap, valid for writes of the slot (32
+/// bytes).
+pub(crate) unsafe extern "system" fn create_sampler(_: This, desc: *const [u32; 13], handle: u64) {
+    // SAFETY: `desc` and `handle` as this function's contract gives them.
+    if let Some(desc) = unsafe { words(desc) } {
+        // SAFETY: as above.
+        unsafe { record(handle, View::Sampler(desc)) };
     }
 }
 
 /// Device method 0x1e8.
-pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], handle: u64) {
-    if let Some(desc) = words(desc) {
-        record(handle, View::ConsoleSampler(desc));
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of 27 words. `handle` is 0 or the
+/// address of a descriptor slot in a heap, valid for writes of the slot (32
+/// bytes).
+pub(crate) unsafe extern "system" fn create_sampler_x(
+    _: This,
+    desc: *const [u32; 27],
+    handle: u64,
+) {
+    // SAFETY: `desc` and `handle` as this function's contract gives them.
+    if let Some(desc) = unsafe { words(desc) } {
+        // SAFETY: as above.
+        unsafe { record(handle, View::ConsoleSampler(desc)) };
     }
 }
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
-pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
+///
+/// # Safety
+///
+/// `dst` and `src` are each 0 or the start of `count` descriptors of `kind`
+/// in a heap, valid for writes (`dst`) and reads (`src`) of that many
+/// bytes.
+pub(crate) unsafe extern "system" fn copy_simple(
+    _: This,
+    count: u32,
+    dst: u64,
+    src: u64,
+    kind: u32,
+) {
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
+        // SAFETY: both ranges are descriptor slots, per this function's
+        // contract.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
         for i in 0..u64::from(count) {
@@ -507,7 +603,13 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     clippy::too_many_arguments,
     reason = "the method's own arguments, fixed by the D3D12.X table it sits in"
 )]
-pub(crate) extern "system" fn copy(
+/// # Safety
+///
+/// `dst_starts` and `src_starts` are null or valid for reads of
+/// `dst_ranges` and `src_ranges` addresses, and the sizes arrays are null
+/// or valid for reads of as many counts; every range is a run of
+/// descriptors as for [`copy_simple`].
+pub(crate) unsafe extern "system" fn copy(
     _: This,
     dst_ranges: u32,
     dst_starts: *const u64,
@@ -525,7 +627,8 @@ pub(crate) extern "system" fn copy(
     let ranges = |n: u32, starts: *const u64, sizes: *const u32| -> Vec<(u64, u32)> {
         (0..n as usize)
             .map(|i| {
-                // SAFETY: the title passes `n` starts and sizes (or null sizes).
+                // SAFETY: `n` starts and sizes (or null sizes), per this
+                // function's contract.
                 unsafe { (*starts.add(i), if sizes.is_null() { 1 } else { *sizes.add(i) }) }
             })
             .collect()
@@ -543,7 +646,9 @@ pub(crate) extern "system" fn copy(
                 (to, room) = next;
             }
             let n = left.min(room);
-            copy_simple(std::ptr::null(), n, to, from, kind);
+            // SAFETY: the ranges the title named, per this function's
+            // contract.
+            unsafe { copy_simple(std::ptr::null(), n, to, from, kind) };
             let bytes = u64::from(n) * u64::from(step);
             (to, from, room, left) = (to + bytes, from + bytes, room - n, left - n);
         }
@@ -570,13 +675,21 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_heap(
+///
+/// # Safety
+///
+/// `desc_ptr` is null or valid for reads of a [`HeapDesc`], and so is the
+/// memory after it, which newer titles fill with a placement and older ones
+/// leave as their own stack or data (it is read as a hint). `iid` is null
+/// or points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_heap(
     _: This,
     desc_ptr: *const HeapDesc,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc_ptr` is null or readable, per this function's contract.
     let Some(&desc) = (unsafe { desc_ptr.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -584,8 +697,8 @@ pub(crate) extern "system" fn create_heap(
     else {
         return E_INVALIDARG;
     };
-    // SAFETY: read only as a hint: a title that passes the plain
-    // description has its own stack or data after it.
+    // SAFETY: read only as a hint: the memory after the description is
+    // readable, per this function's contract.
     let placement = unsafe { desc_ptr.add(1).cast::<Placement>().read_unaligned() };
     // shortcut: a placement is recognised by its size matching the count,
     // since the plain and extended descriptions share the slot and the
@@ -623,22 +736,46 @@ pub(crate) extern "system" fn create_heap(
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// `QueryInterface`.
+///
+/// # Safety
+///
+/// `this` is a live descriptor heap this module created. `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
+unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &HEAP_IIDS).then_some(this);
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+/// `Release`.
+///
+/// # Safety
+///
+/// `this` is a live descriptor heap this module created, holding the
+/// reference the caller gives up; it must not be used after the last one is
+/// released.
+unsafe extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn desc(this: This, out: *mut HeapDesc) {
+/// # Safety
+///
+/// `this` is a live descriptor heap this module created. `out` is null or
+/// valid for a write of a [`HeapDesc`].
+unsafe extern "system" fn desc(this: This, out: *mut HeapDesc) {
     if !out.is_null() {
-        // SAFETY: checked non-null; the title passes room for a description.
+        // SAFETY: checked non-null; writable, and `this` is a live heap,
+        // per this function's contract.
         unsafe { out.write(heap(this).desc) };
     }
 }
 /// The same address for the CPU and the GPU start.
-extern "system" fn start(this: This) -> u64 {
-    heap(this).start
+///
+/// # Safety
+///
+/// `this` is a live descriptor heap this module created.
+unsafe extern "system" fn start(this: This) -> u64 {
+    // SAFETY: `this` is a live heap, per this function's contract.
+    unsafe { heap(this) }.start
 }
 
 /// IUnknown 3, object 4, device child 1, heap 3.
@@ -665,7 +802,9 @@ mod tests {
 
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
-        create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+        // SAFETY: `extended` holds the description and a placement after it;
+        // a static id and a local to write.
+        unsafe { create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out) }
     }
 
     #[test]
@@ -675,9 +814,13 @@ mod tests {
         let none = Placement { address: 0, size: 0 };
         let mut h = null;
         assert_eq!(create(desc, none, &mut h), S_OK);
-        let cpu = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+        let start = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x48);
+        // SAFETY: `h` is the heap just created.
+        let cpu = unsafe { start(h) };
         assert_eq!(cpu % 64, 0);
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), cpu);
+        let gpu = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x50);
+        // SAFETY: as above.
+        assert_eq!(unsafe { gpu(h) }, cpu);
         assert_eq!(increment_size(null, 0), 32);
         // SAFETY: the heap holds 1000 descriptors of 32 bytes.
         unsafe { (cpu as *mut u8).add(999 * 32 + 31).write(1) };
@@ -692,17 +835,22 @@ mod tests {
         let mut heap = vec![0u64; 4 * 8]; // four 32-byte slots
         let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
         let (s0, s1, s2, s3) = (at(0), at(1), at(2), at(3));
-        create_cbv(null, &[0x1000, 1, 256, 0], s0);
+        // SAFETY: `s0` to `s3` are 32-byte slots in `heap`.
+        unsafe { create_cbv(null, &[0x1000, 1, 256, 0], s0) };
         assert_eq!(view(s0), Some(View::Constant(0x1_0000_1000, 256)));
-        create_srv(null, null, std::ptr::null(), s1);
+        // SAFETY: as above; a null description is tolerated.
+        unsafe { create_srv(null, null, std::ptr::null(), s1) };
         assert_eq!(view(s1), Some(View::Shader(0, None)));
         // The same view twice is one entry.
-        create_srv(null, null, std::ptr::null(), s2);
+        // SAFETY: as above.
+        unsafe { create_srv(null, null, std::ptr::null(), s2) };
         // SAFETY: both slots are in `heap`.
         assert_eq!(unsafe { *(s1 as *const [u32; 3]) }, unsafe { *(s2 as *const [u32; 3]) });
         // Two ranges of one into one range of two.
         let (dst, dst_n, src, src_n) = ([s2], [2u32], [s0, s1], [1u32, 1]);
-        copy(null, 1, dst.as_ptr(), dst_n.as_ptr(), 2, src.as_ptr(), src_n.as_ptr(), 0);
+        // SAFETY: the ranges are slots in `heap`; the arrays are locals of the
+        // lengths given.
+        unsafe { copy(null, 1, dst.as_ptr(), dst_n.as_ptr(), 2, src.as_ptr(), src_n.as_ptr(), 0) };
         assert_eq!(view(s2), view(s0));
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
@@ -717,11 +865,14 @@ mod tests {
         let slots = [0u64; 2 * 4];
         let (a, b) = (slots.as_ptr() as u64, slots.as_ptr() as u64 + 32);
         let resource = 0x7777_0000usize as This;
-        create_srv(null, resource, std::ptr::null(), a);
+        // SAFETY: `a` and `b` are 32-byte slots in `slots`; a null description
+        // is tolerated.
+        unsafe { create_srv(null, resource, std::ptr::null(), a) };
         assert_eq!(view(a), Some(View::Shader(0x7777_0000, None)));
         forget(0x7777_0000);
         assert_eq!(view(a), None, "stale after release");
-        create_srv(null, resource, std::ptr::null(), b);
+        // SAFETY: as above.
+        unsafe { create_srv(null, resource, std::ptr::null(), b) };
         assert_eq!(view(b), Some(View::Shader(0x7777_0000, None)));
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
@@ -737,10 +888,16 @@ mod tests {
         let desc = HeapDesc { kind: 0, count: 64, flags: 1, nodes: 1 };
         let mut h = std::ptr::null();
         assert_eq!(create(desc, Placement { address, size: 64 * 32 }, &mut h), S_OK);
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        let start = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x48);
+        let gpu = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x50);
+        // SAFETY: `h` is the heap just created.
+        assert_eq!(unsafe { start(h) }, address);
+        // SAFETY: as above.
+        assert_eq!(unsafe { gpu(h) }, address);
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
-        assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        let start = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x48);
+        // SAFETY: `h` is the second heap just created.
+        assert_ne!(unsafe { start(h) }, address);
     }
 }
