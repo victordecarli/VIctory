@@ -663,6 +663,7 @@ mod tests {
         // the code it points at outlives the call.
         let hr = unsafe { create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p) };
         assert_eq!(hr, S_OK);
+        let p = crate::test_support::valid(p);
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
