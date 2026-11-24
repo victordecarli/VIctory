@@ -1087,7 +1087,9 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
-    let Some((stride, args)) = crate::signature::layout(signature) else {
+    // SAFETY: `signature` is the title's `ExecuteIndirect` argument, a
+    // signature our device created and the title still holds for the call.
+    let Some((stride, args)) = (unsafe { crate::signature::layout(signature) }) else {
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);

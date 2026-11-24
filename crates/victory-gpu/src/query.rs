@@ -29,9 +29,10 @@ struct Heap {
 ///
 /// # Safety
 ///
-/// `desc` is null or points to a query heap description valid for reads
-/// for the duration of the call, as `CreateQueryHeap` requires. `iid` and
-/// `out` are passed on to `object::hand_out` unchanged.
+/// `desc` is null or points to a query heap description valid for reads for
+/// the duration of the call, as `CreateQueryHeap` requires. `iid` is null
+/// or points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
 pub(crate) unsafe extern "system" fn create(
     _: This,
     desc: *const Desc,
@@ -47,10 +48,23 @@ pub(crate) unsafe extern "system" fn create(
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// `QueryInterface`.
+///
+/// # Safety
+///
+/// `this` is a live query heap this module created. `iid` is null or points
+/// to an interface id valid for reads, and `out` is null or valid for a
+/// write of an object pointer, for the duration of the call.
+unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(QUERY_HEAP, iid, object::is(iid, &HEAP_IIDS).then_some(this), out)
 }
-extern "system" fn release(this: This) -> u32 {
+/// `Release`.
+///
+/// # Safety
+///
+/// `this` is a live query heap this module created, holding the reference
+/// the caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
 

@@ -2,10 +2,6 @@
 //! (titles wait for that before anything else) but reaches nothing, the
 //! connectivity hint never changes, and the title's security allow list,
 //! which comes from the service, cannot be fetched.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{c_char, c_void};
 
@@ -58,24 +54,52 @@ const OFFLINE: ConnectivityHint = ConnectivityHint {
 
 type This = *const Object;
 
-extern "system" fn udp_port(_: This, out: *mut u16) -> HRESULT {
+/// The preferred local UDP multiplayer port.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u16`.
+unsafe extern "system" fn udp_port(_: This, out: *mut u16) -> HRESULT {
     put(out, UDP_PORT)
 }
 
 /// Tells our port queries apart from other calls on the same block.
 static PORT: u8 = 0;
 
-extern "system" fn udp_port_async(_: This, block: *mut AsyncBlock) -> HRESULT {
+/// The same, as an async call.
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn udp_port_async(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::finished_with(block, (&raw const PORT).cast(), Ok(xasync::bytes(UDP_PORT)))
 }
-extern "system" fn udp_port_result(_: This, block: *mut AsyncBlock, out: *mut u16) -> HRESULT {
+/// The port from [`udp_port_async`].
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a `u16`.
+unsafe extern "system" fn udp_port_result(
+    _: This,
+    block: *mut AsyncBlock,
+    out: *mut u16,
+) -> HRESULT {
     xasync::result(block, (&raw const PORT).cast(), out)
 }
 
 static SECURITY: u8 = 0;
 
 /// The allow list comes from the service: unreachable offline.
-extern "system" fn security_info_async(
+///
+/// # Safety
+///
+/// `url` is null or points to a NUL-terminated string valid for reads for
+/// the duration of the call. `block` is null or an async block valid for
+/// reads and writes until the call this starts has completed and its
+/// result has been read.
+unsafe extern "system" fn security_info_async(
     _: This,
     url: *const c_char,
     block: *mut AsyncBlock,
@@ -83,10 +107,27 @@ extern "system" fn security_info_async(
     tracing::debug!(url = text(url).unwrap_or_default(), "security information: offline");
     xasync::finished(block, (&raw const SECURITY).cast(), UNREACHABLE)
 }
-extern "system" fn security_info_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
+/// The size of the security information's result.
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a `usize`.
+unsafe extern "system" fn security_info_size(
+    _: This,
+    block: *mut AsyncBlock,
+    out: *mut usize,
+) -> HRESULT {
     xasync::XAsyncGetResultSize(block, out)
 }
-extern "system" fn security_info_result(
+/// The security information itself (never, offline).
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `buffer` is null or valid for writes of
+/// `size` bytes, and `used` is null or valid for a write of a `usize`.
+unsafe extern "system" fn security_info_result(
     _: This,
     block: *mut AsyncBlock,
     size: usize,
@@ -106,12 +147,21 @@ extern "system" fn verify_certificate(
     UNREACHABLE
 }
 
-extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRESULT {
+/// The connectivity hint: offline, always.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a [`ConnectivityHint`].
+unsafe extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRESULT {
     put(out, OFFLINE)
 }
 
 /// The hint never changes offline, so the callback never runs.
-extern "system" fn register(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe extern "system" fn register(
     _: This,
     _queue: *const c_void,
     _context: *mut c_void,
@@ -162,29 +212,35 @@ mod tests {
     #[test]
     fn offline_but_initialized() {
         let this: This = &OBJECT;
-        type Hint = extern "system" fn(This, *mut ConnectivityHint) -> HRESULT;
+        type Hint = unsafe extern "system" fn(This, *mut ConnectivityHint) -> HRESULT;
         let mut hint = OFFLINE;
         hint.initialized = false;
-        assert_eq!(method::<Hint>(&OBJECT, 0x78)(this, &mut hint), S_OK);
+        // SAFETY: `hint` is a local to write.
+        assert_eq!(unsafe { method::<Hint>(&OBJECT, 0x78)(this, &mut hint) }, S_OK);
         assert!(hint.initialized && hint.level == 1);
         assert_eq!(size_of::<ConnectivityHint>(), 16);
 
-        type Begin = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
-        type Port = extern "system" fn(This, *mut AsyncBlock, *mut u16) -> HRESULT;
+        type Begin = unsafe extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type Port = unsafe extern "system" fn(This, *mut AsyncBlock, *mut u16) -> HRESULT;
         let mut b = block();
-        assert_eq!(method::<Begin>(&OBJECT, 0x20)(this, &mut b), S_OK);
+        // SAFETY: `b` outlives the call, which completes before it is read.
+        assert_eq!(unsafe { method::<Begin>(&OBJECT, 0x20)(this, &mut b) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         let mut port = 0;
-        assert_eq!(method::<Port>(&OBJECT, 0x28)(this, &mut b, &mut port), S_OK);
+        // SAFETY: `b` is the block just started, `port` a local to write.
+        assert_eq!(unsafe { method::<Port>(&OBJECT, 0x28)(this, &mut b, &mut port) }, S_OK);
         assert_eq!(port, 3074);
 
-        type Url = extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
-        type Size = extern "system" fn(This, *mut AsyncBlock, *mut usize) -> HRESULT;
+        type Url = unsafe extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type Size = unsafe extern "system" fn(This, *mut AsyncBlock, *mut usize) -> HRESULT;
         let mut b = block();
         let url = c"https://example.invalid/";
-        assert_eq!(method::<Url>(&OBJECT, 0x40)(this, url.as_ptr(), &mut b), S_OK);
+        // SAFETY: a NUL-terminated literal; `b` outlives the call.
+        assert_eq!(unsafe { method::<Url>(&OBJECT, 0x40)(this, url.as_ptr(), &mut b) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), UNREACHABLE);
         let mut size = 0;
-        assert_eq!(method::<Size>(&OBJECT, 0x48)(this, &mut b, &mut size), UNREACHABLE);
+        let get_size = method::<Size>(&OBJECT, 0x48);
+        // SAFETY: `b` is the block just started, `size` a local to write.
+        assert_eq!(unsafe { get_size(this, &mut b, &mut size) }, UNREACHABLE);
     }
 }

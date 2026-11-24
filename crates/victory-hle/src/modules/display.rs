@@ -1,9 +1,5 @@
 //! The display and what the system shell does for a title: HDR mode, screen
 //! timeout deferrals, launching URIs, screenshots.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{c_char, c_void};
 
@@ -51,15 +47,24 @@ extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) 
 
 /// Nothing launches URIs for the title: no store, browser or console app
 /// exists here, and the console's are online services.
-extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char) -> HRESULT {
+///
+/// # Safety
+///
+/// `uri` is null or points to a NUL-terminated string valid for reads for
+/// the duration of the call.
+unsafe extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char) -> HRESULT {
     tracing::info!(uri = text(uri).unwrap_or_default(), "URI not launched");
     NOT_SUPPORTED
 }
 
 /// A deferral keeps the host display on, as on the console, through a
 /// power request; the handle is that request.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a handle.
 #[cfg(windows)]
-extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     use windows_sys::Win32::System::Power::{
         PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
     };
@@ -88,12 +93,19 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     put(out, request)
 }
 
+/// Ends a deferral.
+///
+/// # Safety
+///
+/// `handle` is null or a request handle `acquire_deferral` handed out that
+/// the title has not closed yet.
 #[cfg(windows)]
-extern "system" fn close_deferral(_: This, handle: *mut c_void) {
+unsafe extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
     if !handle.is_null() {
-        // SAFETY: a request from `acquire_deferral`.
+        // SAFETY: non-null, so a live request from `acquire_deferral`, per
+        // this function's contract.
         unsafe {
             PowerClearRequest(handle, PowerRequestDisplayRequired);
             CloseHandle(handle);
@@ -161,11 +173,14 @@ mod tests {
     fn sdr_and_display_deferrals() {
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
         assert_eq!(method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()), 2);
-        type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
-        type Close = extern "system" fn(This, *mut c_void);
+        type Acquire = unsafe extern "system" fn(This, *mut *mut c_void) -> HRESULT;
+        type Close = unsafe extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
-        assert_eq!(method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle), S_OK);
+        let acquire = method::<Acquire>(&SHELL_OBJECT, 0x20);
+        // SAFETY: `handle` is a local to write.
+        assert_eq!(unsafe { acquire(&SHELL_OBJECT, &mut handle) }, S_OK);
         assert!(!handle.is_null());
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+        // SAFETY: the request `acquire` just handed out, closed once.
+        unsafe { method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle) };
     }
 }

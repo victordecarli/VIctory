@@ -1,9 +1,5 @@
 //! Command signatures: the record layout of indirect execution. Kept for
 //! translating it later.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use crate::object::{
     self, COMMAND_SIGNATURE, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid,
@@ -34,14 +30,24 @@ struct Signature {
 }
 
 /// Device method.
-pub(crate) extern "system" fn create(
+///
+/// # Safety
+///
+/// `desc` is null or points to a command signature description valid for
+/// reads for the duration of the call, as `CreateCommandSignature`
+/// requires; when its `count` is non-zero, its `arguments` is null or
+/// points to `count` argument descriptions valid for reads for the same
+/// duration. `iid` is null or points to an interface id valid for reads,
+/// and `out` is null or valid for a write of an object pointer, for the
+/// duration of the call.
+pub(crate) unsafe extern "system" fn create(
     _: This,
     desc: *const Desc,
     _root: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -51,7 +57,8 @@ pub(crate) extern "system" fn create(
     let arguments = if desc.count == 0 {
         Vec::new()
     } else {
-        // SAFETY: the title passes `count` argument descriptions.
+        // SAFETY: `arguments` is non-null here and points to `count`
+        // readable descriptions, per this function's contract.
         unsafe { std::slice::from_raw_parts(desc.arguments, desc.count as usize) }.to_vec()
     };
     tracing::debug!(stride = desc.stride, ?arguments, "command signature");
@@ -62,20 +69,40 @@ pub(crate) extern "system" fn create(
 
 /// A signature's record stride and arguments (type, then up to three
 /// fields each).
-pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
+///
+/// # Safety
+///
+/// `this` is null or a signature this module created with `create` and the
+/// title has not released, and it stays alive for `'a`.
+pub(crate) unsafe fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
     if this.is_null() {
         return None;
     }
-    // SAFETY: the title passes one of our signatures.
+    // SAFETY: `this` is one of our live signatures, per this function's
+    // contract.
     let s = unsafe { &*this.cast::<Signature>() };
     Some((s.stride, &s.arguments))
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// `QueryInterface`.
+///
+/// # Safety
+///
+/// `this` is a live command signature this module created. `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
+unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
     object::answer(COMMAND_SIGNATURE, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+/// `Release`.
+///
+/// # Safety
+///
+/// `this` is a live command signature this module created, holding the
+/// reference the caller gives up; it must not be used after the last one is
+/// released.
+unsafe extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Signature>(this)
 }
 
