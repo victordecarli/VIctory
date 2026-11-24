@@ -1399,17 +1399,22 @@ mod tests {
         use crate::modules::xmem;
         let mut pages = [0usize; 2];
         let mut n = 2;
-        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        // SAFETY: the arguments are this test's locals, valid for the call.
+        assert_eq!(unsafe { xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()) }, 1);
         // Where the title would see them: a reservation of 64 KiB pages.
-        let mapped = xmem::XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            2 * PAGE,
-            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-            0,
-            0x04,
-        );
+        // SAFETY: the arguments are this test's locals, valid for the call.
+        let mapped = unsafe {
+            xmem::XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * PAGE,
+                0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+                0,
+                0x04,
+            )
+        };
         assert!(!mapped.is_null());
-        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
+        // SAFETY: the arguments are this test's locals, valid for the call.
+        assert_eq!(unsafe { xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()) }, mapped);
 
         let plain = pattern(100);
         let (queue, array) = (new_queue(1), status_array(1));
@@ -1435,7 +1440,9 @@ mod tests {
         use crate::modules::xmem;
         let allocate = |n: usize| {
             let (mut pages, mut given) = (vec![0usize; n], n);
-            assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()), 1);
+            let (given_ptr, pages_ptr) = (&mut given, pages.as_mut_ptr());
+            // SAFETY: the arguments are this test's locals, valid for the call.
+            assert_eq!(unsafe { xmem::XMemAllocatePhysicalPages(0, given_ptr, pages_ptr) }, 1);
             pages
         };
         let (a, b) = (allocate(3), allocate(1));
@@ -1461,22 +1468,29 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         for pages in &destinations {
-            let mapped = xmem::XMemVirtualAlloc(
-                std::ptr::null_mut(),
-                3 * PAGE,
-                0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-                0,
-                0x04,
-            );
+            // SAFETY: the arguments are this test's locals, valid for the call.
+            let mapped = unsafe {
+                xmem::XMemVirtualAlloc(
+                    std::ptr::null_mut(),
+                    3 * PAGE,
+                    0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+                    0,
+                    0x04,
+                )
+            };
             assert!(!mapped.is_null());
-            assert_eq!(xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()), mapped);
+            // SAFETY: the arguments are this test's locals, valid for the call.
+            assert_eq!(unsafe { xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()) }, mapped);
             // SAFETY: all three pages are mapped read-write.
             let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
             assert!(seen[..50].iter().all(|&b| b == 0));
             assert_eq!(seen[50..50 + plain.len()], plain);
-            assert_eq!(xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()), mapped);
+            // SAFETY: the arguments are this test's locals, valid for the call.
+            assert_eq!(unsafe { xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()) }, mapped);
         }
-        assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
-        assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+        // SAFETY: the arguments are this test's locals, valid for the call.
+        assert_eq!(unsafe { xmem::XMemFreePhysicalPages(3, a.as_ptr()) }, 1);
+        // SAFETY: the arguments are this test's locals, valid for the call.
+        assert_eq!(unsafe { xmem::XMemFreePhysicalPages(1, b.as_ptr()) }, 1);
     }
 }

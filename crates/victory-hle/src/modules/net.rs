@@ -19,10 +19,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`WSAConnect`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 #![allow(clippy::too_many_arguments, reason = "the signature is fixed by the API title code calls")]
 
 use std::ffi::{CStr, c_char, c_void};
@@ -114,14 +110,20 @@ fn winhttp_failure<T>(value: T) -> T {
     value
 }
 
-fn narrow(text: *const c_char) -> Option<String> {
+/// # Safety
+///
+/// `text` is null or points to a NUL-terminated string.
+unsafe fn narrow(text: *const c_char) -> Option<String> {
     (!text.is_null()).then(|| {
         // SAFETY: the title passes a NUL-terminated string.
         unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
     })
 }
 
-fn wide(text: *const u16) -> Option<String> {
+/// # Safety
+///
+/// `text` is null or points to a NUL-terminated UTF-16 string.
+unsafe fn wide(text: *const u16) -> Option<String> {
     // SAFETY: the title passes a NUL-terminated string or null.
     (!text.is_null()).then(|| unsafe {
         let len = (0..).take_while(|&i| *text.add(i) != 0).count();
@@ -130,7 +132,11 @@ fn wide(text: *const u16) -> Option<String> {
 }
 
 /// An IPv4 or IPv6 `sockaddr` of `len` bytes.
-fn socket_addr(addr: *const u8, len: i32) -> Option<SocketAddr> {
+///
+/// # Safety
+///
+/// `addr` is null or valid for reads of `len` bytes.
+unsafe fn socket_addr(addr: *const u8, len: i32) -> Option<SocketAddr> {
     let len = usize::try_from(len).ok()?;
     if addr.is_null() || len < 4 {
         return None;
@@ -146,7 +152,11 @@ fn socket_addr(addr: *const u8, len: i32) -> Option<SocketAddr> {
 }
 
 /// A raw address of family `kind` (`gethostbyaddr` style).
-fn raw_ip(addr: *const c_char, len: i32, kind: i32) -> Option<IpAddr> {
+///
+/// # Safety
+///
+/// `addr` is null or valid for reads of `len` bytes.
+unsafe fn raw_ip(addr: *const c_char, len: i32, kind: i32) -> Option<IpAddr> {
     let len = usize::try_from(len).ok()?;
     if addr.is_null() {
         return None;
@@ -176,8 +186,13 @@ fn shown(addr: Option<impl ToString>) -> String {
 
 /// True for a loopback `sockaddr`; otherwise logs it and sets
 /// `WSAENETUNREACH`. Other address families count as off the machine.
-fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
-    match socket_addr(addr, len) {
+///
+/// # Safety
+///
+/// `addr` is null or valid for reads of `len` bytes.
+unsafe fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
+    // SAFETY: as this function's contract gives them.
+    match unsafe { socket_addr(addr, len) } {
         Some(a) if loopback(a.ip()) => true,
         a => {
             once(what, shown(a));
@@ -232,10 +247,15 @@ fn reverse_resolvable(ip: Option<IpAddr>) -> bool {
 
 /// `getnameinfo` flags that keep a host name lookup on the machine: the
 /// numeric form, as without a network, or `None` if a name is required.
-fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Option<i32> {
+///
+/// # Safety
+///
+/// `sa` is null or valid for reads of `len` bytes.
+unsafe fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Option<i32> {
     if !host_wanted
         || flags & NI_NUMERICHOST != 0
-        || reverse_resolvable(socket_addr(sa, len).map(|a| a.ip()))
+        // SAFETY: as this function's contract gives them.
+        || reverse_resolvable(unsafe { socket_addr(sa, len) }.map(|a| a.ip()))
     {
         Some(flags)
     } else if flags & NI_NAMEREQD != 0 {
@@ -248,8 +268,14 @@ fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Op
 
 // Connects.
 
-pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+/// # Safety
+///
+/// `name` is null or valid as the Windows API this stands in for requires:
+/// a buffer for its stated size, a NUL-terminated string, or a structure of
+/// its type, for the duration of the call.
+pub unsafe extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
+    // SAFETY: as this function's contract gives them.
+    if !unsafe { reachable("network connect blocked", name, len) } {
         return SOCKET_ERROR;
     }
     match try_host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32) {
@@ -258,7 +284,13 @@ pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
     }
 }
 
-pub extern "system" fn WSAConnect(
+/// # Safety
+///
+/// `name`, `caller_data`, `callee_data`, `sqos`, `gqos` are null or valid
+/// as the Windows API this stands in for requires: a buffer for its stated
+/// size, a NUL-terminated string, or a structure of its type, for the
+/// duration of the call.
+pub unsafe extern "system" fn WSAConnect(
     s: Socket,
     name: *const u8,
     len: i32,
@@ -267,7 +299,8 @@ pub extern "system" fn WSAConnect(
     sqos: *const c_void,
     gqos: *const c_void,
 ) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    // SAFETY: as this function's contract gives them.
+    if !unsafe { reachable("network connect blocked", name, len) } {
         return SOCKET_ERROR;
     }
     match try_host!("ws2_32.dll", "WSAConnect": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void) -> i32)
@@ -277,7 +310,13 @@ pub extern "system" fn WSAConnect(
     }
 }
 
-pub extern "system" fn WSAConnectByNameA(
+/// # Safety
+///
+/// `node`, `service`, `local_len`, `local`, `remote_len`, `remote`,
+/// `timeout`, `reserved` are null or valid as the Windows API this stands
+/// in for requires: a buffer for its stated size, a NUL-terminated string,
+/// or a structure of its type, for the duration of the call.
+pub unsafe extern "system" fn WSAConnectByNameA(
     s: Socket,
     node: *const c_char,
     service: *const c_char,
@@ -288,19 +327,24 @@ pub extern "system" fn WSAConnectByNameA(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
-    if !reachable_name(narrow(node)) {
+    // SAFETY: as this function's contract gives them.
+    if !reachable_name(unsafe { narrow(node) }) {
         return 0;
     }
     match try_host!("ws2_32.dll", "WSAConnectByNameA": extern "system" fn(Socket, *const c_char, *const c_char, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)
     {
-        Some(f) => f(
-            s, node, service, local_len, local, remote_len, remote, timeout, reserved,
-        ),
+        Some(f) => f(s, node, service, local_len, local, remote_len, remote, timeout, reserved),
         None => winsock_failure(0),
     }
 }
 
-pub extern "system" fn WSAConnectByNameW(
+/// # Safety
+///
+/// `node`, `service`, `local_len`, `local`, `remote_len`, `remote`,
+/// `timeout`, `reserved` are null or valid as the Windows API this stands
+/// in for requires: a buffer for its stated size, a NUL-terminated string,
+/// or a structure of its type, for the duration of the call.
+pub unsafe extern "system" fn WSAConnectByNameW(
     s: Socket,
     node: *const u16,
     service: *const u16,
@@ -311,14 +355,13 @@ pub extern "system" fn WSAConnectByNameW(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
-    if !reachable_name(wide(node)) {
+    // SAFETY: as this function's contract gives them.
+    if !reachable_name(unsafe { wide(node) }) {
         return 0;
     }
     match try_host!("ws2_32.dll", "WSAConnectByNameW": extern "system" fn(Socket, *const u16, *const u16, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)
     {
-        Some(f) => f(
-            s, node, service, local_len, local, remote_len, remote, timeout, reserved,
-        ),
+        Some(f) => f(s, node, service, local_len, local, remote_len, remote, timeout, reserved),
         None => winsock_failure(0),
     }
 }
@@ -332,7 +375,14 @@ struct SocketAddress {
 }
 
 /// Every candidate must be loopback.
-pub extern "system" fn WSAConnectByList(
+///
+/// # Safety
+///
+/// `list`, `local_len`, `local`, `remote_len`, `remote`, `timeout`,
+/// `reserved` are null or valid as the Windows API this stands in for
+/// requires: a buffer for its stated size, a NUL-terminated string, or a
+/// structure of its type, for the duration of the call.
+pub unsafe extern "system" fn WSAConnectByList(
     s: Socket,
     list: *const u8,
     local_len: *mut u32,
@@ -348,20 +398,25 @@ pub extern "system" fn WSAConnectByList(
             let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
             std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
         };
-        if !entries.iter().all(|e| reachable("network connect blocked", e.addr, e.len)) {
+        // SAFETY: as this function's contract gives them.
+        if !entries.iter().all(|e| unsafe { reachable("network connect blocked", e.addr, e.len) }) {
             return 0;
         }
     }
     match try_host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)
     {
-        Some(f) => f(
-            s, list, local_len, local, remote_len, remote, timeout, reserved,
-        ),
+        Some(f) => f(s, list, local_len, local, remote_len, remote, timeout, reserved),
         None => winsock_failure(0),
     }
 }
 
-pub extern "system" fn WSAJoinLeaf(
+/// # Safety
+///
+/// `name`, `caller_data`, `callee_data`, `sqos`, `gqos` are null or valid
+/// as the Windows API this stands in for requires: a buffer for its stated
+/// size, a NUL-terminated string, or a structure of its type, for the
+/// duration of the call.
+pub unsafe extern "system" fn WSAJoinLeaf(
     s: Socket,
     name: *const u8,
     len: i32,
@@ -371,7 +426,8 @@ pub extern "system" fn WSAJoinLeaf(
     gqos: *const c_void,
     flags: u32,
 ) -> Socket {
-    if !reachable("network connect blocked", name, len) {
+    // SAFETY: as this function's contract gives them.
+    if !unsafe { reachable("network connect blocked", name, len) } {
         return INVALID_SOCKET;
     }
     match try_host!("ws2_32.dll", "WSAJoinLeaf": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void, u32) -> Socket)
@@ -382,7 +438,14 @@ pub extern "system" fn WSAJoinLeaf(
 }
 
 /// `ConnectEx` as `WSAIoctl` hands it out: vetted, then the socket's own.
-extern "system" fn connect_ex(
+///
+/// # Safety
+///
+/// `name`, `send`, `sent`, `overlapped` are null or valid as the Windows
+/// API this stands in for requires: a buffer for its stated size, a
+/// NUL-terminated string, or a structure of its type, for the duration of
+/// the call.
+unsafe extern "system" fn connect_ex(
     s: Socket,
     name: *const u8,
     len: i32,
@@ -391,7 +454,8 @@ extern "system" fn connect_ex(
     sent: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    // SAFETY: as this function's contract gives them.
+    if !unsafe { reachable("network connect blocked", name, len) } {
         return 0;
     }
     let (mut real, mut size) = (0usize, 0u32);
@@ -454,9 +518,8 @@ pub extern "system" fn WSAIoctl(
     else {
         return winsock_failure(SOCKET_ERROR);
     };
-    let result = ioctl(
-        s, code, input, input_len, output, output_len, returned, overlapped, completion,
-    );
+    let result =
+        ioctl(s, code, input, input_len, output, output_len, returned, overlapped, completion);
     if result == 0 && code == SIO_GET_EXTENSION_FUNCTION_POINTER && input_len >= 16 {
         // SAFETY: the host just read a GUID from `input` and wrote a pointer to `output`.
         unsafe {
@@ -475,7 +538,13 @@ pub extern "system" fn WSAIoctl(
 
 /// Without an address it sends to the connected peer, which `connect` vetted;
 /// so does a stream socket whatever `to` says (Winsock ignores it there).
-pub extern "system" fn sendto(
+///
+/// # Safety
+///
+/// `buf`, `to` are null or valid as the Windows API this stands in for
+/// requires: a buffer for its stated size, a NUL-terminated string, or a
+/// structure of its type, for the duration of the call.
+pub unsafe extern "system" fn sendto(
     s: Socket,
     buf: *const u8,
     len: i32,
@@ -483,7 +552,9 @@ pub extern "system" fn sendto(
     to: *const u8,
     to_len: i32,
 ) -> i32 {
-    if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
+    // SAFETY: as this function's contract gives them.
+    if !to.is_null() && !stream(s) && !unsafe { reachable("network datagram blocked", to, to_len) }
+    {
         return SOCKET_ERROR;
     }
     match try_host!("ws2_32.dll", "sendto": extern "system" fn(Socket, *const u8, i32, i32, *const u8, i32) -> i32)
@@ -493,7 +564,13 @@ pub extern "system" fn sendto(
     }
 }
 
-pub extern "system" fn WSASendTo(
+/// # Safety
+///
+/// `buffers`, `sent`, `to`, `overlapped`, `completion` are null or valid as
+/// the Windows API this stands in for requires: a buffer for its stated
+/// size, a NUL-terminated string, or a structure of its type, for the
+/// duration of the call.
+pub unsafe extern "system" fn WSASendTo(
     s: Socket,
     buffers: *const c_void,
     count: u32,
@@ -504,14 +581,14 @@ pub extern "system" fn WSASendTo(
     overlapped: *mut c_void,
     completion: *const c_void,
 ) -> i32 {
-    if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
+    // SAFETY: as this function's contract gives them.
+    if !to.is_null() && !stream(s) && !unsafe { reachable("network datagram blocked", to, to_len) }
+    {
         return SOCKET_ERROR;
     }
     match try_host!("ws2_32.dll", "WSASendTo": extern "system" fn(Socket, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32)
     {
-        Some(f) => f(
-            s, buffers, count, sent, flags, to, to_len, overlapped, completion,
-        ),
+        Some(f) => f(s, buffers, count, sent, flags, to, to_len, overlapped, completion),
         None => winsock_failure(SOCKET_ERROR),
     }
 }
@@ -538,7 +615,13 @@ struct MessageName {
     len: i32,
 }
 
-pub extern "system" fn WSASendMsg(
+/// # Safety
+///
+/// `message`, `sent`, `overlapped`, `completion` are null or valid as the
+/// Windows API this stands in for requires: a buffer for its stated size, a
+/// NUL-terminated string, or a structure of its type, for the duration of
+/// the call.
+pub unsafe extern "system" fn WSASendMsg(
     s: Socket,
     message: *const c_void,
     flags: u32,
@@ -549,7 +632,8 @@ pub extern "system" fn WSASendMsg(
     // SAFETY: the title passes a `WSAMSG` or null.
     if let Some(m) = unsafe { message.cast::<MessageName>().as_ref() }
         && !m.name.is_null()
-        && !reachable("network datagram blocked", m.name, m.len)
+        // SAFETY: as this function's contract gives them.
+        && !unsafe { reachable("network datagram blocked", m.name, m.len) }
     {
         return SOCKET_ERROR;
     }
@@ -564,13 +648,19 @@ pub extern "system" fn WSASendMsg(
 /// any other address is not ours (`WSAEADDRNOTAVAIL`).
 // shortcut: `[::]` becomes `[::1]`, so a dual-stack listener no longer hears
 // 127.0.0.1; bind both families if a title relies on that.
-pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
+/// # Safety
+///
+/// `name` is null or valid as the Windows API this stands in for requires:
+/// a buffer for its stated size, a NUL-terminated string, or a structure of
+/// its type, for the duration of the call.
+pub unsafe extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
     let Some(host_bind) =
         try_host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32)
     else {
         return winsock_failure(SOCKET_ERROR);
     };
-    match socket_addr(name, len) {
+    // SAFETY: as this function's contract gives them.
+    match unsafe { socket_addr(name, len) } {
         Some(a) if loopback(a.ip()) => host_bind(s, name, len),
         Some(a) if a.ip().is_unspecified() => {
             once("network bind narrowed to loopback", a.to_string());
@@ -592,13 +682,20 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
-pub extern "system" fn getaddrinfo(
+/// # Safety
+///
+/// `node`, `service`, `hints`, `result` are null or valid as the Windows
+/// API this stands in for requires: a buffer for its stated size, a
+/// NUL-terminated string, or a structure of its type, for the duration of
+/// the call.
+pub unsafe extern "system" fn getaddrinfo(
     node: *const c_char,
     service: *const c_char,
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(narrow(node)) {
+    // SAFETY: as this function's contract gives them.
+    if !resolvable(unsafe { narrow(node) }) {
         return WSAHOST_NOT_FOUND;
     }
     match try_host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)
@@ -608,13 +705,20 @@ pub extern "system" fn getaddrinfo(
     }
 }
 
-pub extern "system" fn GetAddrInfoW(
+/// # Safety
+///
+/// `node`, `service`, `hints`, `result` are null or valid as the Windows
+/// API this stands in for requires: a buffer for its stated size, a
+/// NUL-terminated string, or a structure of its type, for the duration of
+/// the call.
+pub unsafe extern "system" fn GetAddrInfoW(
     node: *const u16,
     service: *const u16,
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(wide(node)) {
+    // SAFETY: as this function's contract gives them.
+    if !resolvable(unsafe { wide(node) }) {
         return WSAHOST_NOT_FOUND;
     }
     match try_host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)
@@ -624,7 +728,14 @@ pub extern "system" fn GetAddrInfoW(
     }
 }
 
-pub extern "system" fn GetAddrInfoExA(
+/// # Safety
+///
+/// `name`, `service`, `provider`, `hints`, `result`, `timeout`,
+/// `overlapped`, `completion`, `handle` are null or valid as the Windows
+/// API this stands in for requires: a buffer for its stated size, a
+/// NUL-terminated string, or a structure of its type, for the duration of
+/// the call.
+pub unsafe extern "system" fn GetAddrInfoExA(
     name: *const c_char,
     service: *const c_char,
     namespace: u32,
@@ -636,7 +747,8 @@ pub extern "system" fn GetAddrInfoExA(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(narrow(name)) {
+    // SAFETY: as this function's contract gives them.
+    if !resolvable(unsafe { narrow(name) }) {
         return WSAHOST_NOT_FOUND;
     }
     match try_host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)
@@ -649,7 +761,14 @@ pub extern "system" fn GetAddrInfoExA(
     }
 }
 
-pub extern "system" fn GetAddrInfoExW(
+/// # Safety
+///
+/// `name`, `service`, `provider`, `hints`, `result`, `timeout`,
+/// `overlapped`, `completion`, `handle` are null or valid as the Windows
+/// API this stands in for requires: a buffer for its stated size, a
+/// NUL-terminated string, or a structure of its type, for the duration of
+/// the call.
+pub unsafe extern "system" fn GetAddrInfoExW(
     name: *const u16,
     service: *const u16,
     namespace: u32,
@@ -661,7 +780,8 @@ pub extern "system" fn GetAddrInfoExW(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(wide(name)) {
+    // SAFETY: as this function's contract gives them.
+    if !resolvable(unsafe { wide(name) }) {
         return WSAHOST_NOT_FOUND;
     }
     match try_host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)
@@ -674,8 +794,14 @@ pub extern "system" fn GetAddrInfoExW(
     }
 }
 
-pub extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
-    if !resolvable(narrow(name)) {
+/// # Safety
+///
+/// `name` is null or valid as the Windows API this stands in for requires:
+/// a buffer for its stated size, a NUL-terminated string, or a structure of
+/// its type, for the duration of the call.
+pub unsafe extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
+    // SAFETY: as this function's contract gives them.
+    if !resolvable(unsafe { narrow(name) }) {
         return std::ptr::null_mut();
     }
     match try_host!("ws2_32.dll", "gethostbyname": extern "system" fn(*const c_char) -> *mut c_void)
@@ -685,14 +811,20 @@ pub extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
     }
 }
 
-pub extern "system" fn WSAAsyncGetHostByName(
+/// # Safety
+///
+/// `name`, `buf` are null or valid as the Windows API this stands in for
+/// requires: a buffer for its stated size, a NUL-terminated string, or a
+/// structure of its type, for the duration of the call.
+pub unsafe extern "system" fn WSAAsyncGetHostByName(
     window: Handle,
     message: u32,
     name: *const c_char,
     buf: *mut c_char,
     buf_len: i32,
 ) -> Handle {
-    if !resolvable(narrow(name)) {
+    // SAFETY: as this function's contract gives them.
+    if !resolvable(unsafe { narrow(name) }) {
         return std::ptr::null_mut();
     }
     match try_host!("ws2_32.dll", "WSAAsyncGetHostByName": extern "system" fn(Handle, u32, *const c_char, *mut c_char, i32) -> Handle)
@@ -727,8 +859,18 @@ pub extern "system" fn WSALookupServiceBeginW(
 
 // Reverse lookups.
 
-pub extern "system" fn gethostbyaddr(addr: *const c_char, len: i32, kind: i32) -> *mut c_void {
-    if !reverse_resolvable(raw_ip(addr, len, kind)) {
+/// # Safety
+///
+/// `addr` is null or valid as the Windows API this stands in for requires:
+/// a buffer for its stated size, a NUL-terminated string, or a structure of
+/// its type, for the duration of the call.
+pub unsafe extern "system" fn gethostbyaddr(
+    addr: *const c_char,
+    len: i32,
+    kind: i32,
+) -> *mut c_void {
+    // SAFETY: as this function's contract gives them.
+    if !reverse_resolvable(unsafe { raw_ip(addr, len, kind) }) {
         wsa_error(WSAHOST_NOT_FOUND);
         return std::ptr::null_mut();
     }
@@ -739,7 +881,12 @@ pub extern "system" fn gethostbyaddr(addr: *const c_char, len: i32, kind: i32) -
     }
 }
 
-pub extern "system" fn WSAAsyncGetHostByAddr(
+/// # Safety
+///
+/// `addr`, `buf` are null or valid as the Windows API this stands in for
+/// requires: a buffer for its stated size, a NUL-terminated string, or a
+/// structure of its type, for the duration of the call.
+pub unsafe extern "system" fn WSAAsyncGetHostByAddr(
     window: Handle,
     message: u32,
     addr: *const c_char,
@@ -748,7 +895,8 @@ pub extern "system" fn WSAAsyncGetHostByAddr(
     buf: *mut c_char,
     buf_len: i32,
 ) -> Handle {
-    if !reverse_resolvable(raw_ip(addr, len, kind)) {
+    // SAFETY: as this function's contract gives them.
+    if !reverse_resolvable(unsafe { raw_ip(addr, len, kind) }) {
         wsa_error(WSAHOST_NOT_FOUND);
         return std::ptr::null_mut();
     }
@@ -759,7 +907,12 @@ pub extern "system" fn WSAAsyncGetHostByAddr(
     }
 }
 
-pub extern "system" fn getnameinfo(
+/// # Safety
+///
+/// `sa`, `host`, `serv` are null or valid as the Windows API this stands in
+/// for requires: a buffer for its stated size, a NUL-terminated string, or
+/// a structure of its type, for the duration of the call.
+pub unsafe extern "system" fn getnameinfo(
     sa: *const u8,
     sa_len: i32,
     host: *mut c_char,
@@ -768,7 +921,9 @@ pub extern "system" fn getnameinfo(
     serv_len: u32,
     flags: i32,
 ) -> i32 {
-    let Some(flags) = name_info_flags(sa, sa_len, !host.is_null(), flags) else {
+    // SAFETY: as this function's contract gives them.
+    let numeric = unsafe { name_info_flags(sa, sa_len, !host.is_null(), flags) };
+    let Some(flags) = numeric else {
         return WSAHOST_NOT_FOUND;
     };
     match try_host!("ws2_32.dll", "getnameinfo": extern "system" fn(*const u8, i32, *mut c_char, u32, *mut c_char, u32, i32) -> i32)
@@ -778,7 +933,12 @@ pub extern "system" fn getnameinfo(
     }
 }
 
-pub extern "system" fn GetNameInfoW(
+/// # Safety
+///
+/// `sa`, `host`, `serv` are null or valid as the Windows API this stands in
+/// for requires: a buffer for its stated size, a NUL-terminated string, or
+/// a structure of its type, for the duration of the call.
+pub unsafe extern "system" fn GetNameInfoW(
     sa: *const u8,
     sa_len: i32,
     host: *mut u16,
@@ -787,7 +947,9 @@ pub extern "system" fn GetNameInfoW(
     serv_len: u32,
     flags: i32,
 ) -> i32 {
-    let Some(flags) = name_info_flags(sa, sa_len, !host.is_null(), flags) else {
+    // SAFETY: as this function's contract gives them.
+    let numeric = unsafe { name_info_flags(sa, sa_len, !host.is_null(), flags) };
+    let Some(flags) = numeric else {
         return WSAHOST_NOT_FOUND;
     };
     match try_host!("ws2_32.dll", "GetNameInfoW": extern "system" fn(*const u8, i32, *mut u16, u32, *mut u16, u32, i32) -> i32)
@@ -801,13 +963,20 @@ pub extern "system" fn GetNameInfoW(
 
 /// The one door to a server: requests, uploads and WebSockets all hang off
 /// the handle this returns.
-pub extern "system" fn WinHttpConnect(
+///
+/// # Safety
+///
+/// `server` is null or valid as the Windows API this stands in for
+/// requires: a buffer for its stated size, a NUL-terminated string, or a
+/// structure of its type, for the duration of the call.
+pub unsafe extern "system" fn WinHttpConnect(
     session: Handle,
     server: *const u16,
     port: u16,
     reserved: u32,
 ) -> Handle {
-    if let Some(name) = wide(server)
+    // SAFETY: as this function's contract gives them.
+    if let Some(name) = unsafe { wide(server) }
         && !loopback_name(&name)
     {
         once("HTTP connection blocked", format!("{name}:{port}"));
@@ -836,13 +1005,9 @@ pub extern "system" fn WinHttpOpen(
     }
     match try_host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)
     {
-        Some(f) => f(
-            agent,
-            WINHTTP_ACCESS_TYPE_NO_PROXY,
-            std::ptr::null(),
-            std::ptr::null(),
-            flags,
-        ),
+        Some(f) => {
+            f(agent, WINHTTP_ACCESS_TYPE_NO_PROXY, std::ptr::null(), std::ptr::null(), flags)
+        }
         None => winhttp_failure(std::ptr::null_mut()),
     }
 }
@@ -970,180 +1135,4 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use victory_pe::ImportSymbol;
-
-    fn v4(ip: [u8; 4], port: u16) -> [u8; 16] {
-        let mut a = [0u8; 16];
-        a[..2].copy_from_slice(&AF_INET.to_le_bytes());
-        a[2..4].copy_from_slice(&port.to_be_bytes());
-        a[4..8].copy_from_slice(&ip);
-        a
-    }
-
-    // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
-    const AWAY: [u8; 4] = [192, 0, 2, 1];
-    const HOME: [u8; 4] = [127, 0, 0, 1];
-
-    /// What a call returns when the host lacks the function behind it.
-    #[test]
-    #[cfg(windows)]
-    fn a_missing_host_export_fails_the_call() {
-        let _starts_winsock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let last_error = try_host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32)
-            .expect("ws2_32 exports WSAGetLastError");
-        assert_eq!(winsock_failure(SOCKET_ERROR), SOCKET_ERROR);
-        assert_eq!(last_error(), WSAENETDOWN);
-        assert_eq!(lookup_failure(), WSANO_RECOVERY);
-        assert_eq!(last_error(), WSANO_RECOVERY);
-        assert!(winhttp_failure(std::ptr::null_mut::<c_void>()).is_null());
-        // SAFETY: no arguments.
-        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        assert_eq!(error, ERROR_WINHTTP_INTERNAL_ERROR);
-    }
-
-    #[test]
-    fn only_loopback_is_reachable() {
-        // Also starts Winsock for the raw calls below.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let socket = try_host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket)
-            .expect("ws2_32 exports socket");
-        let close = try_host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32)
-            .expect("ws2_32 exports closesocket");
-        let last_error = try_host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32)
-            .expect("ws2_32 exports WSAGetLastError");
-        let null = std::ptr::null_mut::<c_void>();
-
-        // Connects.
-        let s = socket(2, 1, 6);
-        assert_ne!(s, INVALID_SOCKET);
-        assert_eq!(connect(s, v4(AWAY, 80).as_ptr(), 16), SOCKET_ERROR);
-        assert_eq!(last_error(), WSAENETUNREACH);
-        let n = null.cast();
-        assert_eq!(
-            WSAConnectByNameA(
-                s,
-                c"example.com".as_ptr(),
-                c"80".as_ptr(),
-                n,
-                null,
-                n,
-                null,
-                null,
-                null
-            ),
-            0
-        );
-        assert_eq!(last_error(), WSAHOST_NOT_FOUND);
-        assert_eq!(connect(s, v4(HOME, port).as_ptr(), 16), 0);
-        listener.accept().unwrap();
-        // A stream socket sends to its vetted peer whatever `to` says.
-        assert_eq!(sendto(s, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16), 1);
-        close(s);
-
-        // `ConnectEx` from `WSAIoctl` is the vetted one.
-        let s = socket(2, 1, 6);
-        let mut f = 0usize;
-        let mut size = 0u32;
-        let guid = WSAID_CONNECTEX;
-        let got = WSAIoctl(
-            s,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            (&raw const guid).cast(),
-            16,
-            (&raw mut f).cast(),
-            8,
-            &mut size,
-            null,
-            null,
-        );
-        assert_eq!((got, f), (0, connect_ex as *const () as usize));
-        assert_eq!(connect_ex(s, v4(AWAY, 80).as_ptr(), 16, null, 0, n, null), 0);
-        assert_eq!(last_error(), WSAENETUNREACH);
-        close(s);
-
-        // Datagram sends.
-        let u = socket(2, 2, 17);
-        assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16), SOCKET_ERROR);
-        assert_eq!(last_error(), WSAENETUNREACH);
-        assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, v4(HOME, port).as_ptr(), 16), 1);
-        close(u);
-
-        // Forward and reverse lookups.
-        let mut result = null;
-        assert_eq!(
-            getaddrinfo(c"example.com".as_ptr(), std::ptr::null(), std::ptr::null(), &mut result),
-            WSAHOST_NOT_FOUND
-        );
-        let name: Vec<u16> = "example.com\0".encode_utf16().collect();
-        assert_eq!(
-            GetAddrInfoW(name.as_ptr(), std::ptr::null(), std::ptr::null(), &mut result),
-            WSAHOST_NOT_FOUND
-        );
-        let mut text = [0 as c_char; 64];
-        let away = v4(AWAY, 80);
-        assert_eq!(
-            getnameinfo(away.as_ptr(), 16, text.as_mut_ptr(), 64, std::ptr::null_mut(), 0, 0),
-            0
-        );
-        // SAFETY: NUL-terminated by `getnameinfo`.
-        let numeric = unsafe { CStr::from_ptr(text.as_ptr()) };
-        assert_eq!(numeric.to_str(), Ok("192.0.2.1"));
-        assert_eq!(
-            getnameinfo(
-                away.as_ptr(),
-                16,
-                text.as_mut_ptr(),
-                64,
-                std::ptr::null_mut(),
-                0,
-                NI_NAMEREQD
-            ),
-            WSAHOST_NOT_FOUND
-        );
-        assert!(gethostbyaddr(AWAY.as_ptr().cast(), 4, 2).is_null());
-
-        // WinHTTP.
-        assert!(WinHttpConnect(null, name.as_ptr(), 443, 0).is_null());
-        // SAFETY: no arguments.
-        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        assert_eq!(error, ERROR_WINHTTP_CANNOT_CONNECT);
-        assert_eq!(
-            WinHttpGetProxyForUrlEx(null, name.as_ptr(), std::ptr::null(), 0),
-            ERROR_WINHTTP_AUTODETECTION_FAILED
-        );
-
-        // The ordinals we override name the functions they stand for.
-        let m = module();
-        for e in m.exports.iter().filter(|e| e.name.starts_with('#')) {
-            let named = m
-                .exports
-                .iter()
-                .find(|n| n.address == e.address && !n.name.starts_with('#'))
-                .unwrap();
-            let by_ordinal = ImportSymbol::Ordinal(e.name[1..].parse().unwrap());
-            assert_eq!(
-                crate::HostPolicy::default().resolve("ws2_32.dll", &by_ordinal),
-                crate::host::function("ws2_32.dll", named.name),
-                "{} is not {}",
-                e.name,
-                named.name
-            );
-        }
-        // Every override names a real export of its DLL. Some exports only
-        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
-        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
-        // them only when the host really lacks them.
-        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
-        for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
-            let dll = if e.name.starts_with("WinHttp") { "winhttp.dll" } else { "ws2_32.dll" };
-            let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
-                continue;
-            }
-            assert!(present, "{dll} lacks {}", e.name);
-        }
-    }
-}
+mod tests;
