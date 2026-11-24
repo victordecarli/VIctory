@@ -18,10 +18,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`XDspDisconnect`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -79,7 +75,13 @@ pub struct Command {
     reserved: u64,
 }
 
-pub extern "system" fn XDspConnectWithMaximumStreamLimit(
+/// Connects the DSP, with `base` as its memory block.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a connection pointer. `base` is
+/// only checked for null here, never read or written.
+pub unsafe extern "system" fn XDspConnectWithMaximumStreamLimit(
     base: *mut c_void,
     base_length: u32,
     ir_seconds: u32,
@@ -100,17 +102,24 @@ pub extern "system" fn XDspConnectWithMaximumStreamLimit(
     }
     tracing::info!(base_length, ir_seconds, max_streams, max_channels, "audio DSP connected");
     let dsp = Box::new(Dsp { max_streams, active: Mutex::new(0) });
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(Box::into_raw(dsp)) };
     S_OK
 }
 
-pub extern "system" fn XDspDisconnect(dsp: *mut Dsp) -> HRESULT {
+/// Disconnects the DSP.
+///
+/// # Safety
+///
+/// `dsp` is null or a connection `XDspConnectWithMaximumStreamLimit` made
+/// that is not disconnected yet and has no active stream. It must not be
+/// used afterwards.
+pub unsafe extern "system" fn XDspDisconnect(dsp: *mut Dsp) -> HRESULT {
     if dsp.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: made by `XDspConnectWithMaximumStreamLimit`; disconnected
-    // once, after its streams.
+    // SAFETY: non-null, so a live connection that is disconnected once,
+    // after its streams, per this function's contract.
     drop(unsafe { Box::from_raw(dsp) });
     S_OK
 }
@@ -127,7 +136,15 @@ fn valid(desc: &StreamDesc) -> bool {
     shape && (options & STEREO_OPTIONS == 0 || channels == 2)
 }
 
-pub extern "system" fn XDspActivate(
+/// Starts a stream on the connection.
+///
+/// # Safety
+///
+/// `dsp` is null or a live connection. `desc` is null or valid for reads of
+/// a [`StreamDesc`] for the duration of the call. `status` and `stream` are
+/// null or valid for a write of a pointer; the status block handed back
+/// lives as long as the stream.
+pub unsafe extern "system" fn XDspActivate(
     dsp: *mut Dsp,
     desc: *const StreamDesc,
     status: *mut *const Status,
@@ -139,7 +156,7 @@ pub extern "system" fn XDspActivate(
     if dsp.is_null() || desc.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: checked non-null; the title passes its description.
+    // SAFETY: checked non-null; readable, per this function's contract.
     let desc = unsafe { &*desc };
     if !valid(desc) {
         return E_INVALIDARG;
@@ -147,7 +164,8 @@ pub extern "system" fn XDspActivate(
     let (kind, options, frames, channels) = (desc.kind, desc.options, desc.frames, desc.channels);
     tracing::debug!(kind, options, frames, channels, "audio DSP stream activated");
     {
-        // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
+        // SAFETY: checked non-null, so a live connection, per this
+        // function's contract.
         let dsp = unsafe { &*dsp };
         let mut active = dsp.active.lock().unwrap_or_else(|e| e.into_inner());
         if *active >= dsp.max_streams {
@@ -161,7 +179,8 @@ pub extern "system" fn XDspActivate(
         channels: desc.channels,
         status: Box::new(Status { submitted: 0, completed: 0, reserved: 0, result: S_OK }),
     });
-    // SAFETY: checked non-null.
+    // SAFETY: both checked non-null; writable, per this function's
+    // contract.
     unsafe {
         status.write(&*new.status);
         stream.write(Box::into_raw(new));
@@ -169,20 +188,36 @@ pub extern "system" fn XDspActivate(
     S_OK
 }
 
-pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
+/// Ends a stream.
+///
+/// # Safety
+///
+/// `stream` is null or a stream `XDspActivate` made that is not deactivated
+/// yet, on a connection that is still live. It, and the status block that
+/// came with it, must not be used afterwards.
+pub unsafe extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     if stream.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: made by `XDspActivate`; deactivated once.
+    // SAFETY: non-null, so a live stream that is deactivated once, per
+    // this function's contract.
     let stream = unsafe { Box::from_raw(stream) };
-    // SAFETY: the connection outlives its streams.
+    // SAFETY: the connection is live, per this function's contract.
     let dsp = unsafe { &*stream.dsp };
     *dsp.active.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
     S_OK
 }
 
 /// Completes the command at once: its output block is silence.
-pub extern "system" fn XDspSubmitCommand(
+///
+/// # Safety
+///
+/// `stream` is null or a live stream no other call is using at the same
+/// time. `command` is null or valid for reads of a [`Command`] whose
+/// `output`, if non-null, is valid for writes of one block of the stream
+/// (frames times channels floats). `ticket` is null or valid for a write of
+/// a `u32`.
+pub unsafe extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
     ticket: *mut u32,
@@ -190,11 +225,13 @@ pub extern "system" fn XDspSubmitCommand(
     if stream.is_null() || command.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: a stream from `XDspActivate`, the title's command.
+    // SAFETY: both checked non-null; live and readable, per this
+    // function's contract.
     let (stream, command) = unsafe { (&mut *stream, &*command) };
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        // SAFETY: the title's output buffer holds one block of the stream.
+        // SAFETY: non-null, and one block of the stream, per this
+        // function's contract.
         unsafe { std::ptr::write_bytes(command.output, 0, samples) };
     }
     let status = &mut *stream.status;
@@ -206,7 +243,7 @@ pub extern "system" fn XDspSubmitCommand(
         std::ptr::write_volatile(&mut status.completed, next);
     }
     if !ticket.is_null() {
-        // SAFETY: optional out parameter.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { ticket.write(next) };
     }
     S_OK
@@ -234,17 +271,18 @@ mod tests {
     fn convolution_stream_as_the_title_drives_it() {
         let mut base = vec![0u8; 0x10_0000];
         let mut dsp = std::ptr::null_mut();
-        assert_eq!(
+        // SAFETY: `base` is a local block, `dsp` a local to write.
+        let connected = unsafe {
             XDspConnectWithMaximumStreamLimit(
                 base.as_mut_ptr().cast(),
                 0x10_0000,
                 24,
                 0x80,
                 1,
-                &mut dsp
-            ),
-            S_OK
-        );
+                &mut dsp,
+            )
+        };
+        assert_eq!(connected, S_OK);
         let ir = vec![0f32; 0x800];
         // Stereo convolution with option 2, as the title asks for.
         let desc = StreamDesc {
@@ -256,7 +294,8 @@ mod tests {
             ir: ir.as_ptr(),
         };
         let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
-        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        // SAFETY: `dsp` is the live connection, the rest are locals.
+        assert_eq!(unsafe { XDspActivate(dsp, &desc, &mut status, &mut stream) }, S_OK);
         let mut output = vec![1f32; 0x800];
         let input = vec![0.5f32; 0x800];
         let command = Command {
@@ -266,16 +305,21 @@ mod tests {
             reserved: 0,
         };
         let mut ticket = 0;
-        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        // SAFETY: `stream` is live and unshared; `command.output` holds a
+        // block (0x400 frames, 2 channels) and `ticket` is a local.
+        assert_eq!(unsafe { XDspSubmitCommand(stream, &command, &mut ticket) }, S_OK);
         // SAFETY: the stream's status block.
         let (completed, result) = unsafe { ((*status).completed, (*status).result) };
         assert_eq!((completed, result), (ticket, S_OK));
         assert!(output.iter().all(|&s| s == 0.0));
-        assert_eq!(XDspDeactivate(stream), S_OK);
+        // SAFETY: `stream` is live and deactivated once; `status` is not
+        // read afterwards.
+        assert_eq!(unsafe { XDspDeactivate(stream) }, S_OK);
 
         // Mono streams refuse stereo options; transforms are mono only.
         let bad = StreamDesc { channels: 1, ..desc };
-        assert_eq!(XDspActivate(dsp, &bad, &mut status, &mut stream), E_INVALIDARG);
+        // SAFETY: as above.
+        assert_eq!(unsafe { XDspActivate(dsp, &bad, &mut status, &mut stream) }, E_INVALIDARG);
         let transform = StreamDesc {
             kind: 2,
             options: 0,
@@ -284,8 +328,11 @@ mod tests {
             ir: std::ptr::null(),
             ..desc
         };
-        assert_eq!(XDspActivate(dsp, &transform, &mut status, &mut stream), S_OK);
-        assert_eq!(XDspDeactivate(stream), S_OK);
-        assert_eq!(XDspDisconnect(dsp), S_OK);
+        // SAFETY: as above.
+        assert_eq!(unsafe { XDspActivate(dsp, &transform, &mut status, &mut stream) }, S_OK);
+        // SAFETY: `stream` is live and deactivated once.
+        assert_eq!(unsafe { XDspDeactivate(stream) }, S_OK);
+        // SAFETY: `dsp` is live and has no active stream left.
+        assert_eq!(unsafe { XDspDisconnect(dsp) }, S_OK);
     }
 }

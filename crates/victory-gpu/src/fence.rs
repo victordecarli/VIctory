@@ -1,9 +1,5 @@
 //! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
 //! GPU yet, so only signals (the title's, later our queues') move one.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -30,12 +26,23 @@ struct Fence {
     waiters: Mutex<Vec<(u64, usize)>>,
 }
 
-fn fence<'a>(this: This) -> &'a Fence {
-    // SAFETY: called from fence methods only.
+/// # Safety
+///
+/// `this` is a live fence this module created, and it stays alive for `'a`
+/// (fences are never destroyed while the title holds a reference).
+unsafe fn fence<'a>(this: This) -> &'a Fence {
+    // SAFETY: `this` is one of our live fences, per this function's contract.
     unsafe { &*this.cast::<Fence>() }
 }
 
-pub(crate) extern "system" fn create(
+/// Device method.
+///
+/// # Safety
+///
+/// `iid` is null or points to an interface id valid for reads, and `out` is
+/// null or valid for a write of an object pointer, for the duration of the
+/// call.
+pub(crate) unsafe extern "system" fn create(
     _: This,
     initial: u64,
     flags: u32,
@@ -62,17 +69,47 @@ fn set_event(event: usize) {
     let _ = event;
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// `QueryInterface`.
+///
+/// # Safety
+///
+/// `this` is a live fence this module created. `iid` is null or points to
+/// an interface id valid for reads, and `out` is null or valid for a write
+/// of an object pointer, for the duration of the call.
+unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(FENCE, iid, object::is(iid, &FENCE_IIDS).then_some(this), out)
 }
-extern "system" fn release(this: This) -> u32 {
+/// `Release`.
+///
+/// # Safety
+///
+/// `this` is a live fence this module created, holding the reference the
+/// caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
-extern "system" fn completed(this: This) -> u64 {
-    fence(this).value.load(Ordering::Acquire)
+/// `GetCompletedValue`.
+///
+/// # Safety
+///
+/// `this` is a live fence this module created.
+unsafe extern "system" fn completed(this: This) -> u64 {
+    // SAFETY: `this` is a live fence, per this function's contract.
+    unsafe { fence(this) }.value.load(Ordering::Acquire)
 }
-extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
-    let fence = fence(this);
+/// `SetEventOnCompletion`.
+///
+/// # Safety
+///
+/// `this` is a live fence this module created. `event` is null or an event
+/// handle valid until the fence reaches `value`.
+unsafe extern "system" fn set_event_on_completion(
+    this: This,
+    value: u64,
+    event: *mut c_void,
+) -> HRESULT {
+    // SAFETY: `this` is a live fence, per this function's contract.
+    let fence = unsafe { fence(this) };
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -89,8 +126,14 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
-pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
-    let fence = fence(this);
+/// `Signal`.
+///
+/// # Safety
+///
+/// `this` is a live fence this module created.
+pub(crate) unsafe extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    // SAFETY: `this` is a live fence, per this function's contract.
+    let fence = unsafe { fence(this) };
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
     waiters.retain(|&(wanted, event)| {
@@ -103,12 +146,22 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     S_OK
 }
 
-extern "system" fn creation_flags(this: This) -> u32 {
-    fence(this).flags
+/// # Safety
+///
+/// `this` is a live fence this module created.
+unsafe extern "system" fn creation_flags(this: This) -> u32 {
+    // SAFETY: `this` is a live fence, per this function's contract.
+    unsafe { fence(this) }.flags
 }
 /// Where the value lives (GPU addresses are CPU addresses).
-extern "system" fn gpu_address(this: This) -> u64 {
-    (&raw const fence(this).value) as u64
+///
+/// # Safety
+///
+/// `this` is a live fence this module created.
+unsafe extern "system" fn gpu_address(this: This) -> u64 {
+    // SAFETY: `this` is a live fence, per this function's contract.
+    let fence = unsafe { fence(this) };
+    (&raw const fence.value) as u64
 }
 
 /// IUnknown 3, object 4, device child 1, fence 3, fence 1 (2, a console
@@ -138,29 +191,41 @@ mod tests {
         use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
         let mut f = std::ptr::null();
-        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 1);
+        // SAFETY: a static interface id and a local to write.
+        assert_eq!(unsafe { create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f) }, S_OK);
+        let completed = slot::<unsafe extern "system" fn(This) -> u64>(f, 0x40);
+        // SAFETY: `f` is the fence just created; every call below uses it
+        // before its last reference is released at the end.
+        assert_eq!(unsafe { completed(f) }, 1);
         // SAFETY: plain auto-reset event.
         let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         assert!(!event.is_null());
-        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
-        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
-        assert_eq!(wait(f, 5, event), S_OK);
+        let wait = slot::<unsafe extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<unsafe extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        // SAFETY: `f` is live and `event` is a valid event handle.
+        assert_eq!(unsafe { wait(f, 5, event) }, S_OK);
         // SAFETY: a valid event.
         assert_ne!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(signal(f, 5), S_OK);
+        // SAFETY: `f` is live.
+        assert_eq!(unsafe { signal(f, 5) }, S_OK);
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 5, event), S_OK, "already reached");
+        // SAFETY: as above.
+        assert_eq!(unsafe { wait(f, 5, event) }, S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        // SAFETY: as above; null is a tolerated event.
+        assert_eq!(unsafe { wait(f, 9, std::ptr::null_mut()) }, E_NOTIMPL);
         // Grand Theft Auto VI reads the value at the fence's address.
-        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
+        let gpu_address = slot::<unsafe extern "system" fn(This) -> u64>(f, 0x60);
+        // SAFETY: `f` is live.
+        let at = unsafe { gpu_address(f) };
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+        let release = slot::<unsafe extern "system" fn(This) -> u32>(f, 0x10);
+        // SAFETY: `f` is live; this releases the only reference.
+        assert_eq!(unsafe { release(f) }, 0);
     }
 }

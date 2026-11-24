@@ -393,26 +393,35 @@ mod tests {
     /// interface the device itself answers to.
     #[test]
     fn the_device_is_found_at_every_level_through_others() {
-        type Get = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        type Get = unsafe extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
         let fence_iid = &crate::fence::FENCE_IIDS[0];
         let mut fence = std::ptr::null();
-        assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, fence_iid, &mut fence), S_OK);
+        // SAFETY: a static interface id and a local to write.
+        let created =
+            unsafe { crate::fence::create(std::ptr::null(), 0, 0, fence_iid, &mut fence) };
+        assert_eq!(created, S_OK);
         let get_device = slot::<Get>(fence, 0x38);
         let dxgi = dxgi::device();
         let query = slot::<Get>(dxgi, 0);
         for iid in std::iter::once(&IID).chain(&LEVEL_IIDS) {
             let mut found = std::ptr::null();
-            assert_eq!(get_device(fence, iid, &mut found), S_OK, "{iid:02x?}");
+            // SAFETY: `fence` is the live fence above, `iid` a static id and
+            // `found` a local to write.
+            assert_eq!(unsafe { get_device(fence, iid, &mut found) }, S_OK, "{iid:02x?}");
             assert_eq!(found, device());
             let mut found = std::ptr::null();
-            assert_eq!(query(dxgi, iid, &mut found), S_OK, "{iid:02x?}");
+            // SAFETY: `dxgi` is our DXGI device; the other pointers as above.
+            assert_eq!(unsafe { query(dxgi, iid, &mut found) }, S_OK, "{iid:02x?}");
             assert_eq!(found, device());
         }
         // What the device is not, it is not through them either.
         let mut found = device();
-        assert_eq!(get_device(fence, fence_iid, &mut found), E_NOINTERFACE);
+        // SAFETY: as above.
+        assert_eq!(unsafe { get_device(fence, fence_iid, &mut found) }, E_NOINTERFACE);
         assert!(found.is_null());
-        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+        let release = slot::<unsafe extern "system" fn(This) -> u32>(fence, 0x10);
+        // SAFETY: `fence` is live; this releases its only reference.
+        unsafe { release(fence) };
     }
 
     /// The host's: a fence's `GetDevice` for `ID3D12Device5`.

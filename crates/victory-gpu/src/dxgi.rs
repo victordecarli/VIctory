@@ -1,10 +1,6 @@
 //! The DXGI side of the device: one adapter with one output, reached from
 //! the device by interface query. Tables follow the PC interfaces' order
 //! (IUnknown, the object methods, then each interface's methods).
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real DXGI API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use crate::object::{
     self, ADAPTER, DXGI_DEVICE, E_INVALIDARG, FACTORY, HRESULT, Iid, MORE_DATA, NOT_FOUND, OUTPUT,
@@ -40,31 +36,84 @@ pub(crate) fn device() -> This {
 }
 
 /// `found` if `iid` is one of `known`.
-fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut This) -> HRESULT {
+///
+/// # Safety
+///
+/// `iid` is null or points to an interface id valid for reads, and `out` is
+/// null or valid for a write of an object pointer, for the duration of the
+/// call.
+unsafe fn query(
+    kind: usize,
+    iid: *const Iid,
+    known: &[Iid],
+    found: This,
+    out: *mut This,
+) -> HRESULT {
     object::answer(kind, iid, object::is(iid, known).then_some(found), out)
 }
 
 /// The DXGI device also answers for the D3D12 device.
-extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+///
+/// # Safety
+///
+/// `this` is one of this module's objects. `iid` is null or points to an
+/// interface id valid for reads, and `out` is null or valid for a write of
+/// an object pointer, for the duration of the call.
+unsafe extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     if crate::device::is_device(iid) {
         return object::answer(DXGI_DEVICE, iid, Some(crate::device::device()), out);
     }
-    query(DXGI_DEVICE, iid, &DEVICE_IIDS, this, out)
+    // SAFETY: the pointers are forwarded as this function's contract gives them.
+    unsafe { query(DXGI_DEVICE, iid, &DEVICE_IIDS, this, out) }
 }
-extern "system" fn device_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(DXGI_DEVICE, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out)
+/// `GetParent` of the DXGI device: the adapter.
+///
+/// # Safety
+///
+/// `iid` is null or points to an interface id valid for reads, and `out` is
+/// null or valid for a write of an object pointer, for the duration of the
+/// call.
+unsafe extern "system" fn device_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    // SAFETY: the pointers are forwarded as this function's contract gives them.
+    unsafe { query(DXGI_DEVICE, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out) }
 }
-extern "system" fn device_adapter(_: This, out: *mut This) -> HRESULT {
+/// `GetAdapter` of the DXGI device.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of an object pointer.
+unsafe extern "system" fn device_adapter(_: This, out: *mut This) -> HRESULT {
     object::answer(DXGI_DEVICE, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
 
-extern "system" fn adapter_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(ADAPTER, iid, &ADAPTER_IIDS, this, out)
+/// `QueryInterface` of the adapter.
+///
+/// # Safety
+///
+/// `this` is one of this module's objects. `iid` is null or points to an
+/// interface id valid for reads, and `out` is null or valid for a write of
+/// an object pointer, for the duration of the call.
+unsafe extern "system" fn adapter_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    // SAFETY: the pointers are forwarded as this function's contract gives them.
+    unsafe { query(ADAPTER, iid, &ADAPTER_IIDS, this, out) }
 }
-extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(ADAPTER, iid, &FACTORY_IIDS, &FACTORY_OBJECT, out)
+/// `GetParent` of the adapter: the factory.
+///
+/// # Safety
+///
+/// `iid` is null or points to an interface id valid for reads, and `out` is
+/// null or valid for a write of an object pointer, for the duration of the
+/// call.
+unsafe extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    // SAFETY: the pointers are forwarded as this function's contract gives them.
+    unsafe { query(ADAPTER, iid, &FACTORY_IIDS, &FACTORY_OBJECT, out) }
 }
-extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
+/// `EnumOutputs`.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of an object pointer.
+unsafe extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
         return NOT_FOUND;
     }
@@ -87,7 +136,12 @@ const _: () = assert!(size_of::<AdapterDescription>() == 0x130);
 
 const AMD: u32 = 0x1002;
 
-extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
+/// `GetDesc` of the adapter.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of an `AdapterDescription`.
+unsafe extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -109,26 +163,55 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
         shared_system_memory: standard,
         luid: [1, 0],
     };
-    // SAFETY: checked non-null; the title passes room for the description.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(description) };
     S_OK
 }
 
-extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(FACTORY, iid, &FACTORY_IIDS, this, out)
+/// `QueryInterface` of the factory.
+///
+/// # Safety
+///
+/// `this` is one of this module's objects. `iid` is null or points to an
+/// interface id valid for reads, and `out` is null or valid for a write of
+/// an object pointer, for the duration of the call.
+unsafe extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    // SAFETY: the pointers are forwarded as this function's contract gives them.
+    unsafe { query(FACTORY, iid, &FACTORY_IIDS, this, out) }
 }
-extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
+/// `EnumAdapters`.
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of an object pointer.
+unsafe extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
         return NOT_FOUND;
     }
     object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
 
-extern "system" fn output_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(OUTPUT, iid, &OUTPUT_IIDS, this, out)
+/// `QueryInterface` of the output.
+///
+/// # Safety
+///
+/// `this` is one of this module's objects. `iid` is null or points to an
+/// interface id valid for reads, and `out` is null or valid for a write of
+/// an object pointer, for the duration of the call.
+unsafe extern "system" fn output_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    // SAFETY: the pointers are forwarded as this function's contract gives them.
+    unsafe { query(OUTPUT, iid, &OUTPUT_IIDS, this, out) }
 }
-extern "system" fn output_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(OUTPUT, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out)
+/// `GetParent` of the output: the adapter.
+///
+/// # Safety
+///
+/// `iid` is null or points to an interface id valid for reads, and `out` is
+/// null or valid for a write of an object pointer, for the duration of the
+/// call.
+unsafe extern "system" fn output_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    // SAFETY: the pointers are forwarded as this function's contract gives them.
+    unsafe { query(OUTPUT, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out) }
 }
 
 /// IUnknown 3, object 4, device 5 + 2 + 3.
@@ -177,14 +260,21 @@ const _: () = assert!(size_of::<Mode>() == 32);
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
-extern "system" fn modes(
+///
+/// # Safety
+///
+/// `count` is null or valid for reads and writes of a `u32`. When `out`
+/// is non-null and `*count` is at least 1, `out` is valid for a write of
+/// a mode.
+unsafe extern "system" fn modes(
     _: This,
     _format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
 ) -> HRESULT {
-    // SAFETY: the title passes its count (null is tolerated).
+    // SAFETY: `count` is null or valid for reads and writes, per this
+    // function's contract.
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;
     };
@@ -205,7 +295,8 @@ extern "system" fn modes(
         scaling: 0,
         flags: 0,
     };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
+    // SAFETY: checked non-null, and `*count` >= 1, per this function's
+    // contract.
     unsafe { out.write(mode) };
     S_OK
 }
@@ -224,10 +315,10 @@ mod tests {
     use super::*;
     use crate::object::{E_NOINTERFACE, slot};
 
-    type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
-    type Get = extern "system" fn(This, *mut This) -> HRESULT;
-    type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
-    type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+    type Query = unsafe extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+    type Get = unsafe extern "system" fn(This, *mut This) -> HRESULT;
+    type Indexed = unsafe extern "system" fn(This, u32, *mut This) -> HRESULT;
+    type Describe = unsafe extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.
@@ -238,29 +329,40 @@ mod tests {
             guid(0x6007896c, 0x3244, 0x4afd, [0xbf, 0x18, 0xa6, 0xd3, 0xbe, 0xda, 0x50, 0x23]);
         let mut dxgi = std::ptr::null();
         let qi = slot::<Query>(d3d, 0);
-        assert_eq!(qi(d3d, &newest_pc, &mut dxgi), E_NOINTERFACE);
+        // SAFETY: `d3d` is our device, `newest_pc` a local id, `dxgi` a local to write.
+        assert_eq!(unsafe { qi(d3d, &newest_pc, &mut dxgi) }, E_NOINTERFACE);
         assert!(dxgi.is_null());
-        assert_eq!(qi(d3d, &DEVICE_IIDS[2], &mut dxgi), S_OK);
+        // SAFETY: as above.
+        assert_eq!(unsafe { qi(d3d, &DEVICE_IIDS[2], &mut dxgi) }, S_OK);
         assert_eq!(dxgi, device());
 
         let mut adapter = std::ptr::null();
-        assert_eq!(slot::<Get>(dxgi, 0x38)(dxgi, &mut adapter), S_OK);
+        let get_adapter = slot::<Get>(dxgi, 0x38);
+        // SAFETY: `dxgi` is our DXGI device, `adapter` a local to write.
+        assert_eq!(unsafe { get_adapter(dxgi, &mut adapter) }, S_OK);
         let mut description = std::mem::MaybeUninit::<AdapterDescription>::uninit();
-        assert_eq!(slot::<Describe>(adapter, 0x40)(adapter, description.as_mut_ptr()), S_OK);
+        let describe = slot::<Describe>(adapter, 0x40);
+        // SAFETY: `adapter` is our adapter, `description` has room for one.
+        assert_eq!(unsafe { describe(adapter, description.as_mut_ptr()) }, S_OK);
         // SAFETY: written above.
         assert_eq!(unsafe { description.assume_init() }.vendor, AMD);
 
         let mut factory = std::ptr::null();
         let parent = slot::<Query>(adapter, 0x30);
-        assert_eq!(parent(adapter, &FACTORY_IIDS[2], &mut factory), S_OK);
+        // SAFETY: a static id and a local to write.
+        assert_eq!(unsafe { parent(adapter, &FACTORY_IIDS[2], &mut factory) }, S_OK);
         let mut again = std::ptr::null();
-        assert_eq!(slot::<Indexed>(factory, 0x38)(factory, 0, &mut again), S_OK);
+        let factory_adapters = slot::<Indexed>(factory, 0x38);
+        // SAFETY: `factory` is our factory, `again` a local to write.
+        assert_eq!(unsafe { factory_adapters(factory, 0, &mut again) }, S_OK);
         assert_eq!(again, adapter);
 
         let mut output = std::ptr::null();
         let outputs = slot::<Indexed>(adapter, 0x38);
-        assert_eq!(outputs(adapter, 0, &mut output), S_OK);
+        // SAFETY: `adapter` is our adapter, `output` a local to write.
+        assert_eq!(unsafe { outputs(adapter, 0, &mut output) }, S_OK);
         assert!(!output.is_null());
-        assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+        // SAFETY: as above.
+        assert_eq!(unsafe { outputs(adapter, 1, &mut output) }, NOT_FOUND);
     }
 }

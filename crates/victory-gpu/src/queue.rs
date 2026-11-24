@@ -147,7 +147,8 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    crate::fence::signal(fence, value)
+    // SAFETY: `fence` is non-null and is the title's fence for this call.
+    unsafe { crate::fence::signal(fence, value) }
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
@@ -470,10 +471,13 @@ mod tests {
         assert_eq!(unsafe { q.cast::<u8>().add(0x10).cast::<u32>().read() }, 0);
         let mut fence = null;
         let fence_iid = &crate::fence::FENCE_IIDS[0];
-        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
+        // SAFETY: a static interface id and a local to write.
+        assert_eq!(unsafe { crate::fence::create(null, 0, 0, fence_iid, &mut fence) }, S_OK);
         let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
         assert_eq!(signal(q, fence, 7), S_OK);
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence), 7);
+        let completed = slot::<unsafe extern "system" fn(This) -> u64>(fence, 0x40);
+        // SAFETY: `fence` is the fence just created and still live.
+        assert_eq!(unsafe { completed(fence) }, 7);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
