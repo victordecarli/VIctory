@@ -3,10 +3,6 @@
 //! description, default text, the length limit) on a thread of its own and
 //! completes the call with what the user typed, or as cancelled (`E_ABORT`)
 //! when the dialog is dismissed or cannot open.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{c_char, c_void};
 
@@ -30,7 +26,13 @@ type This = *const Object;
 static PROFILE: u8 = 0;
 static TEXT: u8 = 0;
 
-extern "system" fn profile_card_async(
+/// Shows a profile card: there is nothing to show.
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read. `_user` is not used.
+unsafe extern "system" fn profile_card_async(
     _: This,
     block: *mut AsyncBlock,
     _user: *const c_void,
@@ -39,14 +41,27 @@ extern "system" fn profile_card_async(
     tracing::info!(xuid, "profile card: nothing to show");
     xasync::finished(block, (&raw const PROFILE).cast(), S_OK)
 }
-extern "system" fn profile_card_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+/// The result of [`profile_card_async`].
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes.
+unsafe extern "system" fn profile_card_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const PROFILE).cast(), 0, none, none.cast())
 }
 
 /// Grand Theft Auto VI treats `E_ABORT` as cancelled and goes on; any
 /// other failure as an error.
-extern "system" fn text_entry_async(
+///
+/// # Safety
+///
+/// `title`, `description` and `default` are each null or point to a
+/// NUL-terminated string valid for reads for the duration of the call (they
+/// are copied before it returns). `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read.
+unsafe extern "system" fn text_entry_async(
     _: This,
     block: *mut AsyncBlock,
     title: *const c_char,
@@ -74,7 +89,16 @@ extern "system" fn text_entry_async(
     })
 }
 /// Bytes of the result, its NUL included.
-extern "system" fn text_entry_size(_: This, block: *mut AsyncBlock, out: *mut u32) -> HRESULT {
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `out` is null or valid for a write of a `u32`.
+unsafe extern "system" fn text_entry_size(
+    _: This,
+    block: *mut AsyncBlock,
+    out: *mut u32,
+) -> HRESULT {
     let mut size = 0;
     let hr = xasync::XAsyncGetResultSize(block, &mut size);
     if hr < 0 {
@@ -82,7 +106,14 @@ extern "system" fn text_entry_size(_: This, block: *mut AsyncBlock, out: *mut u3
     }
     put(out, size as u32)
 }
-extern "system" fn text_entry_result(
+/// The text typed, with its NUL.
+///
+/// # Safety
+///
+/// `block` is null or the async block of a call this object started, still
+/// valid for reads and writes. `buffer` is null or valid for writes of `size` bytes, and `used`
+/// is null or valid for a write of a `u32`.
+unsafe extern "system" fn text_entry_result(
     _: This,
     block: *mut AsyncBlock,
     size: u32,
@@ -281,13 +312,16 @@ mod tests {
     fn dialogs_end_with_what_was_typed() {
         let this: This = &OBJECT;
         let mut b = block();
-        type Card = extern "system" fn(This, *mut AsyncBlock, *const c_void, u64) -> HRESULT;
-        type Done = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
-        assert_eq!(method::<Card>(&OBJECT, 0x38)(this, &mut b, std::ptr::null(), 1), S_OK);
+        type Card = unsafe extern "system" fn(This, *mut AsyncBlock, *const c_void, u64) -> HRESULT;
+        type Done = unsafe extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        let card = method::<Card>(&OBJECT, 0x38);
+        // SAFETY: `b` outlives the call, which completes before it is read.
+        assert_eq!(unsafe { card(this, &mut b, std::ptr::null(), 1) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
-        assert_eq!(method::<Done>(&OBJECT, 0x40)(this, &mut b), S_OK);
+        // SAFETY: `b` is the block just started.
+        assert_eq!(unsafe { method::<Done>(&OBJECT, 0x40)(this, &mut b) }, S_OK);
 
-        type Entry = extern "system" fn(
+        type Entry = unsafe extern "system" fn(
             This,
             *mut AsyncBlock,
             *const c_char,
@@ -296,28 +330,35 @@ mod tests {
             u32,
             u32,
         ) -> HRESULT;
-        type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type Size = unsafe extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
         type Result_ =
-            extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
+            unsafe extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
         let null = std::ptr::null();
         let entry = method::<Entry>(&OBJECT, 0x88);
         // Dismissed: cancelled.
         let mut b = block();
-        assert_eq!(entry(this, &mut b, c"Name".as_ptr(), null, null, 0, 16), S_OK);
+        // SAFETY: NUL-terminated literals and null for the rest; `b`
+        // outlives the call.
+        assert_eq!(unsafe { entry(this, &mut b, c"Name".as_ptr(), null, null, 0, 16) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), E_ABORT);
         let mut size = 0;
-        assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), E_ABORT);
+        let get_size = method::<Size>(&OBJECT, 0x90);
+        // SAFETY: `b` is the block just started, `size` a local to write.
+        assert_eq!(unsafe { get_size(this, &mut b, &mut size) }, E_ABORT);
         // Typed: the text, cut to the limit, with its NUL.
         let mut b = block();
         let default = c"abc".as_ptr();
-        assert_eq!(entry(this, &mut b, c"Type".as_ptr(), null, default, 0, 6), S_OK);
+        // SAFETY: as above.
+        assert_eq!(unsafe { entry(this, &mut b, c"Type".as_ptr(), null, default, 0, 6) }, S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
-        assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), S_OK);
+        // SAFETY: as above.
+        assert_eq!(unsafe { get_size(this, &mut b, &mut size) }, S_OK);
         assert_eq!(size, 7);
         let mut out = [0 as c_char; 7];
         let mut used = 0;
         let result = method::<Result_>(&OBJECT, 0x98);
-        assert_eq!(result(this, &mut b, 7, out.as_mut_ptr(), &mut used), S_OK);
+        // SAFETY: `out` holds 7 bytes, `used` is a local to write.
+        assert_eq!(unsafe { result(this, &mut b, 7, out.as_mut_ptr(), &mut used) }, S_OK);
         assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyp"), 7));
         assert_eq!(limit("\u{e9}t\u{e9}s", 3), "\u{e9}t\u{e9}");
     }
