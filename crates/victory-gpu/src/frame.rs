@@ -8,10 +8,6 @@
 //!
 //! shortcut: event offsets are ignored (every event is at the tick); tie
 //! the clock to presentation if a title paces by them.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,7 +102,11 @@ fn next_tick(kind: u32) -> (u64, Duration) {
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so
 /// lateness never accumulates.
-pub(crate) extern "system" fn wait(
+///
+/// # Safety
+///
+/// `token` is null or valid for a write of a `u64`.
+pub(crate) unsafe extern "system" fn wait(
     _: This,
     kind: u32,
     timeout_ms: u32,
@@ -130,7 +130,8 @@ pub(crate) extern "system" fn wait(
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
         if !token.is_null() {
-            // SAFETY: checked non-null; the title passes its token.
+            // SAFETY: checked non-null; writable, per this function's
+            // contract.
             unsafe { token.write(frame) };
         }
     }
@@ -149,7 +150,11 @@ pub(crate) extern "system" fn wait(
 }
 
 /// Device method: no statistics are kept, so none are returned.
-pub(crate) extern "system" fn statistics(
+///
+/// # Safety
+///
+/// `count` is null or valid for a write of a `u32`.
+pub(crate) unsafe extern "system" fn statistics(
     _: This,
     _token: u64,
     _kinds: u32,
@@ -157,7 +162,7 @@ pub(crate) extern "system" fn statistics(
     _out: *mut u8,
 ) -> HRESULT {
     if !count.is_null() {
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { count.write(0) };
     }
     S_OK
@@ -167,24 +172,30 @@ pub(crate) extern "system" fn statistics(
 mod tests {
     use super::*;
 
+    /// `wait` with a null device and list, the token a local.
+    fn wait(kind: u32, timeout_ms: u32, flags: u32, token: &mut u64) -> HRESULT {
+        // SAFETY: `token` is a valid, writable `u64`.
+        unsafe { super::wait(std::ptr::null(), kind, timeout_ms, std::ptr::null(), flags, token) }
+    }
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
-        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
+        assert_eq!(wait(0, 1_000, 0, &mut first), S_OK);
         let before = Instant::now();
         let mut second = 0;
-        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
+        assert_eq!(wait(0, 1_000, 0, &mut second), S_OK);
         assert!(second > first);
         assert!(before.elapsed() <= Duration::from_millis(50));
-        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+        assert_eq!(wait(0, 0, 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
         let flags = TOKEN_ON_TIMEOUT;
-        assert_eq!(wait(null, 0, 0, std::ptr::null(), flags, &mut early), TIMEOUT);
+        assert_eq!(wait(0, 0, flags, &mut early), TIMEOUT);
         let mut next = 0;
-        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
+        assert_eq!(wait(0, 1_000, 0, &mut next), S_OK);
         assert!(early == second + 1 && next == early + 1);
         assert!(LAST[0].load(Ordering::Relaxed) >= 2);
 
@@ -196,8 +207,8 @@ mod tests {
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
             .map(|_| {
-                let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
-                assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
+                let _ = wait(0, 0, TOKEN_ON_TIMEOUT, &mut token);
+                assert_eq!(wait(FLIP, u32::MAX, 0, &mut token), S_OK);
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
