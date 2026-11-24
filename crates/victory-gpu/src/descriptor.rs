@@ -814,6 +814,7 @@ mod tests {
         let none = Placement { address: 0, size: 0 };
         let mut h = null;
         assert_eq!(create(desc, none, &mut h), S_OK);
+        let h = crate::test_support::valid(h);
         let start = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x48);
         // SAFETY: `h` is the heap just created.
         let cpu = unsafe { start(h) };
@@ -826,7 +827,8 @@ mod tests {
         unsafe { (cpu as *mut u8).add(999 * 32 + 31).write(1) };
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
-        assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+        let mut refused = null;
+        assert_eq!(create(bad, none, &mut refused), E_INVALIDARG);
     }
 
     #[test]
@@ -888,6 +890,7 @@ mod tests {
         let desc = HeapDesc { kind: 0, count: 64, flags: 1, nodes: 1 };
         let mut h = std::ptr::null();
         assert_eq!(create(desc, Placement { address, size: 64 * 32 }, &mut h), S_OK);
+        let h = crate::test_support::valid(h);
         let start = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x48);
         let gpu = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x50);
         // SAFETY: `h` is the heap just created.
@@ -895,9 +898,11 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { gpu(h) }, address);
         // A size that does not match the count is not a placement.
-        assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
-        let start = slot::<unsafe extern "system" fn(This) -> u64>(h, 0x48);
-        // SAFETY: `h` is the second heap just created.
-        assert_ne!(unsafe { start(h) }, address);
+        let mut small = std::ptr::null();
+        assert_eq!(create(desc, Placement { address, size: 7 }, &mut small), S_OK);
+        let small = crate::test_support::valid(small);
+        let start = slot::<unsafe extern "system" fn(This) -> u64>(small, 0x48);
+        // SAFETY: `small` is the second heap just created.
+        assert_ne!(unsafe { start(small) }, address);
     }
 }
