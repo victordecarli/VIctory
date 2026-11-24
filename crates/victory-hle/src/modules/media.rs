@@ -7,10 +7,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`MFCreateSourceResolver`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -114,7 +110,12 @@ fn percent_decode(s: &str) -> String {
 
 /// The URL to give the host, or the refusal (logged once per scheme and
 /// host).
-fn checked(url: *const u16) -> Result<Vec<u16>, HRESULT> {
+///
+/// # Safety
+///
+/// `url` is null or points to a NUL-terminated UTF-16 string valid for
+/// reads for the duration of the call.
+unsafe fn checked(url: *const u16) -> Result<Vec<u16>, HRESULT> {
     if url.is_null() {
         return Err(E_POINTER);
     }
@@ -161,10 +162,10 @@ type Unknown = *mut c_void;
 #[repr(C)]
 struct Methods {
     query_interface:
-        extern "system" fn(*mut Resolver, *const [u8; 16], *mut *mut c_void) -> HRESULT,
-    add_ref: extern "system" fn(*mut Resolver) -> u32,
-    release: extern "system" fn(*mut Resolver) -> u32,
-    create_from_url: extern "system" fn(
+        unsafe extern "system" fn(*mut Resolver, *const [u8; 16], *mut *mut c_void) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut Resolver) -> u32,
+    release: unsafe extern "system" fn(*mut Resolver) -> u32,
+    create_from_url: unsafe extern "system" fn(
         *mut Resolver,
         *const u16,
         u32,
@@ -172,7 +173,7 @@ struct Methods {
         *mut u32,
         *mut Unknown,
     ) -> HRESULT,
-    create_from_stream: extern "system" fn(
+    create_from_stream: unsafe extern "system" fn(
         *mut Resolver,
         Unknown,
         *const u16,
@@ -181,7 +182,7 @@ struct Methods {
         *mut u32,
         *mut Unknown,
     ) -> HRESULT,
-    begin_from_url: extern "system" fn(
+    begin_from_url: unsafe extern "system" fn(
         *mut Resolver,
         *const u16,
         u32,
@@ -190,8 +191,9 @@ struct Methods {
         Unknown,
         Unknown,
     ) -> HRESULT,
-    end_from_url: extern "system" fn(*mut Resolver, Unknown, *mut u32, *mut Unknown) -> HRESULT,
-    begin_from_stream: extern "system" fn(
+    end_from_url:
+        unsafe extern "system" fn(*mut Resolver, Unknown, *mut u32, *mut Unknown) -> HRESULT,
+    begin_from_stream: unsafe extern "system" fn(
         *mut Resolver,
         Unknown,
         *const u16,
@@ -201,8 +203,9 @@ struct Methods {
         Unknown,
         Unknown,
     ) -> HRESULT,
-    end_from_stream: extern "system" fn(*mut Resolver, Unknown, *mut u32, *mut Unknown) -> HRESULT,
-    cancel: extern "system" fn(*mut Resolver, Unknown) -> HRESULT,
+    end_from_stream:
+        unsafe extern "system" fn(*mut Resolver, Unknown, *mut u32, *mut Unknown) -> HRESULT,
+    cancel: unsafe extern "system" fn(*mut Resolver, Unknown) -> HRESULT,
 }
 
 static METHODS: Methods = Methods {
@@ -218,15 +221,26 @@ static METHODS: Methods = Methods {
     cancel,
 };
 
-fn host(this: *mut Resolver) -> *mut Host {
-    // SAFETY: title code calls methods on a proxy we made, alive until its
-    // last release.
+/// The host's resolver behind the proxy.
+///
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released.
+unsafe fn host(this: *mut Resolver) -> *mut Host {
+    // SAFETY: `this` is a live proxy, per this function's contract.
     unsafe { (*this).host }
 }
 
 /// Only the resolver's own interfaces: anything else could hand out the
 /// host object unguarded.
-extern "system" fn query_interface(
+///
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released. `iid` is null or points to 16 bytes valid for reads, and `out`
+/// is null or valid for a write of a pointer.
+unsafe extern "system" fn query_interface(
     this: *mut Resolver,
     iid: *const [u8; 16],
     out: *mut *mut c_void,
@@ -234,25 +248,36 @@ extern "system" fn query_interface(
     if iid.is_null() || out.is_null() {
         return E_POINTER;
     }
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; 16 readable bytes, per this function's
+    // contract.
     let iid = unsafe { *iid };
     let found = iid == IID_IUNKNOWN || iid == IID_RESOLVER;
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(if found { this.cast() } else { std::ptr::null_mut() }) };
     if !found {
         return E_NOINTERFACE;
     }
-    add_ref(this);
+    // SAFETY: `this` is a live proxy, per this function's contract.
+    unsafe { add_ref(this) };
     S_OK
 }
 
-extern "system" fn add_ref(this: *mut Resolver) -> u32 {
-    // SAFETY: as in `host`.
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released.
+unsafe extern "system" fn add_ref(this: *mut Resolver) -> u32 {
+    // SAFETY: `this` is a live proxy, per this function's contract.
     unsafe { (*this).refs.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
-extern "system" fn release(this: *mut Resolver) -> u32 {
-    // SAFETY: as in `host`.
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made, holding the
+/// reference the caller gives up; it must not be used after the last one is
+/// released.
+unsafe extern "system" fn release(this: *mut Resolver) -> u32 {
+    // SAFETY: `this` is a live proxy, per this function's contract.
     let left = unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel) } - 1;
     if left == 0 {
         // SAFETY: made by `MFCreateSourceResolver`; this was the last
@@ -265,7 +290,15 @@ extern "system" fn release(this: *mut Resolver) -> u32 {
     left
 }
 
-extern "system" fn create_from_url(
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released. `url` is null or points to a NUL-terminated UTF-16 string
+/// valid for reads for the duration of the call. `kind` and `object` are
+/// each null or valid for a write, as the host's resolver requires. The
+/// interface pointers (stream, properties, callback, state, result) are
+/// ones the host's resolver accepts.
+unsafe extern "system" fn create_from_url(
     this: *mut Resolver,
     url: *const u16,
     flags: u32,
@@ -273,17 +306,21 @@ extern "system" fn create_from_url(
     kind: *mut u32,
     object: *mut Unknown,
 ) -> HRESULT {
-    let url = match checked(url) {
+    // SAFETY: `url` is null or a NUL-terminated string, per this function's
+    // contract.
+    let url = match unsafe { checked(url) } {
         Ok(url) => url,
         Err(error) => {
             if !object.is_null() {
-                // SAFETY: the title's out parameter.
+                // SAFETY: checked non-null; writable, per this function's
+                // contract.
                 unsafe { object.write(std::ptr::null_mut()) };
             }
             return error;
         }
     };
-    let host = host(this);
+    // SAFETY: `this` is a live proxy, per this function's contract.
+    let host = unsafe { host(this) };
     // SAFETY: slot 3 is `CreateObjectFromURL`.
     let f: extern "system" fn(
         *mut Host,
@@ -296,7 +333,14 @@ extern "system" fn create_from_url(
     f(host, url.as_ptr(), flags, props, kind, object)
 }
 
-extern "system" fn begin_from_url(
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released. `url` is null or points to a NUL-terminated UTF-16 string
+/// valid for reads for the duration of the call. `cookie` is null or valid
+/// for a write of a pointer. The interface pointers (stream, properties,
+/// callback, state, result) are ones the host's resolver accepts.
+unsafe extern "system" fn begin_from_url(
     this: *mut Resolver,
     url: *const u16,
     flags: u32,
@@ -305,11 +349,14 @@ extern "system" fn begin_from_url(
     callback: Unknown,
     state: Unknown,
 ) -> HRESULT {
-    let url = match checked(url) {
+    // SAFETY: `url` is null or a NUL-terminated string, per this function's
+    // contract.
+    let url = match unsafe { checked(url) } {
         Ok(url) => url,
         Err(error) => return error,
     };
-    let host = host(this);
+    // SAFETY: `this` is a live proxy, per this function's contract.
+    let host = unsafe { host(this) };
     // SAFETY: slot 5 is `BeginCreateObjectFromURL`.
     let f: extern "system" fn(
         *mut Host,
@@ -323,7 +370,15 @@ extern "system" fn begin_from_url(
     f(host, url.as_ptr(), flags, props, cookie, callback, state)
 }
 
-extern "system" fn create_from_stream(
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released. `url` is only a hint for the host, which accepts null or a
+/// NUL-terminated string. `kind` and `object` are each null or valid for a
+/// write, as the host's resolver requires. The interface pointers (stream,
+/// properties, callback, state, result) are ones the host's resolver
+/// accepts.
+unsafe extern "system" fn create_from_stream(
     this: *mut Resolver,
     stream: Unknown,
     url: *const u16,
@@ -332,7 +387,8 @@ extern "system" fn create_from_stream(
     kind: *mut u32,
     object: *mut Unknown,
 ) -> HRESULT {
-    let host = host(this);
+    // SAFETY: `this` is a live proxy, per this function's contract.
+    let host = unsafe { host(this) };
     // SAFETY: slot 4 is `CreateObjectFromByteStream`; the URL is only a
     // hint for picking a handler.
     let f: extern "system" fn(
@@ -347,13 +403,20 @@ extern "system" fn create_from_stream(
     f(host, stream, url, flags, props, kind, object)
 }
 
-extern "system" fn end_from_url(
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released. `kind` and `object` are each null or valid for a write, as the
+/// host's resolver requires. The interface pointers (stream, properties,
+/// callback, state, result) are ones the host's resolver accepts.
+unsafe extern "system" fn end_from_url(
     this: *mut Resolver,
     result: Unknown,
     kind: *mut u32,
     object: *mut Unknown,
 ) -> HRESULT {
-    let host = host(this);
+    // SAFETY: `this` is a live proxy, per this function's contract.
+    let host = unsafe { host(this) };
     // SAFETY: slot 6 is `EndCreateObjectFromURL`.
     let f: extern "system" fn(*mut Host, Unknown, *mut u32, *mut Unknown) -> HRESULT =
         unsafe { Host::method(host, 6) };
@@ -361,7 +424,14 @@ extern "system" fn end_from_url(
 }
 
 #[allow(clippy::too_many_arguments, reason = "the signature is fixed by the API title code calls")]
-extern "system" fn begin_from_stream(
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released. `url` is only a hint for the host, which accepts null or a
+/// NUL-terminated string. `cookie` is null or valid for a write of a
+/// pointer. The interface pointers (stream, properties, callback, state,
+/// result) are ones the host's resolver accepts.
+unsafe extern "system" fn begin_from_stream(
     this: *mut Resolver,
     stream: Unknown,
     url: *const u16,
@@ -371,7 +441,8 @@ extern "system" fn begin_from_stream(
     callback: Unknown,
     state: Unknown,
 ) -> HRESULT {
-    let host = host(this);
+    // SAFETY: `this` is a live proxy, per this function's contract.
+    let host = unsafe { host(this) };
     // SAFETY: slot 7 is `BeginCreateObjectFromByteStream`.
     let f: extern "system" fn(
         *mut Host,
@@ -386,28 +457,44 @@ extern "system" fn begin_from_stream(
     f(host, stream, url, flags, props, cookie, callback, state)
 }
 
-extern "system" fn end_from_stream(
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released. `kind` and `object` are each null or valid for a write, as the
+/// host's resolver requires. The interface pointers (stream, properties,
+/// callback, state, result) are ones the host's resolver accepts.
+unsafe extern "system" fn end_from_stream(
     this: *mut Resolver,
     result: Unknown,
     kind: *mut u32,
     object: *mut Unknown,
 ) -> HRESULT {
-    let host = host(this);
+    // SAFETY: `this` is a live proxy, per this function's contract.
+    let host = unsafe { host(this) };
     // SAFETY: slot 8 is `EndCreateObjectFromByteStream`.
     let f: extern "system" fn(*mut Host, Unknown, *mut u32, *mut Unknown) -> HRESULT =
         unsafe { Host::method(host, 8) };
     f(host, result, kind, object)
 }
 
-extern "system" fn cancel(this: *mut Resolver, cookie: Unknown) -> HRESULT {
-    let host = host(this);
+/// # Safety
+///
+/// `this` is a live proxy `MFCreateSourceResolver` made and not yet fully
+/// released. `cookie` is one the host handed out.
+unsafe extern "system" fn cancel(this: *mut Resolver, cookie: Unknown) -> HRESULT {
+    // SAFETY: `this` is a live proxy, per this function's contract.
+    let host = unsafe { host(this) };
     // SAFETY: slot 9 is `CancelObjectCreation`.
     let f: extern "system" fn(*mut Host, Unknown) -> HRESULT = unsafe { Host::method(host, 9) };
     f(host, cookie)
 }
 
 /// The host's resolver behind our proxy.
-pub extern "system" fn MFCreateSourceResolver(out: *mut *mut Resolver) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+pub unsafe extern "system" fn MFCreateSourceResolver(out: *mut *mut Resolver) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
@@ -426,7 +513,7 @@ pub extern "system" fn MFCreateSourceResolver(out: *mut *mut Resolver) -> HRESUL
         return hr;
     }
     let proxy = Box::new(Resolver { vtable: &METHODS, host, refs: AtomicU32::new(1) });
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(Box::into_raw(proxy)) };
     S_OK
 }
