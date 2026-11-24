@@ -6,10 +6,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`GetModuleHandleW`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{CStr, c_void};
 
@@ -17,30 +13,58 @@ use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
 /// title images and our console modules are found by name.
-pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
+///
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated UTF-16 string valid for
+/// reads for the duration of the call; a name that is not ours is handed to
+/// the host, which reads it too.
+pub unsafe extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name))
+    // SAFETY: `name` is non-null here, a NUL-terminated string per this
+    // function's contract; the host reads the same string.
+    unsafe { find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name)) }
 }
 
 /// See [`GetModuleHandleW`].
-pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
+///
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated string valid for reads for
+/// the duration of the call; a name that is not ours is handed to the host,
+/// which reads it too.
+pub unsafe extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+    // SAFETY: `name` is non-null here, a NUL-terminated string per this
+    // function's contract; the host reads the same string.
+    unsafe { find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name)) }
 }
 
 /// A NUL-terminated string from the title.
-fn narrow(text: *const u8) -> String {
-    // SAFETY: the title passes a NUL-terminated string.
+///
+/// # Safety
+///
+/// `text` points to a NUL-terminated string valid for reads for the
+/// duration of the call.
+unsafe fn narrow(text: *const u8) -> String {
+    // SAFETY: `text` is a NUL-terminated string, per this function's
+    // contract.
     unsafe { CStr::from_ptr(text.cast()) }.to_string_lossy().into_owned()
 }
 
 /// See [`narrow`].
-fn wide(text: *const u16) -> String {
-    // SAFETY: the title passes a NUL-terminated string.
+///
+/// # Safety
+///
+/// `text` points to a NUL-terminated UTF-16 string valid for reads for the
+/// duration of the call.
+unsafe fn wide(text: *const u16) -> String {
+    // SAFETY: `text` is a NUL-terminated string, per this function's
+    // contract.
     unsafe {
         let len = (0..).take_while(|&i| *text.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
@@ -49,21 +73,41 @@ fn wide(text: *const u16) -> String {
 
 /// A title image's path is its original file, not our cache copy;
 /// `NULL` means the title's exe.
-pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
+///
+/// # Safety
+///
+/// `out` is valid for writes of `size` characters. A module that is not a
+/// title image is handed to the host with the same buffer.
+pub unsafe extern "system" fn GetModuleFileNameW(
+    module: *mut c_void,
+    out: *mut u16,
+    size: u32,
+) -> u32 {
     let Some(path) = title_path(module) else {
-        return host::get_module_file_name_w(module, out, size);
+        // SAFETY: the same buffer, per this function's contract.
+        return unsafe { host::get_module_file_name_w(module, out, size) };
     };
     let wide: Vec<u16> = path.encode_utf16().collect();
-    // SAFETY: the title passes a buffer of `size` characters.
+    // SAFETY: `out` holds `size` characters, per this function's contract.
     copy_truncated(&wide, unsafe { std::slice::from_raw_parts_mut(out, size as usize) })
 }
 
 /// See [`GetModuleFileNameW`].
-pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
+///
+/// # Safety
+///
+/// `out` is valid for writes of `size` bytes. A module that is not a title
+/// image is handed to the host with the same buffer.
+pub unsafe extern "system" fn GetModuleFileNameA(
+    module: *mut c_void,
+    out: *mut u8,
+    size: u32,
+) -> u32 {
     let Some(path) = title_path(module) else {
-        return host::get_module_file_name_a(module, out, size);
+        // SAFETY: the same buffer, per this function's contract.
+        return unsafe { host::get_module_file_name_a(module, out, size) };
     };
-    // SAFETY: the title passes a buffer of `size` bytes.
+    // SAFETY: `out` holds `size` bytes, per this function's contract.
     copy_truncated(path.as_bytes(), unsafe { std::slice::from_raw_parts_mut(out, size as usize) })
 }
 
@@ -95,31 +139,51 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 /// Console-only DLLs we implement load as a pseudo handle (titles load
 /// `xgameruntime.dll` this way), the title's DLLs as the images we map
 /// (on first use if nothing imports them); anything else loads on the host.
-pub extern "system" fn LoadLibraryExA(
+///
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated string valid for reads for
+/// the duration of the call. `file` is null (reserved), as the API
+/// requires; both go to the host for a library that is not ours.
+pub unsafe extern "system" fn LoadLibraryExA(
     name: *const u8,
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
-    if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
-    {
-        return handle;
+    // SAFETY: `name` is checked non-null, so a NUL-terminated string per
+    // this function's contract; the host gets the same pointers.
+    unsafe {
+        if !name.is_null()
+            && let Some(handle) = find_module(&narrow(name), runs_code(flags))
+        {
+            return handle;
+        }
+        host::load_library_ex_a(name, file, flags)
     }
-    host::load_library_ex_a(name, file, flags)
 }
 
 /// See [`LoadLibraryExA`].
-pub extern "system" fn LoadLibraryExW(
+///
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated UTF-16 string valid for
+/// reads for the duration of the call. `file` is null (reserved), as the
+/// API requires; both go to the host for a library that is not ours.
+pub unsafe extern "system" fn LoadLibraryExW(
     name: *const u16,
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
-    if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
-    {
-        return handle;
+    // SAFETY: `name` is checked non-null, so a NUL-terminated string per
+    // this function's contract; the host gets the same pointers.
+    unsafe {
+        if !name.is_null()
+            && let Some(handle) = find_module(&wide(name), runs_code(flags))
+        {
+            return handle;
+        }
+        host::load_library_ex_w(name, file, flags)
     }
-    host::load_library_ex_w(name, file, flags)
 }
 
 /// False for loads as data or resources (`DONT_RESOLVE_DLL_REFERENCES`,
@@ -129,29 +193,50 @@ fn runs_code(flags: u32) -> bool {
     flags & (0x1 | 0x2 | 0x20 | 0x40) == 0
 }
 
-pub extern "system" fn LoadLibraryA(name: *const u8) -> *mut c_void {
-    LoadLibraryExA(name, std::ptr::null_mut(), 0)
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated string valid for reads for
+/// the duration of the call.
+pub unsafe extern "system" fn LoadLibraryA(name: *const u8) -> *mut c_void {
+    // SAFETY: `name` as this function's contract gives it; a null `file`.
+    unsafe { LoadLibraryExA(name, std::ptr::null_mut(), 0) }
 }
 
-pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
-    LoadLibraryExW(name, std::ptr::null_mut(), 0)
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated UTF-16 string valid for
+/// reads for the duration of the call.
+pub unsafe extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
+    // SAFETY: `name` as this function's contract gives it; a null `file`.
+    unsafe { LoadLibraryExW(name, std::ptr::null_mut(), 0) }
 }
 
 /// Looks up our implementations behind a pseudo handle; real modules go to
 /// the host.
-pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
+///
+/// # Safety
+///
+/// `name` is an ordinal (a value below 0x10000) or points to a
+/// NUL-terminated string valid for reads for the duration of the call; the
+/// host reads it too for a module that is not ours.
+pub unsafe extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
     // `NULL` is the process's exe, which for the title is its own image.
     let module =
         if module.is_null() { runtime::main_image().unwrap_or(0) as *mut c_void } else { module };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        // SAFETY: `name` is an ordinal or a NUL-terminated string, per this
+        // function's contract; the host gets the same pointer.
+        return unsafe {
+            host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name))
+        };
     };
     // Values below 0x10000 are ordinals; we export by name only.
     if (name as usize) < 0x1_0000 {
         tracing::warn!(module = m.name, ordinal = name as usize, "GetProcAddress by ordinal");
         return std::ptr::null_mut();
     }
-    // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
+    // SAFETY: not an ordinal, so a NUL-terminated name, per this function's
+    // contract.
     let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
     match m.exports.iter().find(|e| e.name == name) {
         Some(e) => e.address as *mut c_void,
@@ -165,14 +250,26 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
 /// What a host module's `name` (or ordinal) is bound to at import binding
 /// when we override it: a title that looks a function up by name must not
 /// get past our overrides (the network guard, path rewriting).
-fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
+///
+/// # Safety
+///
+/// `name` is an ordinal (a value below 0x10000) or points to a
+/// NUL-terminated string valid for reads for the duration of the call.
+unsafe fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
     if module.is_null() || runtime::image_path(module as usize).is_some() {
         return None;
     }
-    let symbol =
-        if (name as usize) < 0x1_0000 { format!("#{}", name as usize) } else { narrow(name) };
+    let symbol = if (name as usize) < 0x1_0000 {
+        format!("#{}", name as usize)
+    } else {
+        // SAFETY: not an ordinal, so a NUL-terminated name, per this
+        // function's contract.
+        unsafe { narrow(name) }
+    };
     let mut path = [0u16; 260];
-    let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
+    // SAFETY: `path` is a local buffer of `path.len()` characters.
+    let len = unsafe { host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) }
+        as usize;
     let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
     let file = path.rsplit('\\').next()?;
     crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
@@ -196,18 +293,32 @@ pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
 }
 
 /// Title debug output goes to our log (no debugger needs to be attached).
-pub extern "system" fn OutputDebugStringA(text: *const u8) {
+///
+/// # Safety
+///
+/// `text` is null or points to a NUL-terminated string valid for reads for
+/// the duration of the call.
+pub unsafe extern "system" fn OutputDebugStringA(text: *const u8) {
     if !text.is_null() {
-        let text = narrow(text);
+        // SAFETY: checked non-null; a NUL-terminated string, per this
+        // function's contract.
+        let text = unsafe { narrow(text) };
         host::note_title_output(text.trim());
         tracing::info!(target: "title", "{}", text.trim_end());
     }
 }
 
 /// See [`OutputDebugStringA`].
-pub extern "system" fn OutputDebugStringW(text: *const u16) {
+///
+/// # Safety
+///
+/// `text` is null or points to a NUL-terminated UTF-16 string valid for
+/// reads for the duration of the call.
+pub unsafe extern "system" fn OutputDebugStringW(text: *const u16) {
     if !text.is_null() {
-        let text = wide(text);
+        // SAFETY: checked non-null; a NUL-terminated string, per this
+        // function's contract.
+        let text = unsafe { wide(text) };
         host::note_title_output(text.trim());
         tracing::info!(target: "title", "{}", text.trim_end());
     }
@@ -249,7 +360,8 @@ pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
 }
 
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
-    host::report_unhandled(info);
+    // SAFETY: the system calls this filter with its exception information.
+    unsafe { host::report_unhandled(info) };
     match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         filter => {
@@ -391,26 +503,48 @@ mod host {
         fn crt_abort() -> !;
     }
 
-    // SAFETY (every function): forwarding the title's own arguments to the
-    // host API of the same name.
+    // SAFETY (the functions that call the host): forwarding the title's own
+    // arguments to the host API of the same name, which needs what each
+    // function's contract says.
 
-    pub(super) fn get_module_handle_w(name: *const u16) -> *mut c_void {
-        // SAFETY: see above.
+    /// # Safety
+    ///
+    /// `name` is null or points to a NUL-terminated UTF-16 string valid for
+    /// reads.
+    pub(super) unsafe fn get_module_handle_w(name: *const u16) -> *mut c_void {
+        // SAFETY: the pointers are as this function's contract gives them.
         unsafe { GetModuleHandleW(name) }
     }
 
-    pub(super) fn get_module_handle_a(name: *const u8) -> *mut c_void {
-        // SAFETY: see above.
+    /// # Safety
+    ///
+    /// `name` is null or points to a NUL-terminated string valid for reads.
+    pub(super) unsafe fn get_module_handle_a(name: *const u8) -> *mut c_void {
+        // SAFETY: the pointers are as this function's contract gives them.
         unsafe { GetModuleHandleA(name) }
     }
 
-    pub(super) fn get_module_file_name_w(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
-        // SAFETY: see above.
+    /// # Safety
+    ///
+    /// `out` is valid for writes of `size` characters.
+    pub(super) unsafe fn get_module_file_name_w(
+        module: *mut c_void,
+        out: *mut u16,
+        size: u32,
+    ) -> u32 {
+        // SAFETY: the pointers are as this function's contract gives them.
         unsafe { GetModuleFileNameW(module, out, size) }
     }
 
-    pub(super) fn get_module_file_name_a(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
-        // SAFETY: see above.
+    /// # Safety
+    ///
+    /// `out` is valid for writes of `size` bytes.
+    pub(super) unsafe fn get_module_file_name_a(
+        module: *mut c_void,
+        out: *mut u8,
+        size: u32,
+    ) -> u32 {
+        // SAFETY: the pointers are as this function's contract gives them.
         unsafe { GetModuleFileNameA(module, out, size) }
     }
 
@@ -419,22 +553,37 @@ mod host {
         unsafe { SetLastError(code) }
     }
 
-    pub(super) fn load_library_ex_a(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void {
-        // SAFETY: see above.
+    /// # Safety
+    ///
+    /// `name` is a NUL-terminated string valid for reads, and `file` is
+    /// null.
+    pub(super) unsafe fn load_library_ex_a(
+        name: *const u8,
+        file: *mut c_void,
+        flags: u32,
+    ) -> *mut c_void {
+        // SAFETY: the pointers are as this function's contract gives them.
         unsafe { LoadLibraryExA(name, file, flags) }
     }
 
-    pub(super) fn load_library_ex_w(
+    /// # Safety
+    ///
+    /// `name` is a NUL-terminated UTF-16 string valid for reads, and `file`
+    /// is null.
+    pub(super) unsafe fn load_library_ex_w(
         name: *const u16,
         file: *mut c_void,
         flags: u32,
     ) -> *mut c_void {
-        // SAFETY: see above.
+        // SAFETY: the pointers are as this function's contract gives them.
         unsafe { LoadLibraryExW(name, file, flags) }
     }
 
-    pub(super) fn get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void {
-        // SAFETY: see above.
+    /// # Safety
+    ///
+    /// `name` is an ordinal or a NUL-terminated string valid for reads.
+    pub(super) unsafe fn get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void {
+        // SAFETY: the pointers are as this function's contract gives them.
         unsafe { GetProcAddress(module, name) }.map_or(std::ptr::null_mut(), |f| f as *mut c_void)
     }
 
@@ -478,8 +627,12 @@ mod host {
         };
     }
 
-    pub(super) fn report_unhandled(info: *const c_void) {
-        // SAFETY: the system's exception pointers, passed to the filter.
+    /// # Safety
+    ///
+    /// `info` is the exception information the system passed to our filter.
+    pub(super) unsafe fn report_unhandled(info: *const c_void) {
+        // SAFETY: the system's exception pointers, per this function's
+        // contract.
         unsafe { victory_loader::report_unhandled(info.cast()) };
     }
 
@@ -509,33 +662,57 @@ mod host {
 mod host {
     use std::ffi::c_void;
 
-    pub(super) fn get_module_handle_w(_: *const u16) -> *mut c_void {
+    /// # Safety
+    ///
+    /// `name` is null or points to a NUL-terminated UTF-16 string valid for
+    /// reads.
+    pub(super) unsafe fn get_module_handle_w(_: *const u16) -> *mut c_void {
         std::ptr::null_mut()
     }
 
-    pub(super) fn get_module_handle_a(_: *const u8) -> *mut c_void {
+    /// # Safety
+    ///
+    /// `name` is null or points to a NUL-terminated string valid for reads.
+    pub(super) unsafe fn get_module_handle_a(_: *const u8) -> *mut c_void {
         std::ptr::null_mut()
     }
 
-    pub(super) fn load_library_ex_a(_: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
+    /// # Safety
+    ///
+    /// `name` is a NUL-terminated string valid for reads, and `file` is
+    /// null.
+    pub(super) unsafe fn load_library_ex_a(_: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()
     }
 
-    pub(super) fn get_module_file_name_w(_: *mut c_void, _: *mut u16, _: u32) -> u32 {
+    /// # Safety
+    ///
+    /// `out` is valid for writes of `size` characters.
+    pub(super) unsafe fn get_module_file_name_w(_: *mut c_void, _: *mut u16, _: u32) -> u32 {
         0
     }
 
-    pub(super) fn get_module_file_name_a(_: *mut c_void, _: *mut u8, _: u32) -> u32 {
+    /// # Safety
+    ///
+    /// `out` is valid for writes of `size` bytes.
+    pub(super) unsafe fn get_module_file_name_a(_: *mut c_void, _: *mut u8, _: u32) -> u32 {
         0
     }
 
     pub(super) fn set_last_error(_: u32) {}
 
-    pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
+    /// # Safety
+    ///
+    /// `name` is a NUL-terminated UTF-16 string valid for reads, and `file`
+    /// is null.
+    pub(super) unsafe fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()
     }
 
-    pub(super) fn get_proc_address(_: *mut c_void, _: *const u8) -> *mut c_void {
+    /// # Safety
+    ///
+    /// `name` is an ordinal or a NUL-terminated string valid for reads.
+    pub(super) unsafe fn get_proc_address(_: *mut c_void, _: *const u8) -> *mut c_void {
         std::ptr::null_mut()
     }
 
@@ -566,7 +743,10 @@ mod host {
 
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
-    pub(super) fn report_unhandled(_: *const c_void) {}
+    /// # Safety
+    ///
+    /// `info` is the exception information the system passed to our filter.
+    pub(super) unsafe fn report_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}
 
@@ -585,13 +765,15 @@ mod tests {
         runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
         let module = base as *mut c_void;
         let mut buf = [0xFFFFu16; 32];
-        let n = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32);
+        // SAFETY: `buf` is a local buffer of `buf.len()` characters.
+        let n = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) };
         assert_eq!(String::from_utf16_lossy(&buf[..n as usize]), r"C:\title\game.exe");
         assert_eq!(buf[n as usize], 0);
 
         // Too small: truncated, NUL-terminated, the buffer size returned.
         let mut small = [0u8; 4];
-        assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
+        // SAFETY: `small` is a local buffer of 4 bytes.
+        assert_eq!(unsafe { GetModuleFileNameA(module, small.as_mut_ptr(), 4) }, 4);
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
     }
 
@@ -599,33 +781,60 @@ mod tests {
         text.encode_utf16().chain(Some(0)).collect()
     }
 
+    // The exports, over arguments that are valid by construction.
+    fn handle_w(text: &str) -> *mut c_void {
+        // SAFETY: `w` ends the string with a NUL, and it outlives the call.
+        unsafe { GetModuleHandleW(w(text).as_ptr()) }
+    }
+    fn handle_a(text: &CStr) -> *mut c_void {
+        // SAFETY: a `CStr` is NUL-terminated.
+        unsafe { GetModuleHandleA(text.as_ptr().cast()) }
+    }
+    fn load_w(text: &str) -> *mut c_void {
+        // SAFETY: as `handle_w`.
+        unsafe { LoadLibraryW(w(text).as_ptr()) }
+    }
+    fn load_a(text: &CStr) -> *mut c_void {
+        // SAFETY: as `handle_a`.
+        unsafe { LoadLibraryA(text.as_ptr().cast()) }
+    }
+    fn load_ex_w(text: &str, flags: u32) -> *mut c_void {
+        // SAFETY: as `handle_w`; the reserved argument is null.
+        unsafe { LoadLibraryExW(w(text).as_ptr(), std::ptr::null_mut(), flags) }
+    }
+    #[cfg(windows)]
+    fn proc_address(module: *mut c_void, name: &CStr) -> *mut c_void {
+        // SAFETY: a `CStr` is NUL-terminated.
+        unsafe { GetProcAddress(module, name.as_ptr().cast()) }
+    }
+
     #[cfg(windows)]
     #[test]
     fn host_lookups_by_name_get_our_overrides() {
-        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        let kernel32 = handle_w("kernel32.dll");
         assert!(!kernel32.is_null());
         let ours = crate::registry::lookup("kernel32.dll", "CreateFileW").unwrap();
-        assert_eq!(GetProcAddress(kernel32, c"CreateFileW".as_ptr().cast()) as usize, ours);
+        assert_eq!(proc_address(kernel32, c"CreateFileW") as usize, ours);
         // A plain name stays the host's.
-        let host = host::get_proc_address(kernel32, c"GetTickCount".as_ptr().cast());
+        // SAFETY: a NUL-terminated literal.
+        let host = unsafe { host::get_proc_address(kernel32, c"GetTickCount".as_ptr().cast()) };
         assert!(!host.is_null());
-        assert_eq!(GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()), host);
+        assert_eq!(proc_address(kernel32, c"GetTickCount"), host);
         // Host DLLs outside the host policy do not exist for the title.
-        assert!(LoadLibraryW(w("wininet.dll").as_ptr()).is_null());
-        assert!(LoadLibraryA(c"C:\\Windows\\System32\\urlmon".as_ptr().cast()).is_null());
-        assert!(GetModuleHandleW(w("WININET.DLL").as_ptr()).is_null());
+        assert!(load_w("wininet.dll").is_null());
+        assert!(load_a(c"C:\\Windows\\System32\\urlmon").is_null());
+        assert!(handle_w("WININET.DLL").is_null());
         assert_eq!(
             // SAFETY: reads this thread's last error.
             unsafe { windows_sys::Win32::Foundation::GetLastError() },
             ERROR_MOD_NOT_FOUND
         );
-        assert!(!LoadLibraryW(w("kernel32").as_ptr()).is_null());
+        assert!(!load_w("kernel32").is_null());
         // By ordinal too (ws2_32 #4 is `connect`).
-        let ws2 = LoadLibraryW(w("ws2_32.dll").as_ptr());
-        assert_eq!(
-            GetProcAddress(ws2, 4 as *const u8) as usize,
-            crate::registry::lookup("ws2_32.dll", "connect").unwrap()
-        );
+        let ws2 = load_w("ws2_32.dll");
+        // SAFETY: an ordinal, which is never dereferenced.
+        let by_ordinal = unsafe { GetProcAddress(ws2, 4 as *const u8) };
+        assert_eq!(by_ordinal as usize, crate::registry::lookup("ws2_32.dll", "connect").unwrap());
     }
 
     #[test]
@@ -638,21 +847,21 @@ mod tests {
             _ => Ok(None),
         }));
         let mapped = base as *mut c_void;
-        assert_eq!(GetModuleHandleW(w("MAPPED").as_ptr()), mapped);
-        assert_eq!(GetModuleHandleA(c"sub\\mapped.dll".as_ptr().cast()), mapped);
-        assert_eq!(LoadLibraryW(w("mapped.dll").as_ptr()), mapped);
+        assert_eq!(handle_w("MAPPED"), mapped);
+        assert_eq!(handle_a(c"sub\\mapped.dll"), mapped);
+        assert_eq!(load_w("mapped.dll"), mapped);
         assert_eq!(FreeLibrary(mapped), 1, "title images stay loaded");
 
         // Not mapped yet: `LoadLibrary` maps it, `GetModuleHandle` does not.
-        assert!(GetModuleHandleW(w("late.dll").as_ptr()).is_null());
-        assert_eq!(LoadLibraryA(c"late".as_ptr().cast()) as usize, 0x7200_0000_0000);
-        assert!(LoadLibraryA(c"broken.dll".as_ptr().cast()).is_null());
+        assert!(handle_w("late.dll").is_null());
+        assert_eq!(load_a(c"late") as usize, 0x7200_0000_0000);
+        assert!(load_a(c"broken.dll").is_null());
         // As data it runs no code, so the host loads it (and finds nothing).
-        let data = LoadLibraryExW(w("late.dll").as_ptr(), std::ptr::null_mut(), 0x2);
+        let data = load_ex_w("late.dll", 0x2);
         assert_ne!(data as usize, 0x7200_0000_0000);
 
-        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        let runtime = load_a(c"xgameruntime.dll");
         assert!(!runtime.is_null());
-        assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+        assert_eq!(handle_w("XGameRuntime.dll"), runtime);
     }
 }

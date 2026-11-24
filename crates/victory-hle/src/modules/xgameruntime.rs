@@ -284,10 +284,16 @@ mod tests {
 
     #[test]
     fn title_stub_loads_the_runtime_dynamically() {
-        let load = |name: &CStr| LoadLibraryExA(name.as_ptr().cast(), std::ptr::null_mut(), 0x800);
+        let load = |name: &CStr| {
+            // SAFETY: a `CStr` is NUL-terminated; the reserved argument is null.
+            unsafe { LoadLibraryExA(name.as_ptr().cast(), std::ptr::null_mut(), 0x800) }
+        };
         let runtime = load(c"xgameruntime.dll");
         assert!(!runtime.is_null());
-        let proc = |name: &CStr| GetProcAddress(runtime, name.as_ptr().cast());
+        let proc = |name: &CStr| {
+            // SAFETY: a `CStr` is NUL-terminated.
+            unsafe { GetProcAddress(runtime, name.as_ptr().cast()) }
+        };
         for name in [
             c"InitializeApiImpl",
             c"InitializeApiImplEx",
@@ -300,7 +306,8 @@ mod tests {
         }
         assert!(proc(c"NotAnExport").is_null());
         let ordinal = std::ptr::without_provenance::<u8>(1);
-        assert!(GetProcAddress(runtime, ordinal).is_null());
+        // SAFETY: an ordinal, which is never dereferenced.
+        assert!(unsafe { GetProcAddress(runtime, ordinal) }.is_null());
 
         type Init = extern "system" fn(u64, u64, u64) -> HRESULT;
         type Query = extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> HRESULT;
@@ -323,7 +330,9 @@ mod tests {
         {
             let kernel32 = load(c"kernel32.dll");
             assert!(!kernel32.is_null(), "host DLLs still load from the host");
-            assert!(!GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()).is_null());
+            // SAFETY: a NUL-terminated literal.
+            let tick = unsafe { GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()) };
+            assert!(!tick.is_null());
         }
     }
 }
