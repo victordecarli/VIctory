@@ -13,10 +13,6 @@
 //! and the plain graphics description, keep their containers only. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::collections::HashMap;
 use std::mem::offset_of;
@@ -162,18 +158,27 @@ const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
-fn pipeline<'a>(this: This) -> &'a Pipeline {
-    // SAFETY: the title passes one of our pipelines.
+/// # Safety
+///
+/// `this` is a live pipeline this module created, and it stays alive for
+/// `'a`.
+unsafe fn pipeline<'a>(this: This) -> &'a Pipeline {
+    // SAFETY: `this` is a live pipeline, per this function's contract.
     unsafe { &*this.cast::<Pipeline>() }
 }
 
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
-pub(crate) fn bound(this: This) {
+///
+/// # Safety
+///
+/// `this` is null or a live pipeline this module created.
+pub(crate) unsafe fn bound(this: This) {
     if this.is_null() {
         return;
     }
-    let p = pipeline(this);
+    // SAFETY: non-null, so a live pipeline, per this function's contract.
+    let p = unsafe { pipeline(this) };
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -187,11 +192,16 @@ pub(crate) fn bound(this: This) {
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).
 #[cfg(windows)]
-pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+/// # Safety
+///
+/// `this` is null or a live pipeline this module created, and it stays
+/// alive for `'a`.
+pub(crate) unsafe fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    // SAFETY: non-null, so a live pipeline, per this function's contract.
+    make::ready(&unsafe { pipeline(this) }.host)
 }
 
 /// Host pipelines queued and not made yet.
@@ -237,18 +247,27 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+/// # Safety
+///
+/// `this` is null or a live pipeline this module created.
+pub(crate) unsafe fn is_skipped(this: This) -> bool {
+    // SAFETY: non-null when it is read, so a live pipeline, per this
+    // function's contract.
+    !this.is_null() && skipped_shader(unsafe { pipeline(this) }).is_some()
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
+/// # Safety
+///
+/// `this` is null or a live pipeline this module created.
+pub(crate) unsafe fn note_drop(this: This) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
-        let p = pipeline(this);
+        // SAFETY: non-null, so a live pipeline, per this function's contract.
+        let p = unsafe { pipeline(this) };
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
@@ -277,15 +296,26 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
 }
 
 /// The stage's container, if it has one.
-fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
+///
+/// # Safety
+///
+/// `code.code` is null or valid for reads of `code.size` bytes for the
+/// duration of the call.
+unsafe fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     if code.code.is_null() || code.size == 0 {
         return None;
     }
-    // SAFETY: the title passes `size` bytes of shader code.
+    // SAFETY: non-null, and `size` readable bytes, per this function's
+    // contract.
     Some(shader(stage, unsafe { std::slice::from_raw_parts(code.code, code.size) }))
 }
 
-fn hand_out(
+/// # Safety
+///
+/// `iid` is null or points to an interface id valid for reads, and `out` is
+/// null or valid for a write of an object pointer, for the duration of the
+/// call.
+unsafe fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
     iid: *const Iid,
@@ -308,52 +338,78 @@ fn hand_out(
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_graphics(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a [`GraphicsHead`], and each
+/// shader's `code` is null or valid for reads of its `size` bytes. `iid` is
+/// null or points to an interface id valid for reads, and `out` is null or
+/// valid for a write of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_graphics(
     _: This,
     desc: *const GraphicsHead,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
     let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
-    let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
-    hand_out(
-        shaders,
-        #[cfg(windows)]
-        None,
-        iid,
-        out,
-    )
+    // SAFETY: each shader's code is as this function's contract gives it.
+    let shaders = stages.filter_map(|(s, c)| unsafe { copy(s, c) }).collect();
+    // SAFETY: `iid` and `out` as this function's contract gives them.
+    unsafe {
+        hand_out(
+            shaders,
+            #[cfg(windows)]
+            None,
+            iid,
+            out,
+        )
+    }
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_compute(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a [`ComputeHead`], and each
+/// shader's `code` is null or valid for reads of its `size` bytes. `iid` is
+/// null or points to an interface id valid for reads, and `out` is null or
+/// valid for a write of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_compute(
     _: This,
     desc: *const ComputeHead,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    hand_out(
-        copy("compute", &desc.stage).into_iter().collect(),
-        #[cfg(windows)]
-        None,
-        iid,
-        out,
-    )
+    // SAFETY: the shader's code, `iid` and `out` are as this function's
+    // contract gives them.
+    unsafe {
+        hand_out(
+            copy("compute", &desc.stage).into_iter().collect(),
+            #[cfg(windows)]
+            None,
+            iid,
+            out,
+        )
+    }
 }
 
 /// Device method 0x1f0: the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
 /// the rest of the description.
-pub(crate) extern "system" fn create_compute_x(
+///
+/// # Safety
+///
+/// As [`create_compute`]; the extensions are not read.
+pub(crate) unsafe extern "system" fn create_compute_x(
     this: This,
     desc: *const ComputeHead,
     _extensions: u32,
@@ -361,7 +417,8 @@ pub(crate) extern "system" fn create_compute_x(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    create_compute(this, desc, iid, out)
+    // SAFETY: the pointers are as this function's contract gives them.
+    unsafe { create_compute(this, desc, iid, out) }
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -402,13 +459,22 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
 
 /// Device method: a pipeline from a stream; the shaders are kept, and the
 /// graphics state for the host pipeline.
-pub(crate) extern "system" fn create_stream(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a [`StreamDesc`] whose `stream`
+/// points to `size` bytes laid out as subobjects, each whole at its
+/// position and, for a shader, with each shader's `code` is null or valid
+/// for reads of its `size` bytes. `iid` is null or points to an interface
+/// id valid for reads, and `out` is null or valid for a write of an object
+/// pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_stream(
     _: This,
     desc: *const StreamDesc,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -420,16 +486,18 @@ pub(crate) extern "system" fn create_stream(
     let mut graphics = host::GraphicsState::default();
     let mut at = 0;
     while at + 8 <= desc.size {
-        // SAFETY: inside the stream the title passes.
+        // SAFETY: inside the stream, per this function's contract.
         let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
         let Some((size, stage)) = subobject(kind) else {
             tracing::warn!(kind, at, "pipeline subobject of unknown size; the rest is ignored");
             break;
         };
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
+            // SAFETY: a shader subobject has its bytecode at +8, and its
+            // code is as this function's contract gives it.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: as above.
+            shaders.extend(unsafe { copy(stage, code) });
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -438,20 +506,36 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
-    hand_out(
-        shaders,
-        #[cfg(windows)]
-        Some(Box::new(graphics)),
-        iid,
-        out,
-    )
+    // SAFETY: `iid` and `out` as this function's contract gives them.
+    unsafe {
+        hand_out(
+            shaders,
+            #[cfg(windows)]
+            Some(Box::new(graphics)),
+            iid,
+            out,
+        )
+    }
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// `QueryInterface`.
+///
+/// # Safety
+///
+/// `this` is a live pipeline this module created. `iid` is null or points
+/// to an interface id valid for reads, and `out` is null or valid for a
+/// write of an object pointer, for the duration of the call.
+unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+/// `Release`.
+///
+/// # Safety
+///
+/// `this` is a live pipeline this module created, holding the reference the
+/// caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Pipeline>(this)
 }
 
@@ -500,7 +584,8 @@ mod tests {
     use crate::object::{S_OK, slot};
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
-        pipeline(p).shaders.iter().map(|s| (s.stage, s.container.clone())).collect()
+        // SAFETY: `p` is a pipeline the test just created.
+        unsafe { pipeline(p) }.shaders.iter().map(|s| (s.stage, s.container.clone())).collect()
     }
 
     #[test]
@@ -518,13 +603,21 @@ mod tests {
             ],
         };
         let mut p = std::ptr::null();
-        assert_eq!(create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        // SAFETY: a local description whose code outlives the call; a static
+        // id and a local to write.
+        let made = unsafe { create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p) };
+        assert_eq!(made, S_OK);
         assert_eq!(shaders(p), [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]);
         // A second pipeline with the same pixel shader shares its container.
         let mut q = std::ptr::null();
-        create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
-        assert!(Arc::ptr_eq(&pipeline(p).shaders[1], &pipeline(q).shaders[1]));
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        // SAFETY: as above.
+        unsafe { create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q) };
+        // SAFETY: `p` and `q` are pipelines the test just created.
+        let (sp, sq) = unsafe { (pipeline(p), pipeline(q)) };
+        assert!(Arc::ptr_eq(&sp.shaders[1], &sq.shaders[1]));
+        let release = slot::<unsafe extern "system" fn(This) -> u32>(p, 0x10);
+        // SAFETY: `p` is live; this releases its only reference.
+        assert_eq!(unsafe { release(p) }, 0);
     }
 
     /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
@@ -564,12 +657,15 @@ mod tests {
         put(0x2a0, 1 << 32);
         let desc = StreamDesc { size: stream.len(), stream: stream.as_ptr() };
         let mut p = std::ptr::null();
-        let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        // SAFETY: `stream` is a local of the size the description says, and
+        // the code it points at outlives the call.
+        let hr = unsafe { create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p) };
         assert_eq!(hr, S_OK);
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
-            let g = pipeline(p).host.graphics.as_deref().unwrap();
+            // SAFETY: `p` is a pipeline the test just created.
+            let g = unsafe { pipeline(p) }.host.graphics.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);
             assert_eq!((g.targets.NumRenderTargets, g.targets.RTFormats[0].0), (1, 28));
         }

@@ -118,7 +118,9 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+    // SAFETY: `pipeline` is the pipeline the title set, which it keeps alive
+    // while a list uses it.
+    unsafe { crate::pipeline::note_drop(pipeline as This) };
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -326,10 +328,15 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        if unsafe { crate::pipeline::is_skipped(self.pipeline as This) } {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
+        let Some(p) = ready else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -501,19 +508,30 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        if unsafe { crate::pipeline::is_skipped(self.pipeline as This) } {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+            // while a list uses it.
+            unsafe { crate::pipeline::note_drop(self.pipeline as This) };
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
+        let Some(p) = ready else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+            // while a list uses it.
+            unsafe {
+                crate::pipeline::note_drop(self.pipeline as This)
+            };
             return;
         };
         if !p.compute {
@@ -538,7 +556,10 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
+        let Some(p) = ready else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -781,7 +802,10 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
+        let Some(p) = ready else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -835,7 +859,10 @@ impl State {
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
+        let Some(p) = ready else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -935,8 +962,12 @@ impl State {
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        if unsafe { crate::pipeline::is_skipped(self.pipeline as This) } {
+            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+            // while a list uses it.
+            unsafe { crate::pipeline::note_drop(self.pipeline as This) };
             return false;
         }
         const DRAW: u32 = 0;
@@ -983,7 +1014,9 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
+            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+            // while a list uses it.
+            DISPATCH => match unsafe { crate::pipeline::host_pipeline(self.pipeline as This) } {
                 Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
@@ -992,8 +1025,12 @@ impl State {
         if !ran {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
+            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+            // while a list uses it.
+            match unsafe { crate::pipeline::host_pipeline(self.pipeline as This) } {
+                // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+                // while a list uses it.
+                None => unsafe { crate::pipeline::note_drop(self.pipeline as This) },
                 Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
             }
             return false;

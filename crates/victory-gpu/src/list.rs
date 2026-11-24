@@ -795,7 +795,9 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
-    crate::pipeline::bound(pipeline);
+    // SAFETY: the title's pipeline (null is tolerated), which it keeps
+    // alive while the list uses it.
+    unsafe { crate::pipeline::bound(pipeline) };
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
