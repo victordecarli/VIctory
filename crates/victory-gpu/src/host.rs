@@ -590,7 +590,9 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
-                what.write(at as *mut u8, bytes);
+                // SAFETY: `defer_write` recorded the title's writable GPU
+                // memory (unified with ours) and its width.
+                unsafe { what.write(at as *mut u8, bytes) };
             }
         }
         self.log_messages();

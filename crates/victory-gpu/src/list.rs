@@ -1208,7 +1208,9 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     }
     let _ = this;
     // Without a host GPU nothing runs later: write now.
-    what.write(address as *mut u8, bytes);
+    // SAFETY: the title names writable GPU memory; its GPU addresses are CPU
+    // addresses (unified memory), and `bytes` is the width of the query.
+    unsafe { what.write(address as *mut u8, bytes) };
 }
 
 /// The list methods by their slot in older titles' lists (the 2020-era

@@ -1,9 +1,5 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
 //! so fence signals complete at once.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -35,18 +31,28 @@ struct Queue {
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
-fn queue<'a>(this: This) -> &'a Queue {
-    // SAFETY: called from queue methods only.
+/// # Safety
+///
+/// `this` is a live queue this module created, and it stays alive for `'a`.
+unsafe fn queue<'a>(this: This) -> &'a Queue {
+    // SAFETY: `this` is a live queue, per this function's contract.
     unsafe { &*this.cast::<Queue>() }
 }
 
-pub(crate) extern "system" fn create(
+/// Device method.
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a `QueueDesc`. `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create(
     _: This,
     desc: *const QueueDesc,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -76,37 +82,64 @@ pub(crate) struct QueueDescX {
 
 /// Device method `CreateCommandQueueX`. The host picks engines itself, so
 /// the queue is created as on PC.
-pub(crate) extern "system" fn create_x(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a `QueueDescX`. `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_x(
     this: This,
     desc: *const QueueDescX,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(&x) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
     tracing::debug!(desc = ?x, "console command queue");
     let desc = QueueDesc { kind: x.kind, priority: 0, flags: x.flags, nodes: 1 };
-    create(this, &desc, iid, out)
+    // SAFETY: `desc` is a local; `iid` and `out` as this function's contract
+    // gives them.
+    unsafe { create(this, &desc, iid, out) }
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// `QueryInterface`.
+///
+/// # Safety
+///
+/// `this` is a live queue this module created. `iid` is null or points to
+/// an interface id valid for reads, and `out` is null or valid for a write
+/// of an object pointer, for the duration of the call.
+unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(QUEUE, iid, object::is(iid, &QUEUE_IIDS).then_some(this), out)
 }
-extern "system" fn release(this: This) -> u32 {
+/// `Release`.
+///
+/// # Safety
+///
+/// `this` is a live queue this module created, holding the reference the
+/// caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
 /// Runs the lists' host lists and waits for them (`crate::host` waits for
 /// every submission).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+///
+/// # Safety
+///
+/// `lists` is null or valid for reads of `count` command list pointers,
+/// each a live list `crate::list` created, for the duration of the call.
+unsafe extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
-        // SAFETY: the title passes `count` lists.
+        // SAFETY: non-null, and `count` pointers, per this function's
+        // contract.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let host_lists: Vec<_> = lists.iter().filter_map(|&l| crate::list::host_list(l)).collect();
         host.execute(&host_lists);
@@ -127,27 +160,49 @@ pub(crate) struct Plane {
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
-    execute(this, count, lists);
+///
+/// # Safety
+///
+/// `lists` is null or valid for reads of `count` command list pointers,
+/// each a live list `crate::list` created, for the duration of the call.
+unsafe extern "system" fn execute_x(
+    this: This,
+    count: u32,
+    lists: *const This,
+    _token: u64,
+    _flags: u32,
+) {
+    // SAFETY: `lists` as this function's contract gives it.
+    unsafe { execute(this, count, lists) };
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
-extern "system" fn signal2_x(
+///
+/// # Safety
+///
+/// `fence` is null or a live fence this crate created.
+unsafe extern "system" fn signal2_x(
     this: This,
     fence: This,
     value: u64,
     _bottom: *const u8,
     _top: *const u8,
 ) -> HRESULT {
-    signal(this, fence, value)
+    // SAFETY: `fence` as this function's contract gives it.
+    unsafe { signal(this, fence, value) }
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+/// `Signal`.
+///
+/// # Safety
+///
+/// `fence` is null or a live fence this crate created.
+unsafe extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: `fence` is non-null and is the title's fence for this call.
+    // SAFETY: non-null, so a live fence, per this function's contract.
     unsafe { crate::fence::signal(fence, value) }
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
@@ -155,11 +210,15 @@ extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
     if fence.is_null() { E_INVALIDARG } else { S_OK }
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
-extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(TIMESTAMP_FREQUENCY) };
     S_OK
 }
@@ -178,7 +237,11 @@ pub(crate) enum Written {
 
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
-    pub(crate) fn write(self, at: *mut u8, bytes: usize) {
+    ///
+    /// # Safety
+    ///
+    /// `at` is valid for writes (unaligned) of `bytes` bytes, 4 or 8.
+    pub(crate) unsafe fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
             Written::GpuTimestamp => {
@@ -188,7 +251,7 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
-        // SAFETY: the title names writable GPU memory (unified with ours).
+        // SAFETY: `at` is writable, per this function's contract.
         unsafe {
             if bytes == 4 {
                 at.cast::<u32>().write_unaligned(value as u32);
@@ -223,7 +286,13 @@ pub(crate) fn presented() -> u64 {
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
-extern "system" fn present(
+///
+/// # Safety
+///
+/// `plane_parameters` is null or valid for reads of a `Plane` (the first of
+/// `planes`), whose `resources` is null or valid for reads of `count`
+/// resource pointers.
+unsafe extern "system" fn present(
     _: This,
     planes: u32,
     plane_parameters: *const Plane,
@@ -261,11 +330,12 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
+        // SAFETY: readable when non-null, per this function's contract.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
         && plane.count > 0
         && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
+        // SAFETY: non-null, and `count` pointers, per this function's
+        // contract.
         && let resource = unsafe { *plane.resources }
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
@@ -345,7 +415,13 @@ const PAGE: u64 = 64 << 10;
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once: every earlier
 /// submission has run.
-extern "system" fn copy_page_mappings(
+///
+/// # Safety
+///
+/// `batches` is null or valid for reads of `count` `PageBatch` entries,
+/// each with `ranges` null or valid for reads of its own `count`
+/// `PageRange` entries.
+unsafe extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
     batches: *const PageBatch,
@@ -360,7 +436,7 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let batches = (count > 0).then(|| {
-        // SAFETY: the title passes `count` batches.
+        // SAFETY: non-null when `count > 0`, per this function's contract.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
@@ -368,7 +444,8 @@ extern "system" fn copy_page_mappings(
         if b.ranges.is_null() {
             continue;
         }
-        // SAFETY: each batch holds `count` ranges.
+        // SAFETY: non-null, and `count` ranges, per this function's
+        // contract.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
         for r in ranges {
@@ -394,9 +471,14 @@ extern "system" fn copy_page_mappings(
     S_OK
 }
 
-extern "system" fn desc(this: This, out: *mut QueueDesc) {
+/// # Safety
+///
+/// `this` is a live queue this module created. `out` is null or valid for a
+/// write of a `QueueDesc`.
+unsafe extern "system" fn desc(this: This, out: *mut QueueDesc) {
     if !out.is_null() {
-        // SAFETY: checked non-null; the title passes room for a description.
+        // SAFETY: checked non-null; writable, and `this` is a live queue,
+        // per this function's contract.
         unsafe { out.write(queue(this).desc) };
     }
 }
@@ -466,19 +548,24 @@ mod tests {
         let null = std::ptr::null();
         let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
         let mut q = null;
-        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        // SAFETY: a local description, a static id and a local to write.
+        assert_eq!(unsafe { create(null, &desc, &QUEUE_IIDS[0], &mut q) }, S_OK);
         // SAFETY: the title reads the type at +0x10.
         assert_eq!(unsafe { q.cast::<u8>().add(0x10).cast::<u32>().read() }, 0);
         let mut fence = null;
         let fence_iid = &crate::fence::FENCE_IIDS[0];
         // SAFETY: a static interface id and a local to write.
         assert_eq!(unsafe { crate::fence::create(null, 0, 0, fence_iid, &mut fence) }, S_OK);
-        let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
-        assert_eq!(signal(q, fence, 7), S_OK);
+        let signal =
+            slot::<unsafe extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
+        // SAFETY: `q` and `fence` are live.
+        assert_eq!(unsafe { signal(q, fence, 7) }, S_OK);
         let completed = slot::<unsafe extern "system" fn(This) -> u64>(fence, 0x40);
         // SAFETY: `fence` is the fence just created and still live.
         assert_eq!(unsafe { completed(fence) }, 7);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+        let release = slot::<unsafe extern "system" fn(This) -> u32>(q, 0x10);
+        // SAFETY: `q` is live; this releases its only reference.
+        assert_eq!(unsafe { release(q) }, 0);
     }
 
     /// Grand Theft Auto VI's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
@@ -487,10 +574,13 @@ mod tests {
         let null = std::ptr::null();
         let desc = QueueDescX { kind: 2, flags: 0, engine_or_pipe: 1, queue: 0 };
         let mut q = null;
-        assert_eq!(create_x(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
-        assert_eq!(queue(q).desc.kind, 2);
+        // SAFETY: a local description, a static id and a local to write.
+        assert_eq!(unsafe { create_x(null, &desc, &QUEUE_IIDS[0], &mut q) }, S_OK);
+        // SAFETY: `q` is the queue just created.
+        assert_eq!(unsafe { queue(q) }.desc.kind, 2);
         let none = std::ptr::null();
-        assert_eq!(create_x(null, none, &QUEUE_IIDS[0], &mut q), E_INVALIDARG);
+        // SAFETY: a null description is tolerated.
+        assert_eq!(unsafe { create_x(null, none, &QUEUE_IIDS[0], &mut q) }, E_INVALIDARG);
     }
 
     #[test]
@@ -505,12 +595,15 @@ mod tests {
     #[test]
     fn timestamps_and_values_are_written() {
         let mut at = [0u64; 2];
-        Written::Value(0x1_0000_0002).write(at.as_mut_ptr().cast(), 4);
+        // SAFETY: `at` holds two `u64`.
+        unsafe { Written::Value(0x1_0000_0002).write(at.as_mut_ptr().cast(), 4) };
         assert_eq!(at[0], 2);
-        Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
+        // SAFETY: as above.
+        unsafe { Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8) };
         let first = at[1];
         std::thread::sleep(std::time::Duration::from_millis(2));
-        Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
+        // SAFETY: as above.
+        unsafe { Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8) };
         assert!(at[1] > first);
     }
 }
