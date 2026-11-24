@@ -53,4 +53,7 @@ Most modules start with a module-level `not_unsafe_ptr_arg_deref` allow:
 exports take raw pointers in safe signatures. Leave that allow as it is
 in a module you touch for other reasons. Removing it is its own change,
 one module at a time: its functions become `unsafe extern "system"` with
-a `# Safety` section, verified on Windows.
+a `# Safety` section, verified on Windows. That includes functions that
+only hand a title pointer to `put`, `text` or `xasync`: the contract
+belongs on the function the title calls. Those helpers are converted
+last, once all their callers are unsafe.
