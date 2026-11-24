@@ -2,10 +2,6 @@
 //! (`runtime::Title::storage`, under the data directory, never the cache)
 //! with the quota its manifest declares, seen by the title as a drive
 //! (`files`).
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::path::Path;
 
