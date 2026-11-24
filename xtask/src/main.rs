@@ -5,6 +5,7 @@
     reason = "a command-line tool: its reports are its output"
 )]
 
+mod audit;
 mod citations;
 mod policy;
 mod wincheck;
@@ -43,6 +44,19 @@ enum Cmd {
     /// from any host: both clippy runs of the Windows CI job, with
     /// `--target`. Does not link or run tests.
     Wincheck,
+    /// Measure every workspace crate: textual counts, and with `--lints`
+    /// clippy's counts outside tests for the Windows target. Measures only;
+    /// gates nothing.
+    AuditMetrics {
+        /// Print the report as JSON (the format is documented in
+        /// xtask/src/audit.rs) instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Also run clippy (both feature variants, as `wincheck` does) to
+        /// count long functions, panics and unwraps outside tests. Slow.
+        #[arg(long)]
+        lints: bool,
+    },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
 }
@@ -53,6 +67,7 @@ fn main() -> Result<()> {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::Citations { docs } => citations::run(&root, &docs),
         Cmd::Wincheck => wincheck::run(&root),
+        Cmd::AuditMetrics { json, lints } => audit::run(&root, json, lints),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

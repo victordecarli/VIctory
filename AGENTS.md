@@ -27,7 +27,7 @@ out and the gotchas local to it. This file still applies there.
 | `victory-gpu` | D3D12.X objects, command lists, GPU memory → host D3D12 | shader translation logic | compiles, with dead-code warnings |
 | `victory-hle` | console API implementations called by title code | format decoders (call `victory-formats`) | **no** (see the ratchet) |
 | `apps/victory` | CLI: inspect, census, translate, run | library logic that other crates need | no (depends on `victory-hle`) |
-| `xtask` | asset-policy check, citation check, Windows-target clippy (`wincheck`), git hooks | product code | yes |
+| `xtask` | asset-policy check, citation check, Windows-target clippy (`wincheck`), code metrics (`audit-metrics`), git hooks | product code | yes |
 
 Dependency direction (enforced by review, keep it acyclic and downward):
 
@@ -83,6 +83,12 @@ PR, and do not change what `cfg(windows)` code does beyond what you can
 prove by reading and by `wincheck`. Never use `#[expect(...)]` in code you
 could not compile for every configuration CI builds: an unfulfilled
 expectation is itself a warning, and CI runs `-D warnings`.
+
+`cargo xtask audit-metrics [--json] [--lints]` measures and verifies
+nothing: it is not in CI and none of its numbers gate a change. It prints
+per-crate counts (text counts always; with `--lints`, clippy's counts
+outside tests, using `wincheck`'s setup). The JSON format is documented
+in `xtask/src/audit.rs`.
 
 Claude Code sessions run `.claude/hooks/check_edit.ps1` before every file
 edit and shell command (configured in `.claude/settings.json`; needs
