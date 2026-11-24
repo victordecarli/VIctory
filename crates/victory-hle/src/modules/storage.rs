@@ -221,7 +221,10 @@ mod tests {
         let mut attributes = [0u8; 36];
         let get_attributes = super::super::files::GetFileAttributesExW;
         let wide: Vec<u16> = path.encode_utf16().collect();
-        assert_ne!(get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()), 0);
+        // SAFETY: `wide` is NUL-terminated (`path` ends in `\0`), and
+        // `attributes` has room for the 36-byte answer.
+        let found = unsafe { get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()) };
+        assert_ne!(found, 0);
 
         let mut info = SpaceInfo { available_free: 0, total_free: 0, used: 0, total: 0 };
         // SAFETY: `info` is a local to write.

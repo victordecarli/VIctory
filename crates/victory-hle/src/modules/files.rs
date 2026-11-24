@@ -13,10 +13,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`CreateFileW`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 #![allow(clippy::too_many_arguments, reason = "the signature is fixed by the API title code calls")]
 
 use std::ffi::{CStr, c_char, c_void};
@@ -205,11 +201,14 @@ impl Wide {
     }
 }
 
-fn wide(path: *const u16) -> Wide {
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads.
+unsafe fn wide(path: *const u16) -> Wide {
     if path.is_null() {
         return Wide(path, None);
     }
-    // SAFETY: the title passes a NUL-terminated path.
+    // SAFETY: `path` is NUL-terminated, per this function's contract.
     let path_slice = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         std::slice::from_raw_parts(path, len)
@@ -230,11 +229,15 @@ fn trace(path: &[u16], host: Option<&[u16]>) {
 
 /// A narrow path (ANSI code page, as the host decodes it) on a virtual
 /// drive, as a wide host path.
-fn narrow(path: *const c_char) -> Option<Vec<u16>> {
+///
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads.
+unsafe fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     if path.is_null() {
         return None;
     }
-    // SAFETY: the title passes a NUL-terminated path.
+    // SAFETY: `path` is NUL-terminated, per this function's contract.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
     // The drive part is ASCII in every code page; decode only candidates.
     match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
@@ -258,11 +261,15 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
 }
 
 /// An ASCII mode string (`"rb"`, `"w, ccs=UTF-8"`) for a wide CRT call.
-fn widen(mode: *const c_char) -> Vec<u16> {
+///
+/// # Safety
+///
+/// `mode` is null or a NUL-terminated string valid for reads.
+unsafe fn widen(mode: *const c_char) -> Vec<u16> {
     if mode.is_null() {
         return vec![0];
     }
-    // SAFETY: a NUL-terminated mode string.
+    // SAFETY: `mode` is NUL-terminated, per this function's contract.
     let bytes = unsafe { CStr::from_ptr(mode) }.to_bytes();
     bytes.iter().map(|&b| u16::from(b)).chain([0]).collect()
 }
@@ -298,7 +305,11 @@ fn crt_failure<T>(value: T) -> T {
 
 // kernel32 and its file API sets.
 
-pub extern "system" fn CreateFileW(
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn CreateFileW(
     path: *const u16,
     access: u32,
     share: u32,
@@ -307,7 +318,8 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    let p = wide(path);
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     let Some(create) = try_host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)
     else {
         return win32_failure(INVALID_HANDLE_VALUE);
@@ -323,7 +335,11 @@ pub extern "system" fn CreateFileW(
     )
 }
 
-pub extern "system" fn CreateFileA(
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+pub unsafe extern "system" fn CreateFileA(
     path: *const c_char,
     access: u32,
     share: u32,
@@ -332,7 +348,8 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    match narrow(path) {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             let Some(create) = try_host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)
             else {
@@ -359,14 +376,20 @@ pub extern "system" fn CreateFileA(
 }
 
 /// Used by Bink.
-pub extern "system" fn CreateFile2(
+///
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn CreateFile2(
     path: *const u16,
     access: u32,
     share: u32,
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
-    let p = wide(path);
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     let Some(create) = try_host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)
     else {
         return win32_failure(INVALID_HANDLE_VALUE);
@@ -374,8 +397,13 @@ pub extern "system" fn CreateFile2(
     create(p.ptr(), access, share, disposition, params)
 }
 
-pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
-    match narrow(path) {
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+pub unsafe extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             match try_host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32) {
                 Some(delete) => delete(p.as_ptr()),
@@ -392,24 +420,39 @@ pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
     }
 }
 
-pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn DeleteFileW(path: *const u16) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32) {
         Some(delete) => delete(p.ptr()),
         None => win32_failure(0),
     }
 }
 
-pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32) {
         Some(remove_directory) => remove_directory(p.ptr()),
         None => win32_failure(0),
     }
 }
 
-pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)
     {
         Some(set) => set(p.ptr(), attributes),
@@ -417,8 +460,13 @@ pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> 
     }
 }
 
-pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
-    match narrow(path) {
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+pub unsafe extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             match try_host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)
             {
@@ -436,8 +484,13 @@ pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
     }
 }
 
-pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)
     {
         Some(create) => create(p.ptr(), security),
@@ -445,12 +498,17 @@ pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_voi
     }
 }
 
-pub extern "system" fn GetFileAttributesExW(
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn GetFileAttributesExW(
     path: *const u16,
     level: i32,
     info: *mut c_void,
 ) -> i32 {
-    let p = wide(path);
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)
     {
         Some(get) => get(p.ptr(), level, info),
@@ -458,21 +516,31 @@ pub extern "system" fn GetFileAttributesExW(
     }
 }
 
-pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32) {
         Some(get) => get(p.ptr()),
         None => win32_failure(INVALID_FILE_ATTRIBUTES),
     }
 }
 
-pub extern "system" fn GetDiskFreeSpaceExW(
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn GetDiskFreeSpaceExW(
     path: *const u16,
     available: *mut u64,
     total: *mut u64,
     free: *mut u64,
 ) -> i32 {
-    let p = wide(path);
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("kernel32.dll", "GetDiskFreeSpaceExW": extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32)
     {
         Some(get) => get(p.ptr(), available, total, free),
@@ -482,14 +550,20 @@ pub extern "system" fn GetDiskFreeSpaceExW(
 
 /// Wants a volume root: a virtual drive answers for the host volume its
 /// folder is on.
-pub extern "system" fn GetDiskFreeSpaceW(
+///
+/// # Safety
+///
+/// `root` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn GetDiskFreeSpaceW(
     root: *const u16,
     sectors_per_cluster: *mut u32,
     bytes_per_sector: *mut u32,
     free_clusters: *mut u32,
     clusters: *mut u32,
 ) -> i32 {
-    let mut p = wide(root);
+    // SAFETY: `root` is null or NUL-terminated, per this function's contract.
+    let mut p = unsafe { wide(root) };
     if let Some(host) = &mut p.1
         && let [letter, colon, sep, ..] = host[..]
         && colon == u16::from(b':')
@@ -510,8 +584,13 @@ pub extern "system" fn GetDiskFreeSpaceW(
     )
 }
 
-pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Handle {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Handle {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)
     {
         Some(find) => find(p.ptr(), data),
@@ -519,7 +598,11 @@ pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Ha
     }
 }
 
-pub extern "system" fn FindFirstFileExW(
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "system" fn FindFirstFileExW(
     path: *const u16,
     level: i32,
     data: *mut c_void,
@@ -527,7 +610,8 @@ pub extern "system" fn FindFirstFileExW(
     filter: *mut c_void,
     flags: u32,
 ) -> Handle {
-    let p = wide(path);
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     let Some(find) = try_host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)
     else {
         return win32_failure(INVALID_HANDLE_VALUE);
@@ -535,8 +619,14 @@ pub extern "system" fn FindFirstFileExW(
     find(p.ptr(), level, data, search, filter, flags)
 }
 
-pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
-    let (from, to) = (wide(from), wide(to));
+/// # Safety
+///
+/// `from` is null or a NUL-terminated UTF-16 string valid for reads. `to`
+/// is null or a NUL-terminated UTF-16 string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+pub unsafe extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
+    // SAFETY: both are null or NUL-terminated, per this function's contract.
+    let (from, to) = unsafe { (wide(from), wide(to)) };
     match try_host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)
     {
         Some(move_file) => move_file(from.ptr(), to.ptr(), flags),
@@ -544,8 +634,13 @@ pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32)
     }
 }
 
-pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
-    match narrow(path) {
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+pub unsafe extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             match try_host!("kernel32.dll", "SetCurrentDirectoryW": extern "system" fn(*const u16) -> i32)
             {
@@ -565,8 +660,14 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 
 // The C runtime (ucrtbase, which the title's CRT imports bind to).
 
-pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. `mode`
+/// is a NUL-terminated UTF-16 string valid for reads. The rest go to the
+/// host unchanged, as it requires.
+pub unsafe extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File) {
         Some(open) => open(p.ptr(), mode),
         None => crt_failure(std::ptr::null_mut()),
@@ -575,8 +676,16 @@ pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
 
 /// Without the host's `_wfopen_s`, `out` is left as the title passed it;
 /// the error code is what callers check.
-pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
-    let p = wide(path);
+///
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. `mode`
+/// is a NUL-terminated UTF-16 string valid for reads. `out` is valid for a
+/// write of a stream pointer. The rest go to the host unchanged, as it
+/// requires.
+pub unsafe extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)
     {
         Some(open) => open(out, p.ptr(), mode),
@@ -584,8 +693,14 @@ pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) 
     }
 }
 
-pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. `mode`
+/// is a NUL-terminated UTF-16 string valid for reads. The rest go to the
+/// host unchanged, as it requires.
+pub unsafe extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)
     {
         Some(open) => open(p.ptr(), mode, share),
@@ -600,7 +715,11 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // destinations and retry a failed `ReadFile` forever. So the destination
 // is opened first.
 
-pub extern "system" fn ReadFile(
+/// # Safety
+///
+/// `buffer` is valid for writes of `len` bytes; `read` and `overlapped` are
+/// as `ReadFile` requires. All go to the host unchanged.
+pub unsafe extern "system" fn ReadFile(
     file: *mut c_void,
     buffer: *mut u8,
     len: u32,
@@ -618,7 +737,12 @@ pub extern "system" fn ReadFile(
 /// The host CRT reads large requests straight into the caller's buffer.
 /// Without the host's `fread` nothing is read; the stream's error flag
 /// cannot be set without it, so `errno` carries the failure.
-pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
+///
+/// # Safety
+///
+/// `buffer` is valid for writes of `size * count` bytes and `stream` is an
+/// open stream; both go to the host unchanged.
+pub unsafe extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
     match try_host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize) {
         Some(read) => read(buffer, size, count, stream),
@@ -626,12 +750,19 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
     }
 }
 
-pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
-    match narrow(path) {
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. `mode` is a
+/// NUL-terminated string valid for reads. The rest go to the host
+/// unchanged, as it requires.
+pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             match try_host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)
             {
-                Some(open) => open(p.as_ptr(), widen(mode).as_ptr()),
+                // SAFETY: `mode` is NUL-terminated, per this function's contract.
+                Some(open) => open(p.as_ptr(), unsafe { widen(mode) }.as_ptr()),
                 None => crt_failure(std::ptr::null_mut()),
             }
         }
@@ -646,12 +777,20 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 }
 
 /// See [`_wfopen_s`] for `out` when the host lacks the function.
-pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
-    match narrow(path) {
+///
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. `mode` is a
+/// NUL-terminated string valid for reads. `out` is valid for a write of a
+/// stream pointer. The rest go to the host unchanged, as it requires.
+pub unsafe extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             match try_host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)
             {
-                Some(open) => open(out, p.as_ptr(), widen(mode).as_ptr()),
+                // SAFETY: `mode` is NUL-terminated, per this function's contract.
+                Some(open) => open(out, p.as_ptr(), unsafe { widen(mode) }.as_ptr()),
                 None => crt_failure(ENOSYS),
             }
         }
@@ -667,8 +806,14 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 
 /// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
 /// travels in the same register either way, so it is passed on as is.
-pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
-    match narrow(path) {
+///
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+pub unsafe extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             match try_host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32) {
                 Some(open) => open(p.as_ptr(), flags, mode),
@@ -686,24 +831,40 @@ pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
 }
 
 /// See [`_open`]; used by libHttpClient.
-pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
-    let p = wide(path);
+///
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32) {
         Some(open) => open(p.ptr(), flags, mode),
         None => crt_failure(-1),
     }
 }
 
-pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32) {
         Some(stat64) => stat64(p.ptr(), stat),
         None => crt_failure(-1),
     }
 }
 
-pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
-    match narrow(path) {
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+pub unsafe extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             match try_host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)
             {
@@ -721,8 +882,13 @@ pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
     }
 }
 
-pub extern "C" fn remove(path: *const c_char) -> i32 {
-    match narrow(path) {
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+pub unsafe extern "C" fn remove(path: *const c_char) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => match try_host!("ucrtbase.dll", "_wremove": extern "C" fn(*const u16) -> i32) {
             Some(host_remove) => host_remove(p.as_ptr()),
             None => crt_failure(-1),
@@ -734,16 +900,26 @@ pub extern "C" fn remove(path: *const c_char) -> i32 {
     }
 }
 
-pub extern "C" fn _wchmod(path: *const u16, mode: i32) -> i32 {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "C" fn _wchmod(path: *const u16, mode: i32) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("ucrtbase.dll", "_wchmod": extern "C" fn(*const u16, i32) -> i32) {
         Some(chmod) => chmod(p.ptr(), mode),
         None => crt_failure(-1),
     }
 }
 
-pub extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
-    let p = wide(path);
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+pub unsafe extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("ucrtbase.dll", "_wutime64": extern "C" fn(*const u16, *mut c_void) -> i32) {
         Some(utime) => utime(p.ptr(), times),
         None => crt_failure(-1),
@@ -757,8 +933,14 @@ const FIOPEN: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z";
 const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
-extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
-    let p = wide(path);
+///
+/// # Safety
+///
+/// `path` is null or a NUL-terminated UTF-16 string valid for reads. The
+/// rest go to the host unchanged, as it requires.
+unsafe extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    let p = unsafe { wide(path) };
     match try_host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)
     {
         Some(open) => open(p.ptr(), mode, protection),
@@ -767,8 +949,14 @@ extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File 
 }
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
-extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
-    match narrow(path) {
+///
+/// # Safety
+///
+/// `path` is null or a NUL-terminated string valid for reads. The rest go
+/// to the host unchanged, as it requires.
+unsafe extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
+    // SAFETY: `path` is null or NUL-terminated, per this function's contract.
+    match unsafe { narrow(path) } {
         Some(p) => {
             match try_host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)
             {
@@ -877,10 +1065,10 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(
-            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
-            0
-        );
+        // SAFETY: `handle` is an open file, `out` holds 10 bytes and `n` is
+        // a local to write.
+        let read = unsafe { ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()) };
+        assert_ne!(read, 0);
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
@@ -934,15 +1122,20 @@ mod tests {
         let deep = format!("{letter}:/{}/{}", "a".repeat(200), "b".repeat(100));
         let null = std::ptr::null_mut();
         let first = w(&deep[..203]);
-        assert_ne!(CreateDirectoryW(first.as_ptr(), null), 0);
-        assert_ne!(CreateDirectoryW(w(&deep).as_ptr(), null), 0);
+        // SAFETY: `w` ends each string with a NUL; a null security descriptor.
+        assert_ne!(unsafe { CreateDirectoryW(first.as_ptr(), null) }, 0);
+        // SAFETY: as above.
+        assert_ne!(unsafe { CreateDirectoryW(w(&deep).as_ptr(), null) }, 0);
         let file = format!("{deep}/../{}/f.txt", "b".repeat(100));
-        let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
+        // SAFETY: NUL-terminated path and mode.
+        let f = unsafe { _wfopen(w(&file).as_ptr(), w("wb").as_ptr()) };
         assert!(!f.is_null(), "{file}");
         try_host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)
             .expect("ucrtbase exports fclose")(f);
-        assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
-        assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
+        // SAFETY: NUL-terminated paths.
+        assert_ne!(unsafe { DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()) }, 0);
+        // SAFETY: as above.
+        assert_ne!(unsafe { RemoveDirectoryW(w(&deep).as_ptr()) }, 0);
     }
 
     #[test]
@@ -958,44 +1151,53 @@ mod tests {
 
         let path = w(&format!(r"{letter}:\created.bin"));
         let null = std::ptr::null_mut();
-        let h = CreateFileW(path.as_ptr(), GENERIC_WRITE, 0, null, CREATE_ALWAYS, 0, null);
+        // SAFETY: `path` is NUL-terminated; null security and template.
+        let h =
+            unsafe { CreateFileW(path.as_ptr(), GENERIC_WRITE, 0, null, CREATE_ALWAYS, 0, null) };
         assert_ne!(h as isize, -1);
         close(h);
         assert!(dir.path().join("created.bin").is_file());
 
         let path = format!("{letter}:/opened.txt\0");
-        let f = fopen(path.as_ptr().cast(), c"wb".as_ptr());
+        // SAFETY: NUL-terminated path and mode.
+        let f = unsafe { fopen(path.as_ptr().cast(), c"wb".as_ptr()) };
         assert!(!f.is_null());
         fclose(f);
         assert!(dir.path().join("opened.txt").is_file());
 
         let path = format!("{letter}:/stream.txt\0");
         const OUT: i32 = 2;
-        let f = fiopen(path.as_ptr().cast(), OUT, 0x40);
+        // SAFETY: a NUL-terminated path.
+        let f = unsafe { fiopen(path.as_ptr().cast(), OUT, 0x40) };
         assert!(!f.is_null());
         fclose(f);
         assert!(dir.path().join("stream.txt").is_file());
 
-        assert_eq!(remove(path.as_ptr().cast()), 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { remove(path.as_ptr().cast()) }, 0);
         assert!(!dir.path().join("stream.txt").exists());
-        let f = fiopen_wide(w(&format!("{letter}:/wide.txt")).as_ptr(), OUT, 0x40);
+        // SAFETY: a NUL-terminated path.
+        let f = unsafe { fiopen_wide(w(&format!("{letter}:/wide.txt")).as_ptr(), OUT, 0x40) };
         assert!(!f.is_null());
         fclose(f);
         assert!(dir.path().join("wide.txt").is_file());
 
         const OPEN_EXISTING: u32 = 3;
         let path = w(&format!(r"{letter}:\created.bin"));
-        let h = CreateFile2(path.as_ptr(), GENERIC_WRITE, 0, OPEN_EXISTING, null);
+        // SAFETY: `path` is NUL-terminated; null parameters.
+        let h = unsafe { CreateFile2(path.as_ptr(), GENERIC_WRITE, 0, OPEN_EXISTING, null) };
         assert_ne!(h as isize, -1);
         close(h);
         const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
-        assert_ne!(GetFileAttributesW(path.as_ptr()), INVALID_FILE_ATTRIBUTES);
+        // SAFETY: as above.
+        assert_ne!(unsafe { GetFileAttributesW(path.as_ptr()) }, INVALID_FILE_ATTRIBUTES);
 
         const O_WRONLY: i32 = 1;
         const O_CREAT: i32 = 0x100;
         const S_IWRITE: i32 = 0x80;
         let path = format!("{letter}:/low.bin\0");
-        let fd = _open(path.as_ptr().cast(), O_WRONLY | O_CREAT, S_IWRITE);
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { _open(path.as_ptr().cast(), O_WRONLY | O_CREAT, S_IWRITE) };
         assert!(fd >= 0);
         try_host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)
             .expect("ucrtbase exports _close")(fd);
@@ -1003,7 +1205,8 @@ mod tests {
 
         // Other paths pass through untouched.
         let host_path = format!("{}\0", dir.path().join("plain.txt").display());
-        let f = fopen(host_path.as_ptr().cast(), c"wb".as_ptr());
+        // SAFETY: NUL-terminated path and mode.
+        let f = unsafe { fopen(host_path.as_ptr().cast(), c"wb".as_ptr()) };
         assert!(!f.is_null());
         fclose(f);
         assert!(dir.path().join("plain.txt").is_file());
@@ -1025,30 +1228,38 @@ mod tests {
         let path = |name: &str| format!("{inner}:/{name}\0");
 
         const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
-        let wide = GetFileAttributesW(w(&format!("{inner}:/present.txt")).as_ptr());
+        // SAFETY: a NUL-terminated path.
+        let wide = unsafe { GetFileAttributesW(w(&format!("{inner}:/present.txt")).as_ptr()) };
         assert_eq!(wide, INVALID_FILE_ATTRIBUTES);
-        let narrow = GetFileAttributesA(path("present.txt").as_ptr().cast());
+        // SAFETY: as above, narrow.
+        let narrow = unsafe { GetFileAttributesA(path("present.txt").as_ptr().cast()) };
         assert_eq!(narrow, wide, "GetFileAttributesA agrees with its wide twin");
 
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const CREATE_ALWAYS: u32 = 2;
         let null = std::ptr::null_mut();
-        let h = CreateFileA(
-            path("a.bin").as_ptr().cast(),
-            GENERIC_WRITE,
-            0,
-            null,
-            CREATE_ALWAYS,
-            0,
-            null,
-        );
+        // SAFETY: a NUL-terminated path; null security and template.
+        let h = unsafe {
+            CreateFileA(
+                path("a.bin").as_ptr().cast(),
+                GENERIC_WRITE,
+                0,
+                null,
+                CREATE_ALWAYS,
+                0,
+                null,
+            )
+        };
         assert_eq!(h as isize, -1);
-        assert!(fopen(path("b.txt").as_ptr().cast(), c"wb".as_ptr()).is_null());
+        // SAFETY: NUL-terminated path and mode.
+        assert!(unsafe { fopen(path("b.txt").as_ptr().cast(), c"wb".as_ptr()) }.is_null());
         let mut f: File = std::ptr::null_mut();
-        let error = fopen_s(&mut f, path("c.txt").as_ptr().cast(), c"wb".as_ptr());
+        // SAFETY: NUL-terminated path and mode; `f` is a local to write.
+        let error = unsafe { fopen_s(&mut f, path("c.txt").as_ptr().cast(), c"wb".as_ptr()) };
         assert_ne!(error, 0);
         const OUT: i32 = 2;
-        assert!(fiopen(path("d.txt").as_ptr().cast(), OUT, 0x40).is_null());
+        // SAFETY: a NUL-terminated path.
+        assert!(unsafe { fiopen(path("d.txt").as_ptr().cast(), OUT, 0x40) }.is_null());
 
         // Nothing was made behind a path rewritten twice.
         let names: Vec<_> =
