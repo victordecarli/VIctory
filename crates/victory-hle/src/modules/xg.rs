@@ -686,9 +686,11 @@ mod tests {
     }
 
     fn create(d: &ResourceDesc) -> This {
-        let mut c = std::ptr::null_mut();
-        assert_eq!(try_create(d, &mut c), S_OK);
-        crate::test_support::valid_mut(c)
+        let mut c = std::mem::MaybeUninit::<This>::uninit();
+        // SAFETY: valid references for `d`, and room for the pointer.
+        assert_eq!(unsafe { XGCreateTextureComputer(d, c.as_mut_ptr()) }, S_OK);
+        // SAFETY: written by the call, which returned success.
+        crate::test_support::valid_mut(unsafe { c.assume_init() })
     }
 
     fn suggest(d: &ResourceDesc, out: &mut u32) -> HRESULT {

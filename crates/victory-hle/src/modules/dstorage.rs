@@ -1023,7 +1023,7 @@ mod tests {
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        queue
+        crate::test_support::valid_mut(queue)
     }
 
     fn request(
