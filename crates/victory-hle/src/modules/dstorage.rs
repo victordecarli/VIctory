@@ -978,6 +978,7 @@ mod tests {
     use crate::modules::xgameruntime::method;
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
+        let object = crate::test_support::valid_mut(object);
         // SAFETY: every object here starts with the runtime header.
         method(unsafe { &*object.cast::<Object>() }, slot)
     }

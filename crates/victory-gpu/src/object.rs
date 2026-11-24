@@ -354,6 +354,7 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
 
 #[cfg(test)]
 pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
+    let object = crate::test_support::valid(object);
     // SAFETY: `object` is ours and its table has the slot.
     let f = unsafe { *(*object).functions.add(offset / 8) };
     // SAFETY: the caller names the slot's signature.
