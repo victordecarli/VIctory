@@ -6,10 +6,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`XMemVirtualAlloc`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
@@ -88,7 +84,12 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
-pub extern "system" fn XMemVirtualAlloc(
+/// # Safety
+///
+/// `base` is null, or the start of address space the caller owns and may
+/// have the host reserve or commit over: a placeholder it holds, for
+/// `MEM_REPLACE_PLACEHOLDER`.
+pub unsafe extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
     kind: u32,
@@ -175,14 +176,18 @@ pub struct BasicInformation {
 // all of it is GPU-reachable here (Grand Theft Auto VI's BVH builder, the
 // only caller, wants graphics memory); remember the flags of
 // `XMemVirtualAlloc` regions if a title tells CPU-only memory apart.
-pub extern "system" fn XMemVirtualQuery(
+/// # Safety
+///
+/// `out` is null or valid for writes of a `BasicInformation` (the host
+/// fails on null). `address` is only passed to the host.
+pub unsafe extern "system" fn XMemVirtualQuery(
     process: HANDLE,
     address: *const c_void,
     out: *mut BasicInformation,
 ) -> BOOL {
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
-    // SAFETY: the title passes room for the whole structure; the host
-    // fails on a null one.
+    // SAFETY: `out` is writable when non-null, per this function's
+    // contract; the host fails on a null one.
     unsafe {
         if VirtualQueryEx(process, address, out.cast(), size) == 0 {
             return 0;
@@ -256,9 +261,16 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
 }
 
 /// See [`XMemAlloc`].
-pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+///
+/// # Safety
+///
+/// `address` is null, or a block the title's free hook or `XMemFreeDefault`
+/// accepts with these `attributes`, as the matching `XMemAlloc` returned
+/// it.
+pub unsafe extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
     match hooks()[1] {
-        0 => XMemFreeDefault(address, attributes),
+        // SAFETY: `address` as this function's contract gives it.
+        0 => unsafe { XMemFreeDefault(address, attributes) },
         hook => {
             // SAFETY: the title's own routine of this type.
             let free: FreeRoutine = unsafe { std::mem::transmute(hook) };
@@ -270,13 +282,16 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            size,
-            MEM_RESERVE | MEM_COMMIT,
-            GRAPHICS | ADDRESS_32BIT,
-            PAGE_READWRITE,
-        );
+        // SAFETY: a null base: the host picks the address.
+        return unsafe {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                GRAPHICS | ADDRESS_32BIT,
+                PAGE_READWRITE,
+            )
+        };
     }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
@@ -300,7 +315,12 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 }
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
-pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
+///
+/// # Safety
+///
+/// `address` is null, or what `XMemAllocDefault` returned with the same
+/// `attributes`, not freed since.
+pub unsafe extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
@@ -372,7 +392,13 @@ fn physical() -> MutexGuard<'static, Physical> {
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
-pub extern "system" fn XMemAllocatePhysicalPages(
+///
+/// # Safety
+///
+/// `count` and `pages` are null or valid: `count` for a read and a write of
+/// a `usize`, and `pages` for writes of as many page numbers as `*count`
+/// says.
+pub unsafe extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
     count: *mut usize,
     pages: *mut usize,
@@ -380,7 +406,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if count.is_null() || pages.is_null() {
         return 0;
     }
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; readable, per this function's contract.
     let n = unsafe { *count };
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
@@ -406,7 +432,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { count.write(0) };
         return 0;
     }
@@ -419,7 +445,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         let slice = Slice { section: section.clone(), index };
         let number = first + index * FRAMES;
         physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
+        // SAFETY: non-null, and room for `n` page numbers, per this
+        // function's contract.
         unsafe { pages.add(index).write(number) };
     }
     1
@@ -431,13 +458,18 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 const FRAMES: usize = PAGE >> 12;
 
 /// Pages still mapped stay readable through their views until unmapped.
-pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
+///
+/// # Safety
+///
+/// `pages` is null or valid for reads of `n` page numbers.
+pub unsafe extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
     if pages.is_null() {
         return 0;
     }
     let mut physical = physical();
     for i in 0..n {
-        // SAFETY: the title passes `n` page numbers.
+        // SAFETY: non-null, and `n` page numbers, per this function's
+        // contract.
         physical.pages.remove(&unsafe { *pages.add(i) });
     }
     1
@@ -565,7 +597,11 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
-pub extern "system" fn XMemMapPhysicalPages(
+///
+/// # Safety
+///
+/// `pages` is null or valid for reads of `n` page numbers.
+pub unsafe extern "system" fn XMemMapPhysicalPages(
     address: *mut c_void,
     n: usize,
     pages: *const usize,
@@ -576,7 +612,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     if pages.is_null() {
         return address;
     }
-    // SAFETY: the title passes `n` page numbers.
+    // SAFETY: non-null, and `n` page numbers, per this function's contract.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
     let mut i = 0;
     while i < n {
@@ -604,7 +640,12 @@ pub extern "system" fn XMemMapPhysicalPages(
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (Grand Theft Auto VI passes 0 for addresses to clear).
-pub extern "system" fn XMemMapPhysicalPagesScatter(
+///
+/// # Safety
+///
+/// `addresses` is null or valid for reads of `n` pointers, and `pages` is
+/// null or valid for reads of `n` page numbers.
+pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
     pages: *const usize,
@@ -613,14 +654,16 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         return 0;
     }
     for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+        // SAFETY: non-null, and `n` addresses and, unless null, `n` pages,
+        // per this function's contract.
         let (address, page) = unsafe {
             (
                 *addresses.add(i),
                 if pages.is_null() || *pages.add(i) == 0 { std::ptr::null() } else { pages.add(i) },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        // SAFETY: `page` is null or one of the title's `n` page numbers.
+        if unsafe { XMemMapPhysicalPages(address, 1, page) }.is_null() {
             return 0;
         }
     }
@@ -812,7 +855,13 @@ pub struct WorkingSet {
 // shortcut: all fields are filled whatever the flags ask for, and use is
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
-pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
+/// # Safety
+///
+/// `out` is null or valid for a write of a `WorkingSet`.
+pub unsafe extern "system" fn XMemGetWorkingSetStatistics(
+    _which: u32,
+    out: *mut WorkingSet,
+) -> BOOL {
     if out.is_null() {
         return 0;
     }
@@ -829,7 +878,8 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
-    // SAFETY: checked non-null; the title passes room for the structure.
+    // SAFETY: checked non-null; room for the structure, per this
+    // function's contract.
     unsafe { out.write(stats) };
     1
 }
