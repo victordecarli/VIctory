@@ -985,7 +985,7 @@ mod tests {
     fn factory() -> *mut c_void {
         let mut factory = std::ptr::null_mut();
         assert_eq!(DStorageGetFactory(&FACTORY, &mut factory), S_OK);
-        factory
+        crate::test_support::valid_mut(factory)
     }
 
     fn open(path: &std::path::Path) -> *mut c_void {
@@ -1008,7 +1008,7 @@ mod tests {
         let mut array = std::ptr::null_mut();
         let name = c"test".as_ptr();
         assert_eq!(create(factory(), capacity, name, std::ptr::null(), &mut array), S_OK);
-        array
+        crate::test_support::valid_mut(array)
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {

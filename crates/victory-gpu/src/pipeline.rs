@@ -607,11 +607,13 @@ mod tests {
         // id and a local to write.
         let made = unsafe { create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p) };
         assert_eq!(made, S_OK);
+        let p = crate::test_support::valid(p);
         assert_eq!(shaders(p), [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]);
         // A second pipeline with the same pixel shader shares its container.
         let mut q = std::ptr::null();
         // SAFETY: as above.
         unsafe { create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q) };
+        let q = crate::test_support::valid(q);
         // SAFETY: `p` and `q` are pipelines the test just created.
         let (sp, sq) = unsafe { (pipeline(p), pipeline(q)) };
         assert!(Arc::ptr_eq(&sp.shaders[1], &sq.shaders[1]));

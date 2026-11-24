@@ -533,6 +533,7 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+    use crate::test_support::valid;
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
@@ -550,6 +551,7 @@ mod tests {
         let mut q = null;
         // SAFETY: a local description, a static id and a local to write.
         assert_eq!(unsafe { create(null, &desc, &QUEUE_IIDS[0], &mut q) }, S_OK);
+        let q = valid(q);
         // SAFETY: the title reads the type at +0x10.
         assert_eq!(unsafe { q.cast::<u8>().add(0x10).cast::<u32>().read() }, 0);
         let mut fence = null;
@@ -576,11 +578,13 @@ mod tests {
         let mut q = null;
         // SAFETY: a local description, a static id and a local to write.
         assert_eq!(unsafe { create_x(null, &desc, &QUEUE_IIDS[0], &mut q) }, S_OK);
+        let q = valid(q);
         // SAFETY: `q` is the queue just created.
         assert_eq!(unsafe { queue(q) }.desc.kind, 2);
         let none = std::ptr::null();
+        let mut refused = null;
         // SAFETY: a null description is tolerated.
-        assert_eq!(unsafe { create_x(null, none, &QUEUE_IIDS[0], &mut q) }, E_INVALIDARG);
+        assert_eq!(unsafe { create_x(null, none, &QUEUE_IIDS[0], &mut refused) }, E_INVALIDARG);
     }
 
     #[test]

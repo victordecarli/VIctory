@@ -688,7 +688,7 @@ mod tests {
     fn create(d: &ResourceDesc) -> This {
         let mut c = std::ptr::null_mut();
         assert_eq!(try_create(d, &mut c), S_OK);
-        c
+        crate::test_support::valid_mut(c)
     }
 
     fn suggest(d: &ResourceDesc, out: &mut u32) -> HRESULT {
