@@ -17,10 +17,13 @@ use serde::{Deserialize, Serialize};
 use super::text::crate_of;
 use crate::wincheck::{self, Variant};
 
+/// Functions longer than this many lines count in `functions_over_100`:
+/// clippy's own `too_many_lines` threshold (its default; `clippy.toml`
+/// does not change it), stated here so the report can print it. Clippy
+/// counts lines of code, not blank or comment lines.
+pub const CLIPPY_FUNCTION: usize = 100;
+
 /// Functions longer than this many lines count in `functions_over_300`.
-/// Clippy's own `too_many_lines` threshold (100, its default; `clippy.toml`
-/// does not change it) gives `functions_over_100`. Clippy counts lines of
-/// code, not blank or comment lines.
 pub const LONG_FUNCTION: usize = 300;
 
 /// The lints this layer counts.

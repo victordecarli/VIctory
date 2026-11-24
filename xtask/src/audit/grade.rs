@@ -19,6 +19,34 @@ pub const TESTS_LOW_ABOVE: usize = 6;
 /// A file longer than this is a high risk; one over `BIG_FILE` is medium.
 pub const FILE_HIGH: usize = 3_000;
 
+/// The thresholds the rules use, in the report so that a reader does not
+/// have to copy them from here.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Thresholds {
+    /// Tests index: high below this many `#[test]` per 1,000 lines.
+    pub tests_high_below_per_1000_lines: usize,
+    /// Tests index: low above this many `#[test]` per 1,000 lines.
+    pub tests_low_above_per_1000_lines: usize,
+    /// Code smell: a file over this many lines is medium.
+    pub file_medium_over: usize,
+    /// Code smell: a file over this many lines is high.
+    pub file_high_over: usize,
+    /// Code smell: a function over this many lines is medium.
+    pub function_medium_over: usize,
+    /// Code smell: a function over this many lines is high.
+    pub function_high_over: usize,
+}
+
+/// The thresholds in force.
+pub const THRESHOLDS: Thresholds = Thresholds {
+    tests_high_below_per_1000_lines: TESTS_HIGH_BELOW,
+    tests_low_above_per_1000_lines: TESTS_LOW_ABOVE,
+    file_medium_over: super::BIG_FILE,
+    file_high_over: FILE_HIGH,
+    function_medium_over: super::lints::CLIPPY_FUNCTION,
+    function_high_over: super::lints::LONG_FUNCTION,
+};
+
 /// A risk level, ordered from low to high.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -154,12 +182,20 @@ fn code_smell(text: &TextLayer, lints: Option<&LintCounts>) -> Index {
     }
     let medium_functions = lints.functions_over_100 - lints.functions_over_300;
     if medium_functions > 0 {
-        rules.found(Level::Medium, format!("{medium_functions} function(s) of 101 to 300 lines"));
+        rules.found(
+            Level::Medium,
+            format!(
+                "{medium_functions} function(s) over {} lines but not over {}",
+                super::lints::CLIPPY_FUNCTION,
+                super::lints::LONG_FUNCTION
+            ),
+        );
     }
     if rules.reasons.is_empty() {
         rules.reasons.push(format!(
-            "no file over {} lines, no function over 100 lines, no raw-pointer allow",
-            super::BIG_FILE
+            "no file over {} lines, no function over {} lines, no raw-pointer allow",
+            super::BIG_FILE,
+            super::lints::CLIPPY_FUNCTION
         ));
     }
     rules.done(true)

@@ -57,6 +57,8 @@ pub struct Report {
     pub crates: Vec<CrateReport>,
     /// Sums over `crates`.
     pub totals: Totals,
+    /// The thresholds the indices were graded with.
+    pub rules: grade::Thresholds,
 }
 
 /// Checks that hold for the repository as a whole, not per crate.
@@ -196,7 +198,17 @@ fn measure(root: &Path, with_lints: bool) -> Result<Report> {
         bail!("lint findings in crates with no tracked file: {:?}", left.keys());
     }
     let totals = totals(&crates, unattributed);
-    Ok(Report { schema: SCHEMA, commit, commit_date, dirty, layers, repo, crates, totals })
+    Ok(Report {
+        schema: SCHEMA,
+        commit,
+        commit_date,
+        dirty,
+        layers,
+        repo,
+        crates,
+        totals,
+        rules: grade::THRESHOLDS,
+    })
 }
 
 /// Reads every tracked file once: text counts and markers per crate,
