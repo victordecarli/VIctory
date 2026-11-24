@@ -11,6 +11,10 @@ rules below are the filter, so they are strict on purpose.
 
 ## Project map
 
+Before changing `crates/victory-shader/`, `crates/victory-gpu/` or
+`crates/victory-hle/`, read that crate's `AGENTS.md`: how its code is laid
+out and the gotchas local to it. This file still applies there.
+
 | Crate | Owns | Must not contain | Builds off Windows |
 |-------|------|------------------|--------------------|
 | `victory-core` | config, `ensure_outside_repo`, logging setup | title-specific logic | yes |
@@ -136,8 +140,11 @@ been run on as they are (see the `cargo fmt` row of the lint ratchet).
 ## Citations
 
 `cargo xtask citations` (a CI step, and the `agents_md_citations_resolve`
-test) fails when a path this file cites stops existing, so a rename or
-deletion has to update the contract in the same commit. What it checks:
+test) fails when a path this file or a crate `AGENTS.md` it points to
+cites stops existing, so a rename or deletion has to update the contract
+in the same commit. The documents are listed in `CONTRACT_DOCS`
+(`xtask/src/citations.rs`); a new crate `AGENTS.md` is added there. What it
+checks:
 
 - An inline code span (outside fenced blocks) made only of letters,
   digits, `_`, `-`, `.` and at least one `/` is a citation, optionally
