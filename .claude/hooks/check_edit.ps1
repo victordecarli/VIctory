@@ -41,6 +41,9 @@ if ($call.tool_name -eq 'Bash') {
             if (-not $m.Groups[1].Value.Contains('reason')) {
                 $problems += "#[allow($($m.Groups[1].Value.Trim()))] has no reason = `"...`" saying why the code is right (AGENTS.md, hard rule 4)"
             }
+            if ($m.Groups[1].Value.Contains('not_unsafe_ptr_arg_deref')) {
+                $problems += 'new not_unsafe_ptr_arg_deref allow: make the fn unsafe extern "system" with a # Safety section, or take a validated type (AGENTS.md, hard rule 3)'
+            }
         }
     }
 }
