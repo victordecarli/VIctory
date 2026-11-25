@@ -164,36 +164,36 @@ fn upload_footprints_follow_the_pc_rules() {
 #[cfg(windows)]
 #[test]
 fn full_screen_targets_get_a_host_texture() {
-    if crate::host::host().is_none() {
+    let Some(host) = crate::host::host() else {
         return; // no host GPU here
-    }
+    };
     const RENDER_TARGET: u32 = 1;
     const UNORDERED: u32 = 4;
-    // (format, flags asked, flags the host copy has): B5G5R5A1_UNORM has
-    // no typed UAV on PC, B4G4R4A4_UNORM no render target or UAV; a format
-    // the host supports in full keeps every flag.
-    let cases = [
-        (86, RENDER_TARGET | UNORDERED, RENDER_TARGET),
-        (115, RENDER_TARGET, 0),
-        (28, RENDER_TARGET | UNORDERED, RENDER_TARGET | UNORDERED),
-    ];
+    // B5G5R5A1_UNORM with unordered access and B4G4R4A4_UNORM as a render
+    // target: some hosts lack those uses (an RTX 5070 lacks both), others
+    // have them. Either way the texture is made, with the uses this host
+    // has; R8G8B8A8_UNORM is the control every host supports in full.
+    let cases =
+        [(86, RENDER_TARGET | UNORDERED), (115, RENDER_TARGET), (28, RENDER_TARGET | UNORDERED)];
     let wrong: Vec<_> = cases
         .into_iter()
-        .filter_map(|(format, flags, kept)| {
+        .filter_map(|(format, flags)| {
+            let kept = flags & !lacking_uses(&host.device, format, flags);
             let desc = ResourceDesc { flags, ..texture(2560, 1440, format, 1) };
             let clear: [u32; 5] = [format, 0, 0, 0, 0];
             // SAFETY: a whole clear value.
             let made = unsafe { host_texture(&desc, 0, clear.as_ptr().cast()) };
             // SAFETY: a live resource.
             let has = made.map(|t| unsafe { t.GetDesc() }.Flags.0 as u32);
-            (has != Some(kept)).then_some((format, flags, has))
+            (has != Some(kept)).then_some((format, flags, kept, has))
         })
         .collect();
-    assert!(wrong.is_empty(), "(format, flags asked, host flags) {wrong:?}");
+    assert!(wrong.is_empty(), "(format, flags asked, host supports, host flags) {wrong:?}");
 }
 
-/// A host copy that went without its render target use gets no render
-/// target view (the host removes the device for one); a full one does.
+/// A host copy without a render target use (as one that went without it)
+/// gets no render target view, for which the host would remove the
+/// device; one with it does.
 #[cfg(windows)]
 #[test]
 fn a_target_without_its_render_target_use_gets_no_view() {
@@ -201,14 +201,13 @@ fn a_target_without_its_render_target_use_gets_no_view() {
         return; // no host GPU here
     };
     const RENDER_TARGET: u32 = 1;
-    let target = |format: u32| {
-        let desc = ResourceDesc { flags: RENDER_TARGET, ..texture(64, 64, format, 1) };
-        let clear: [u32; 5] = [format, 0, 0, 0, 0];
-        // SAFETY: a whole clear value.
-        unsafe { host_texture(&desc, 0, clear.as_ptr().cast()) }.unwrap()
+    let target = |flags: u32| {
+        let desc = ResourceDesc { flags, ..texture(64, 64, 28, 1) };
+        // SAFETY: no clear value.
+        unsafe { host_texture(&desc, 0, std::ptr::null()) }.unwrap()
     };
-    assert!(host.rtv(&target(115), None).is_none(), "B4G4R4A4_UNORM has no render target use");
-    assert!(host.rtv(&target(28), None).is_some(), "R8G8B8A8_UNORM keeps it");
+    assert!(host.rtv(&target(0), None).is_none(), "a copy without the use gets no view");
+    assert!(host.rtv(&target(RENDER_TARGET), None).is_some(), "one with it does");
 }
 
 /// A 4x4 texture filled from a title buffer through our list and queue,
