@@ -1,12 +1,24 @@
-# VIctory
+# VIctory-32
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs Grand
+Theft Auto VI (Xbox Series X|S) natively on Windows, from files the user
+supplies. It has two aims: running on GPUs whose waves have 32 lanes
+(NVIDIA and others), where the console's have 64, and keeping the code that
+title code calls safe, with numbers produced by commands rather than typed
+by hand.
+
+**This repository contains no game files, code or assets.** You need your
+own copy of the game (`docs/asset-policy.md`). It is not affiliated with or
+endorsed by the game's developer or publisher.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
+
+Upstream: this fork follows [Marvisak/VIctory](https://github.com/Marvisak/VIctory)
+`main` up to `ffe310e` (2026-11-24). Upstream has moved on since; its own
+README describes where it is now.
 
 ## Shader translation
 
@@ -25,10 +37,12 @@ Measured with `victory translate --host-lanes 32 --json` over the game directory
 294 more compute programs are emitted for 64-lane waves, which such a GPU refuses.
 <!-- progress:end -->
 
-## Status (2026-11-23)
+## Status
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+loads the world, where rendering fails. This is what upstream reported on
+2026-11-23 for the code this fork is based on; the fork's changes have not
+been run through the game since.
 
 | Stage | State |
 |-------|-------|
@@ -38,7 +52,7 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested upstream on one machine: Windows 11, AMD RX 6700 XT.
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -60,6 +74,43 @@ What each part does today and what it still needs:
 | Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: see [Shader translation](#shader-translation) | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; compute programs that cannot run as two waves of 32 need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
+
+## What VIctory-32 adds
+
+GPUs with 32-lane waves ([#47](https://github.com/victordecarli/VIctory/issues/47)):
+- With more than one GPU, the title runs on the highest-performance one and
+  the log names it (`97a9a0a`).
+- The log names the host's wave lane range, and each translation carries
+  the wave size it needs; `translate --host-lanes 32` translates for such a
+  GPU and counts the compute programs that still need 64 lanes (`79896c2`,
+  `61557e4`, [#58](https://github.com/victordecarli/VIctory/pull/58)).
+- Console 64-lane compute runs as two 32-lane waves where the result is
+  exact (`e8aafeb`, `1b589d8`, [#60](https://github.com/victordecarli/VIctory/pull/60)).
+  The [Shader translation](#shader-translation) block is measured for a
+  32-lane GPU.
+
+Safe to call from title code:
+- No `unwrap` or `expect` outside tests (`5913d19`); the panics that title
+  code could reach in the bitcode writer, the HLE host exports and the GPU
+  stages return the API's failure instead (`a1c63b8`, `13bec12`, `c4ae7c1`,
+  `a2db8c8`, `197bf80`, `cab9fcf`).
+- FFI functions that dereference raw pointers are `unsafe` with a `# Safety`
+  section, one module at a time; 3 module-level `not_unsafe_ptr_arg_deref`
+  allows remain (see the lint ratchet in `AGENTS.md`).
+- A pointer read goes through `NonNull` instead of a null check
+  (`c8753f8`); tests check the pointers a call wrote out before using them
+  (`c26b43d`, `cc0ba34`).
+- Device-removed reports say whether `VICTORY_D3D12_DRED` was on (`ddccc9a`).
+
+Measured, not guessed:
+- `cargo xtask progress` writes the [Shader translation](#shader-translation)
+  block from `victory translate --json`; a test fails when the two disagree.
+- `cargo xtask audit-metrics` counts and grades every crate (`61ddbe3`,
+  `135aa2a`).
+- `cargo xtask wincheck` type-checks and lints the Windows code from any host,
+  in CI (`9b8509c`, `5f2ca69`).
+- `AGENTS.md` is the contract for every change; `cargo xtask citations` fails
+  when a path it cites is gone (`2f1d505`).
 
 ## Getting started
 
@@ -161,6 +212,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 
-## License
+## Credits and license
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+[VIctory](https://github.com/Marvisak/VIctory) by Marvisak and its
+contributors is the base of everything here; its history is kept in this
+repository's. GPL-3.0-or-later, as upstream. See [LICENSE](LICENSE).
