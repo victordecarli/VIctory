@@ -3,8 +3,8 @@
 Summarises a VIctory run from its run logs.
 
 .DESCRIPTION
-Reads the run logs (<data_dir>\logs\run-*.jsonl, data_dir as `victory
-config` prints it) and shows, for each process of the run: its role and
+Reads the run logs (<log_dir>\run-*.jsonl, log_dir as `victory config`
+prints it) and shows, for each process of the run: its role and
 switches, the host adapter, the last frame report, the costliest dropped
 draws, a crash, and the last summary line. Only lines with the target
 victory::summary are read.
@@ -17,7 +17,7 @@ The logs written since this time: every process of one run (a relaunch and
 the audio recorder write their own). Default: the newest log only.
 
 .PARAMETER Victory
-The victory.exe to ask for the data folder. Default: target\diag, else
+The victory.exe to ask for the log folder. Default: target\diag, else
 target\release.
 
 .PARAMETER Top
@@ -44,13 +44,13 @@ if (-not $Victory) {
     if (-not $Victory) { throw 'No victory.exe in target\diag or target\release: build it first (scripts\run.ps1 does).' }
 }
 
-# The data folder as the program resolves it (victory.toml is read from the
+# The log folder as the program resolves it (victory.toml is read from the
 # repository root, as scripts\run.ps1 runs it).
 Push-Location $repo
 try { $config = & $Victory config } finally { Pop-Location }
-$dataLine = $config | Where-Object { $_ -match '^data_dir\s*:\s*(.+)$' } | Select-Object -First 1
-if (-not $dataLine) { throw "``victory config`` printed no data_dir:`n$($config -join "`n")" }
-$logs = Join-Path ($dataLine -replace '^data_dir\s*:\s*', '').Trim() 'logs'
+$logLine = $config | Where-Object { $_ -match '^log_dir\s*:\s*(.+)$' } | Select-Object -First 1
+if (-not $logLine) { throw "``victory config`` printed no log_dir:`n$($config -join "`n")" }
+$logs = ($logLine -replace '^log_dir\s*:\s*', '').Trim()
 
 $files = @(Get-ChildItem -Path $logs -Filter 'run-*.jsonl' -ErrorAction SilentlyContinue | Sort-Object Name)
 if ($Since) {

@@ -20,6 +20,8 @@ pub struct Config {
     /// What titles write and must keep (persistent local storage). Never
     /// inside the cache, which may be deleted at any time.
     pub data_dir: PathBuf,
+    /// Where `victory run` writes its run logs (`run-*.jsonl`).
+    pub log_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
@@ -39,6 +41,7 @@ struct FilePaths {
     game_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
 }
@@ -86,10 +89,13 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        let log_dir =
+            env_path("VICTORY_LOG_DIR").or(file.log_dir).map_or_else(|| default_dir("logs"), Ok)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
+            log_dir,
             test_titles,
             source,
         })
@@ -112,10 +118,18 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+
+    /// Returns the log directory, creating it, after checking the asset policy.
+    pub fn prepared_log_dir(&self) -> Result<PathBuf> {
+        prepared(self.log_dir.clone())
+    }
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
-    let dir = root.join(sub);
+    prepared(root.join(sub))
+}
+
+fn prepared(dir: PathBuf) -> Result<PathBuf> {
     ensure_outside_repo(&dir)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
@@ -127,7 +141,7 @@ fn default_dir(name: &str) -> Result<PathBuf> {
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
+        .context("cannot determine a user directory; set VICTORY_CACHE_DIR, VICTORY_DATA_DIR and VICTORY_LOG_DIR")?;
     Ok(base.join("victory").join(name))
 }
 
@@ -193,5 +207,30 @@ mod tests {
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
         let cfg = Config { data_dir: inside, ..Default::default() };
         assert!(cfg.data_subdir("x").is_err());
+    }
+
+    #[test]
+    fn log_dir_environment_overrides_file() {
+        let file = FilePaths { log_dir: Some("logs-from-file".into()), ..Default::default() };
+        let cfg = Config::resolve(file, None, |_| None).unwrap();
+        assert_eq!(cfg.log_dir, PathBuf::from("logs-from-file"));
+
+        let file = FilePaths { log_dir: Some("logs-from-file".into()), ..Default::default() };
+        let env = |k: &str| (k == "VICTORY_LOG_DIR").then(|| OsString::from("logs-from-env"));
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.log_dir, PathBuf::from("logs-from-env"));
+    }
+
+    #[test]
+    fn log_dir_defaults_beside_cache_and_data() {
+        let cfg = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
+        assert!(cfg.log_dir.ends_with(Path::new("victory").join("logs")), "{:?}", cfg.log_dir);
+    }
+
+    #[test]
+    fn log_dir_inside_repo_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("logs");
+        let cfg = Config { log_dir: inside, ..Default::default() };
+        assert!(cfg.prepared_log_dir().is_err());
     }
 }
