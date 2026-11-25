@@ -62,6 +62,8 @@ the lowering's error.
 
 ## HostShader is persisted
 
-`victory-gpu`'s `shader_cache` stores `HostShader` as `VSH1` bytes. A new
-field needs its `encode` and `decode` updated in the same change, or
-cached shaders lose it silently.
+`victory-gpu`'s `shader_cache` stores `HostShader` as the bytes of
+`HostShader::to_bytes` (`crates/victory-shader/src/emit/persist.rs`).
+Writing takes `HostShader`, `UserData` and `StaticSampler` apart without
+`..`, so a new field does not compile until it is written and read there.
+Keep it that way: no `..`, and `RootType` goes through `to_raw`/`from_raw`.
