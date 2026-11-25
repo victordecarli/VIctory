@@ -61,3 +61,9 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};
+
+/// The target of events logged whatever the filter, as in the run's log:
+/// the same text as `victory_core::logging::SUMMARY`, which this crate
+/// does not depend on.
+#[cfg(windows)]
+const SUMMARY: &str = "victory::summary";
