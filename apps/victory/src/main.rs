@@ -91,6 +91,11 @@ enum Command {
         /// waves of 32 do. The default, 64, splits nothing.
         #[arg(long, default_value_t = victory_shader::emit::CONSOLE_WAVE)]
         host_lanes: u32,
+        /// Also write the counts per kind of program as JSON to this file
+        /// (read by `cargo xtask progress --record`). Needs --validate: a
+        /// shader counts as translated once the validator accepts it.
+        #[arg(long, requires = "validate")]
+        json: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -143,8 +148,8 @@ fn main() -> Result<()> {
         Command::ShaderInfo { paths, verbose, disasm } => {
             shader::run(paths, verbose || disasm, disasm)
         }
-        Command::Translate { paths, validate, pipelines, list, jobs, host_lanes } => {
-            translate::run(paths, validate, pipelines, list, jobs, host_lanes)
+        Command::Translate { paths, validate, pipelines, list, jobs, host_lanes, json } => {
+            translate::run(paths, validate, pipelines, list, jobs, host_lanes, json)
         }
         Command::Run { exe, unimplemented, strict, execute, console, title_args: _ } => {
             run::run(&exe, unimplemented, strict, execute, console)
@@ -190,4 +195,17 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_json_needs_validate() {
+        assert!(Cli::try_parse_from(["victory", "translate", "--json", "s.json"]).is_err());
+        assert!(
+            Cli::try_parse_from(["victory", "translate", "--validate", "--json", "s.json"]).is_ok()
+        );
+    }
 }

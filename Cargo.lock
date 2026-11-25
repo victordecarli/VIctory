@@ -670,6 +670,8 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "serde",
+ "serde_json",
  "tempfile",
  "tracing",
  "victory-core",

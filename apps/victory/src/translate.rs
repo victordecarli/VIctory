@@ -2,6 +2,7 @@
 //! what it cannot handle yet is tallied by reason, so the most common gaps
 //! show what to implement next.
 
+mod summary;
 mod tally;
 
 use std::collections::{HashMap, HashSet};
@@ -74,6 +75,7 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
     host_lanes: u32,
+    json: Option<PathBuf>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -132,6 +134,9 @@ pub fn run(
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     let verdict = t.verdict();
+    if let Some(path) = &json {
+        summary::write(path, &t, host_lanes)?;
+    }
     println!("files        {} read, {} above the size limit skipped", t.files, t.oversized);
     println!(
         "containers   {} ({} duplicates skipped)",
@@ -249,6 +254,8 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
+        // Outside `isolate`: a program that panics was still found.
+        *counters(t, p.stage)[4] += 1;
         t.isolate(
             || format!("{} {:?}", example(), p.stage),
             |t| program(&container, &p, &example, t, checks),
@@ -399,6 +406,9 @@ fn check(
     match v.validate(&mut shader.dxil) {
         Ok(()) => {
             *counters(t, shader.stage)[2] += 1;
+            if shader.stage == HwStage::Cs && shader.wave_size == Some(64) {
+                t.cs_validated_wave64 += 1;
+            }
             if t.list {
                 t.lines.push(format!("{}  validated", label()));
             }
@@ -470,26 +480,30 @@ fn write_dump(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> bool {
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
-/// 3 pipelines. Callers index with constants, which rustc bounds-checks.
-fn counters(t: &mut Tally, stage: HwStage) -> [&mut usize; 4] {
+/// 3 pipelines, 4 found (every program of the kind, whichever stage stopped
+/// it). Callers index with constants, which rustc bounds-checks.
+fn counters(t: &mut Tally, stage: HwStage) -> [&mut usize; 5] {
     match stage {
         HwStage::Cs => [
             &mut t.cs_programs,
             &mut t.cs_emitted,
             &mut t.cs_validated,
             &mut t.cs_pipelines,
+            &mut t.cs_found,
         ],
         HwStage::Ms => [
             &mut t.ms_programs,
             &mut t.ms_emitted,
             &mut t.ms_validated,
             &mut t.ms_pipelines,
+            &mut t.ms_found,
         ],
         HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Vs | HwStage::Ps => [
             &mut t.emit_programs,
             &mut t.emitted,
             &mut t.validated,
             &mut t.pipelines,
+            &mut t.found,
         ],
     }
 }

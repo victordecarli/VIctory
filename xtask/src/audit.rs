@@ -285,7 +285,7 @@ fn totals(crates: &[CrateReport], unattributed_lint_findings: Option<usize>) -> 
     Totals { text, files_over_1200, lints, unattributed_lint_findings }
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(root: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(root)
