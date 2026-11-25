@@ -12,6 +12,12 @@ Every table method is title-reachable: on any failure it logs and returns
 the API's failure code, or drops the draw. Shader translation failing at
 pipeline creation is one such failure.
 
+A dropped draw, mesh dispatch or dispatch is counted twice: on `DROPPED`
+in `crates/victory-gpu/src/draw.rs` (the frame report's total) and on its
+cause, through `pipeline::count_drop`, or `pipeline::drops::general` with
+a `Cause` when no pipeline is to blame. A drop missing either is missing
+from that report in the run log.
+
 ## Objects and tables
 
 Each object starts with a function-table pointer, bookkeeping bits and a
