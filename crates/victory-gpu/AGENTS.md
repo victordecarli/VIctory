@@ -48,4 +48,8 @@ they are why Linux clippy still excludes this crate.
 `crates/victory-gpu/src/pipeline/host.rs` holds a stage together with its translation from
 construction (`Stage`), so nothing later has to unwrap a translation that
 might be missing. Keep new pipeline state in that shape: build it fallibly
-once, then carry the typed value.
+once, then carry the typed value. A host pipeline's root signature is not
+built here: `HostRootLayout` (`crates/victory-shader/src/emit/root_layout.rs`)
+decides it and `crates/victory-shader/src/emit/host/root.rs` creates it, the
+same code the GPU tests use. A `Stage` keeps its `HostRootStage`, which says
+where its user data and root views went.

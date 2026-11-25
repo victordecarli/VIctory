@@ -3,7 +3,9 @@
 //!
 //! Root signatures come from [`HostRootLayout`] through one translation
 //! (`root`), so the pipelines made here have the root signature the layout
-//! decides and the tests read the parameter indices from it.
+//! decides and the tests read the parameter indices from it. The game's
+//! host pipelines (`victory-gpu`) create theirs the same way, with
+//! [`root_signature`].
 
 use std::ffi::CString;
 
