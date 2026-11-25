@@ -38,8 +38,10 @@
 //! halves exchange the answer ([`Lower::wave_wide`]) and go the same way,
 //! and EXEC stays a guard on the vector instructions inside
 //! ([`crate::structure::structure_wide`]). Every lane then runs the branch's
-//! blocks. Only forward branches at blocks every lane runs are taken so,
-//! never a loop's.
+//! blocks. A branch closing a loop each lane leaves on its own is taken so
+//! too: the wave goes round again while some lane of it is left, and the
+//! lanes that left stay out of the vector instructions. Only branches in no
+//! other lane branch's region are taken so, outermost first.
 //!
 //! Every other console wave64 program keeps 64-lane waves.
 //!
@@ -265,9 +267,9 @@ fn lane_scalar_read_past(
 }
 
 /// The lane branches to take wave-wide next so that `p` could run in
-/// halves: those around the block holding the reason [`keeps_64`] gives,
-/// at blocks every lane runs, and not in a loop of their own (a loop each
-/// lane leaves on its own stays per lane). Empty when there is none.
+/// halves: those around the block holding the reason [`keeps_64`] gives
+/// that lie in no other lane branch's region (a branch closing a loop each
+/// lane leaves on its own lies in its own). Empty when there is none.
 pub(super) fn to_widen(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Vec<usize> {
     let Some(Keep { at: Some(at), .. }) = keeps_64_at(p, st, group, lds_dwords) else {
         return Vec::new();
@@ -275,10 +277,12 @@ pub(super) fn to_widen(p: &Program, st: &Structured, group: u32, lds_dwords: u32
     let Some(regions) = lane_regions(st) else {
         return Vec::new();
     };
-    let inside = |b: usize| regions.iter().any(|r| r.blocks.get(b).copied().unwrap_or(false));
+    let inside_another = |d: usize| {
+        regions.iter().any(|r| r.branch != d && r.blocks.get(d).copied().unwrap_or(false))
+    };
     regions
         .iter()
-        .filter(|r| !r.cycle && !inside(r.branch) && r.blocks.get(at).copied().unwrap_or(false))
+        .filter(|r| !inside_another(r.branch) && r.blocks.get(at).copied().unwrap_or(false))
         .map(|r| r.branch)
         .collect()
 }
@@ -353,8 +357,6 @@ struct Region {
     /// Per IR block: reachable from the branch without post-dominating it,
     /// and in a loop the branch's own block.
     blocks: Vec<bool>,
-    /// The branch can be reached again from its region: a loop.
-    cycle: bool,
 }
 
 /// The region of every per-lane branch that is not wide. None with an
@@ -393,7 +395,7 @@ fn lane_regions(st: &Structured) -> Option<Vec<Region>> {
         // In a loop each lane leaves on its own, the branch's block too runs
         // as often as each lane goes round (it post-dominates itself).
         blocks[d] |= cycle;
-        regions.push(Region { branch: d, blocks, cycle });
+        regions.push(Region { branch: d, blocks });
     }
     Some(regions)
 }

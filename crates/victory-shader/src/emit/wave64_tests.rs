@@ -36,17 +36,17 @@ const READFIRSTLANE_V0_S14: u32 = 0x7E1C_0500;
 const READLANE_10: [u32; 2] = [0xD760_000E, 0x0001_1500];
 /// v_mov_b32 v1, v0
 const V1_V0: u32 = 0x7E02_0300;
-/// v1 = v0; each lane adds 1 to v1 until it reaches 40 (EXEC saved in s[12:13]), reading
-/// lane 10 into s14 in each iteration.
+/// v1 = v0; each lane adds lane 10's v0 (read into s14 in each iteration) to v1 until it
+/// reaches 40 (EXEC saved in s[12:13]).
 const LANE_LOOP: [u32; 9] = [
     V1_V0,
     0xBE8C_047E, // s_mov_b64 s[12:13], exec
     READLANE_10[0],
     READLANE_10[1],
-    vop2(0x25, 1, 0x81, 1), // v_add_nc_u32 v1, 1, v1
-    0x7D86_02A8,            // v_cmp_le_u32 vcc, 40, v1
-    0x8AFE_6A7E,            // s_andn2_b64 exec, exec, vcc
-    0xBF89_FFFA,            // s_cbranch_execnz back to the v_readlane
+    vop2(0x25, 1, 14, 1), // v_add_nc_u32 v1, s14, v1
+    0x7D86_02A8,          // v_cmp_le_u32 vcc, 40, v1
+    0x8AFE_6A7E,          // s_andn2_b64 exec, exec, vcc
+    0xBF89_FFFA,          // s_cbranch_execnz back to the v_readlane
     END_IF,
 ];
 /// v_mov_b32 v1, 0; s_mov_b32 s12, 7; v_writelane_b32 v1, s12, 40
@@ -395,7 +395,7 @@ fn branch_encodings_decode_as_named() {
             "v_mov_b32 v1, v0",
             "s_mov_b64 s[12:13], exec",
             "v_readlane_b32 s14, v0, 10",
-            "v_add_nc_u32 v1, 1, v1",
+            "v_add_nc_u32 v1, s14, v1",
             "v_cmp_le_u32 vcc, 40, v1",
             "s_andn2_b64 exec, exec, vcc",
             "s_cbranch_execnz label_0008",
@@ -510,11 +510,12 @@ fn sum_in_a_branch() -> NativeProgram {
     native(&words, true, 64, false)
 }
 
-/// What taking a branch wave-wide cannot make exact keeps 64-lane waves: a lane read in a
-/// loop each lane leaves on its own (a back edge, which is never taken wave-wide).
+/// A lane read in a loop each lane leaves on its own: the halves could go round a different
+/// number of times, so the loop is taken as the console takes it, round again while some
+/// lane of the wave is left.
 #[test]
-fn lane_loops_keep_64_lane_waves() {
-    assert_eq!(translate(&wave(&LANE_LOOP), 32).unwrap().wave_size, Some(64));
+fn a_lane_loop_is_taken_wave_wide() {
+    assert_eq!(translate(&wave(&LANE_LOOP), 32).unwrap().wave_size, Some(32));
 }
 
 /// The console adds floats in its own tree, which the halves' wave sums do not follow: a
@@ -709,6 +710,23 @@ mod card {
     fn a_lane_read_in_a_lane_branch_reaches_the_other_half() {
         let Some(out) = run_program(&lane_read_in_a_branch()) else { return };
         let want: Vec<u32> = (0..64).map(|t| if t < 40 { t } else { 10 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// Each lane leaves the loop on its own, and every round reads lane 10 of the lower
+    /// half: the upper half's lanes go round fewer times than lane 0.
+    #[test]
+    fn a_lane_read_in_a_lane_loop_reaches_the_other_half() {
+        let Some(out) = run_program(&wave(&LANE_LOOP)) else { return };
+        let want: Vec<u32> = (0..64)
+            .map(|t| {
+                let mut v = t + 10;
+                while v < 40 {
+                    v += 10;
+                }
+                v
+            })
+            .collect();
         assert_eq!(out, want);
     }
 
