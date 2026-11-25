@@ -184,6 +184,14 @@ accepts; for compute, how many of those need 64-lane waves), aggregate
 numbers only; `cargo xtask progress --record <file>` turns
 them into the [Shader translation](#shader-translation) block.
 
+`victory translate` also reads:
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_DXIL=<path>` | the `dxil.dll` that `--validate` loads (default: the newest one under `C:\Program Files (x86)\Windows Kits\10\bin`) |
+| `VICTORY_EMIT_DUMP=<dir>` | writes there, with `--validate`, the first 3 shaders failing with each validator error (`.dxil`, and `.txt` with the error); with `--list`, every emitted shader |
+| `VICTORY_PAIRS=<vs>+<ps>,...` | after the walk, creates a pipeline on the GPU for each pair; each side names a shader by part of its label (file and stage, as `--list` prints it) |
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above; a filter that does not parse is reported and replaced by
 `info`). `victory run` also writes each process's log (a relaunch and the
@@ -224,6 +232,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_COPY_MODE=plain\|none` | for timing copies of title memory to the host: `plain` copies directly instead of through the kernel (an unmapped source page then crashes), `none` skips them (frames come out wrong) |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer: names the command of an invalid call |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure (hang, page fault), the allocation hit and the commands in flight; without it the report says DRED is off |
