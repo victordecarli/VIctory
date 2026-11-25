@@ -185,7 +185,17 @@ numbers only; `cargo xtask progress --record <file>` turns
 them into the [Shader translation](#shader-translation) block.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+info and above; a filter that does not parse is reported and replaced by
+`info`). `victory run` also writes each process's log (a relaunch and the
+audio recorder are processes of their own) to
+`<data_dir>/logs/run-<UTC time>-<pid>.jsonl`, keeping the newest 20: one
+JSON object per line, the event's fields beside `timestamp` (UTC),
+`level`, `target`, `threadId` and `threadName`. The console's first line
+names the file. Events with the target `victory::summary` are logged
+whatever the filter: `run_start` (the BLAKE3 of `victory.exe`, the
+arguments and every `VICTORY_*` variable), the title's build, DLLs and
+missing imports. For example, with `jq`:
+`jq -c 'select(.target == "victory::summary")' run-*.jsonl`.
 
 ## Debugging
 
