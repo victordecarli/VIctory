@@ -793,7 +793,9 @@ unsafe extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(texture, record.desc().as_ref());
+        let Some(rtv) = host.rtv(texture, record.desc().as_ref()) else {
+            return;
+        };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -848,10 +850,12 @@ unsafe extern "system" fn clear_dsv(
             // per this function's contract.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        let Some(dsv) = host.dsv(texture, record.depth_desc().as_ref()) else {
+            return;
+        };
         const DEPTH_WRITE: u32 = 0x10;
         // SAFETY: as this function's contract gives them.
         unsafe { ensure_state(list, record.resource, DEPTH_WRITE) };
-        let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list.ClearDepthStencilView(

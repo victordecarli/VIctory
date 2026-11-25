@@ -801,6 +801,7 @@ unsafe fn host_texture(
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
+    const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
@@ -827,32 +828,99 @@ unsafe fn host_texture(
         value[0] = pc_format(value[0]);
         value
     });
-    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let create = |d: &ResourceDesc| {
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(
+                    d.flags,
+                    crate::host::texture_state(state),
+                ) as i32),
+                // The same layout: format, then color or depth and stencil.
+                // Only for a render target or depth: the host refuses one
+                // otherwise, as for a target that lost its render target use.
+                clear_value
+                    .as_ref()
+                    .filter(|_| d.flags & (RENDER_TARGET | DEPTH) != 0)
+                    .map(|v| std::ptr::from_ref(v).cast()),
+                &mut texture,
+            )
+        }
+        .map(|()| texture)
     };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
+    let mut made = create(&d);
+    // The console allows uses that a PC format lacks (B5G5R5A1_UNORM
+    // unordered access, B4G4R4A4_UNORM render targets). Only when the host
+    // refuses, the host copy goes without the uses its format lacks; what
+    // the host accepts keeps every flag.
+    if made.is_err() {
+        let lacking = lacking_uses(&host.device, d.format, d.flags);
+        if lacking != 0 {
+            crate::warn::warn_once!(
+                "a texture use the host format lacks: its host copy goes without it",
+                format = d.format,
+                asked = d.flags,
+                removed = lacking
+            );
+            d.flags &= !lacking;
+            made = create(&d);
+        }
     }
+    let texture = match made {
+        Ok(texture) => texture,
+        Err(e) => {
+            tracing::warn!(error = %e, desc = ?d, "no host texture");
+            None
+        }
+    };
     if let Some(t) = &texture {
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
     texture
+}
+
+/// The render target, depth and unordered-access flags in `flags` that the
+/// host does not support for `format`.
+#[cfg(windows)]
+fn lacking_uses(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    format: u32,
+    flags: u32,
+) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let mut query = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: the query's own struct, with its size.
+    let asked = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut query).cast(),
+            std::mem::size_of_val(&query) as u32,
+        )
+    };
+    if let Err(e) = asked {
+        tracing::warn!(error = %e, format, "format support not known: no use removed");
+        return 0;
+    }
+    let uses = [
+        (1, D3D12_FORMAT_SUPPORT1_RENDER_TARGET),
+        (2, D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL),
+        (4, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW),
+    ];
+    uses.into_iter()
+        .filter(|&(flag, support)| flags & flag != 0 && (query.Support1 & support).0 == 0)
+        .fold(0, |lacking, (flag, _)| lacking | flag)
 }
 
 /// A texture's console memory and description; `None` for buffers.

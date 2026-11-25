@@ -158,6 +158,58 @@ fn upload_footprints_follow_the_pc_rules() {
     assert_eq!(t, u64::MAX, "no second subresource");
 }
 
+/// The two 2560x1440 targets the title creates at its "press Enter"
+/// screen, as the run log shows them after `pc_format`, each with the
+/// clear value a render target comes with.
+#[cfg(windows)]
+#[test]
+fn full_screen_targets_get_a_host_texture() {
+    let Some(host) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    const RENDER_TARGET: u32 = 1;
+    const UNORDERED: u32 = 4;
+    // B5G5R5A1_UNORM with unordered access and B4G4R4A4_UNORM as a render
+    // target: some hosts lack those uses (an RTX 5070 lacks both), others
+    // have them. Either way the texture is made, with the uses this host
+    // has; R8G8B8A8_UNORM is the control every host supports in full.
+    let cases =
+        [(86, RENDER_TARGET | UNORDERED), (115, RENDER_TARGET), (28, RENDER_TARGET | UNORDERED)];
+    let wrong: Vec<_> = cases
+        .into_iter()
+        .filter_map(|(format, flags)| {
+            let kept = flags & !lacking_uses(&host.device, format, flags);
+            let desc = ResourceDesc { flags, ..texture(2560, 1440, format, 1) };
+            let clear: [u32; 5] = [format, 0, 0, 0, 0];
+            // SAFETY: a whole clear value.
+            let made = unsafe { host_texture(&desc, 0, clear.as_ptr().cast()) };
+            // SAFETY: a live resource.
+            let has = made.map(|t| unsafe { t.GetDesc() }.Flags.0 as u32);
+            (has != Some(kept)).then_some((format, flags, kept, has))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "(format, flags asked, host supports, host flags) {wrong:?}");
+}
+
+/// A host copy without a render target use (as one that went without it)
+/// gets no render target view, for which the host would remove the
+/// device; one with it does.
+#[cfg(windows)]
+#[test]
+fn a_target_without_its_render_target_use_gets_no_view() {
+    let Some(host) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    const RENDER_TARGET: u32 = 1;
+    let target = |flags: u32| {
+        let desc = ResourceDesc { flags, ..texture(64, 64, 28, 1) };
+        // SAFETY: no clear value.
+        unsafe { host_texture(&desc, 0, std::ptr::null()) }.unwrap()
+    };
+    assert!(host.rtv(&target(0), None).is_none(), "a copy without the use gets no view");
+    assert!(host.rtv(&target(RENDER_TARGET), None).is_some(), "one with it does");
+}
+
 /// A 4x4 texture filled from a title buffer through our list and queue,
 /// then read back from the host GPU.
 #[cfg(windows)]

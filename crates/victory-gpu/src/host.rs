@@ -781,37 +781,54 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host render target view of `resource`, valid until it is recorded;
+    /// `None` if its host copy has no render target use (its format lacks
+    /// one), for which the host would remove the device.
     pub(crate) fn rtv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        if !allows(resource, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+            crate::warn::warn_once!("a render target whose host copy cannot be one: not bound");
+            return None;
+        }
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device.CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+            Some(handle)
         }
     }
 
-    /// A host depth view of `resource`, valid until it is recorded.
+    /// A host depth view of `resource`, valid until it is recorded; `None`
+    /// if its host copy has no depth use, as for [`Host::rtv`].
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        if !allows(resource, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+            crate::warn::warn_once!("a depth target whose host copy cannot be one: not bound");
+            return None;
+        }
         let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
             let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.dsv_size) as usize;
             self.device.CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
+            Some(handle)
         }
     }
+}
+
+/// Whether `resource` was made with `flag`.
+fn allows(resource: &ID3D12Resource, flag: D3D12_RESOURCE_FLAGS) -> bool {
+    // SAFETY: a live resource.
+    unsafe { resource.GetDesc() }.Flags.0 & flag.0 != 0
 }
 
 impl HostList {
