@@ -58,6 +58,114 @@ const LDS_WRITE_T: [u32; 4] = [0x3404_0082, 0x7E02_0300, DS_WRITE[0], DS_WRITE[1
 /// LDS dword 63 - t, which the other half wrote.
 const LDS_READ_MIRROR: [u32; 4] = [0x4C06_00BF, 0x3406_0682, 0xD8D8_0000, 0x0100_0003];
 
+const fn vop1(op: u32, vdst: u32, src0: u32) -> u32 {
+    0x3F << 25 | vdst << 17 | op << 9 | src0
+}
+
+const fn vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
+    op << 25 | vdst << 17 | vsrc1 << 9 | src0
+}
+
+/// `v_<op> vdst, vsrc, vdst` with DPP16 `ctrl` on `vsrc`, every row and bank, `bound_ctrl:1`.
+const fn dpp(op: u32, vdst: u32, vsrc: u32, ctrl: u32) -> [u32; 2] {
+    [vop2(op, vdst, 0xFA, vdst), vsrc | ctrl << 8 | 1 << 19 | 0xFF << 24]
+}
+
+/// `v_readlane_b32 s<sdst>, v1, lane`
+const fn readlane_v1(sdst: u32, lane: u32) -> [u32; 2] {
+    [0xD760_0000 | sdst, 0x101 | (128 + lane) << 9]
+}
+
+const V_OR: u32 = 0x1C;
+const V_AND: u32 = 0x1B;
+const V_ADD_U: u32 = 0x25;
+const V_MIN_U: u32 = 0x13;
+const V_MAX_U: u32 = 0x14;
+const V_ADD_F: u32 = 0x03;
+/// Inline constants 0 and -1, the identities of the reductions.
+const ZERO: u32 = 0x80;
+const ALL_ONES: u32 = 0xC1;
+
+/// v_lshrrev_b32 v6, 1, v0; v_mov_b32 v8, 1; v_lshlrev_b32 v7, v6, v8: v7 = 1 << (t >> 1),
+/// so lanes 0..31 hold bits 0..15 and lanes 32..63 bits 16..31.
+const V7_BIT: [u32; 3] = [vop2(0x16, 6, 0x81, 0), vop1(0x01, 8, 0x81), vop2(0x1A, 7, 0x106, 8)];
+/// v_not_b32 v7, v7
+const V7_NOT: u32 = vop1(0x37, 7, 0x107);
+/// v_add_nc_u32 v7, 20, v0; v_and_b32 v7, 63, v7: v7 = (t + 20) & 63, so lanes 0..31 hold
+/// 20..51 and lanes 32..63 hold 52..63 and 0..19.
+const V7_ROTATED: [u32; 2] = [vop2(V_ADD_U, 7, 0x94, 0), vop2(V_AND, 7, 0xBF, 7)];
+/// The section's saved EXEC, s[16:17] (`IF_VCC` saves to s[12:13]).
+const SAVE_ALL: u32 = 0xBE90_25C1; // s_or_saveexec_b64 s[16:17], -1
+const RESTORE: u32 = 0xBEFE_0410; // s_mov_b64 exec, s[16:17]
+/// v_mov_b32 v1, s7
+const V1_S7: u32 = 0x7E02_0207;
+
+/// `WaveActive<op>(v7)` into s7 as the console compiler expands it (the fxceless line's
+/// `WAVE_OR_V7_TO_S7` with `op` and its identity): every lane takes part, those outside the
+/// saved EXEC with `ident`; pairs, quads and octets by dpp8, rows by `row_mirror`, the two
+/// rows of each 32 lanes by `v_permlanex16`, then lane 0 adds lane 32's.
+const fn reduce(op: u32, ident: u32) -> [u32; 20] {
+    [
+        SAVE_ALL,
+        0xD501_0001,
+        0x0042_0E00 | ident, // v_cndmask_b32 v1, ident, v7, s[16:17]
+        vop2(op, 1, 0xE9, 1),
+        0xDE54_C101, // dpp8:[1,0,3,2,5,4,7,6]
+        vop2(op, 1, 0xE9, 1),
+        0x9360_1201, // dpp8:[2,2,0,0,6,6,4,4]
+        vop2(op, 1, 0xE9, 1),
+        0x0009_2401, // dpp8:[4,4,4,4,0,0,0,0]
+        vop2(op, 1, 0xFA, 1),
+        0xFF09_4001, // row_mirror bound_ctrl:1
+        0xD778_0002,
+        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        vop2(op, 1, 0x102, 1),
+        readlane_v1(7, 32)[0],
+        readlane_v1(7, 32)[1],
+        vop2(op, 1, 7, 1),
+        readlane_v1(7, 0)[0],
+        readlane_v1(7, 0)[1],
+        RESTORE,
+    ]
+}
+
+/// `WavePrefixSum(v7)` (inclusive) into v1 over the 64 lanes: in each row by `row_shr` 1, 2,
+/// 4 and 8, then rows 1 and 3 add the total of the row below, then lanes 32..63 the total
+/// of lanes 0..31, EXEC chosen for each step. `exclusive`: less each lane's own term.
+fn prefix_sum(exclusive: bool) -> Vec<u32> {
+    let mut w = vec![
+        SAVE_ALL,
+        0xD501_0003,
+        0x0042_0E80,          // v_cndmask_b32 v3, 0, v7, s[16:17]
+        vop1(0x01, 1, 0x103), // v_mov_b32 v1, v3
+    ];
+    for n in [1, 2, 4, 8] {
+        w.extend(dpp(V_ADD_U, 1, 1, 0x110 + n));
+    }
+    w.extend(readlane_v1(14, 15));
+    w.extend(readlane_v1(15, 47));
+    w.extend([
+        0xBEFE_03FF,
+        0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xBEFF_0380, // s_mov_b32 exec_hi, 0
+        vop2(V_ADD_U, 1, 14, 1),
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFF_03FF,
+        0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
+        vop2(V_ADD_U, 1, 15, 1),
+    ]);
+    w.extend(readlane_v1(14, 31));
+    w.extend([
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        vop2(V_ADD_U, 1, 14, 1),
+    ]);
+    if exclusive {
+        w.extend([0xBEFE_04C1, vop2(0x26, 1, 0x101, 3)]); // s_mov_b64 exec, -1; v1 -= v3
+    }
+    w.push(RESTORE);
+    w
+}
+
 /// A compute program of `threads` threads (thread index in v0; console waves of 64 when
 /// `wave64`), 4 root constants in s0..s3 and a raw UAV's descriptor in s[8:11], then `body`.
 /// `lds`: 512 bytes of LDS.
@@ -246,6 +354,127 @@ fn lds_the_program_does_not_allocate_is_refused_in_halves() {
     }
 }
 
+/// The SP3 text of `words` (a program ending with `s_endpgm`, left out).
+fn sp3(words: &[u32]) -> Vec<String> {
+    let code: Vec<u8> = words.iter().chain([&S_ENDPGM]).flat_map(|w| w.to_le_bytes()).collect();
+    let decoded = crate::gfx10::decode(&code).unwrap_or_else(|e| panic!("{words:#x?}: {e}"));
+    let mut text: Vec<String> = decoded.iter().map(|i| i.text(true)).collect();
+    assert_eq!(text.pop().as_deref(), Some("s_endpgm"));
+    text
+}
+
+#[test]
+fn section_encodings_decode_as_named() {
+    assert_eq!(
+        sp3(&reduce(V_ADD_U, ZERO)),
+        [
+            "s_or_saveexec_b64 s[16:17], -1",
+            "v_cndmask_b32 v1, 0, v7, s[16:17]",
+            "v_add_nc_u32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]",
+            "v_add_nc_u32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]",
+            "v_add_nc_u32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]",
+            "v_add_nc_u32 v1, v1, v1 row_mirror bound_ctrl:1",
+            "v_permlanex16_b32 v2, v1, 0, 0",
+            "v_add_nc_u32 v1, v2, v1",
+            "v_readlane_b32 s7, v1, 32",
+            "v_add_nc_u32 v1, s7, v1",
+            "v_readlane_b32 s7, v1, 0",
+            "s_mov_b64 exec, s[16:17]",
+        ]
+    );
+    assert_eq!(sp3(&reduce(V_AND, ALL_ONES))[1], "v_cndmask_b32 v1, -1, v7, s[16:17]");
+    for (op, name) in [(V_OR, "v_or_b32"), (V_MIN_U, "v_min_u32"), (V_MAX_U, "v_max_u32")] {
+        assert!(sp3(&reduce(op, ZERO))[2].starts_with(name), "{name}");
+    }
+    assert!(sp3(&reduce(V_ADD_F, ZERO))[2].starts_with("v_add_f32"));
+    assert_eq!(
+        sp3(&[&V7_BIT[..], &[V7_NOT], &V7_ROTATED[..], &[V1_S7]].concat()),
+        [
+            "v_lshrrev_b32 v6, 1, v0",
+            "v_mov_b32 v8, 1",
+            "v_lshlrev_b32 v7, v6, v8",
+            "v_not_b32 v7, v7",
+            "v_add_nc_u32 v7, 20, v0",
+            "v_and_b32 v7, 63, v7",
+            "v_mov_b32 v1, s7",
+        ]
+    );
+    let prefix = sp3(&prefix_sum(true));
+    assert_eq!(
+        prefix[1..4],
+        [
+            "v_cndmask_b32 v3, 0, v7, s[16:17]",
+            "v_mov_b32 v1, v3",
+            "v_add_nc_u32 v1, v1, v1 row_shr:1 bound_ctrl:1"
+        ]
+    );
+    assert_eq!(prefix[6], "v_add_nc_u32 v1, v1, v1 row_shr:8 bound_ctrl:1");
+    assert_eq!(prefix[7..9], ["v_readlane_b32 s14, v1, 15", "v_readlane_b32 s15, v1, 47"]);
+    assert_eq!(
+        prefix[9..],
+        [
+            "s_mov_b32 exec_lo, lit(0xffff0000)",
+            "s_mov_b32 exec_hi, 0",
+            "v_add_nc_u32 v1, s14, v1",
+            "s_mov_b32 exec_lo, 0",
+            "s_mov_b32 exec_hi, lit(0xffff0000)",
+            "v_add_nc_u32 v1, s15, v1",
+            "v_readlane_b32 s14, v1, 31",
+            "s_mov_b32 exec_hi, -1",
+            "v_add_nc_u32 v1, s14, v1",
+            "s_mov_b64 exec, -1",
+            "v_sub_nc_u32 v1, v1, v3",
+            "s_mov_b64 exec, s[16:17]",
+        ]
+    );
+}
+
+/// The program of one console wave whose threads each store the reduction `op` over the
+/// wave of `v7` (made by `input`).
+fn reduction(input: &[u32], op: u32, ident: u32) -> NativeProgram {
+    wave(&[input, &reduce(op, ident)[..], &[V1_S7]].concat())
+}
+
+/// A whole-wave section where every lane runs splits: each half reduces its lanes and the
+/// halves exchange their results. On a host of 64-lane waves nothing changes.
+#[test]
+fn a_wave_reduction_where_every_lane_runs_splits() {
+    for (op, ident) in
+        [(V_OR, ZERO), (V_AND, ALL_ONES), (V_ADD_U, ZERO), (V_MIN_U, ALL_ONES), (V_MAX_U, ZERO)]
+    {
+        let cs = reduction(&V7_ROTATED, op, ident);
+        assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32), "op {op:#x}");
+        assert_eq!(translate(&cs, 64).unwrap().wave_size, Some(64), "op {op:#x}");
+    }
+    for exclusive in [false, true] {
+        let cs = wave(&[&V7_ROTATED[..], &prefix_sum(exclusive)].concat());
+        assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32), "exclusive {exclusive}");
+    }
+}
+
+/// A whole-wave section only some lanes reach: a half none of whose lanes is there would
+/// not come to the exchange, so the program keeps 64-lane waves.
+#[test]
+fn a_wave_reduction_in_a_lane_branch_keeps_64_lane_waves() {
+    let section = [&reduce(V_ADD_U, ZERO)[..], &[V1_S7]].concat();
+    let skip = 0xBF88_0000 | section.len() as u32; // s_cbranch_execz past the section
+    let cs = wave(
+        &[&MBCNT[..], &V7_ROTATED[..], &[VCC_FROM_40, IF_VCC[0], skip], &section, &[END_IF]]
+            .concat(),
+    );
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(64));
+}
+
+/// The console adds floats in its own tree, which the halves' wave sums do not follow: a
+/// float sum over two host waves keeps 64-lane waves. A group of at most 32 threads is
+/// one host wave, which sums as an unsplit program does.
+#[test]
+fn a_float_wave_sum_splits_only_in_one_host_wave() {
+    let body = [&V7_ROTATED[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
+    assert_eq!(translate(&native(&body, true, 64, false), 32).unwrap().wave_size, Some(64));
+    assert_eq!(translate(&native(&body, true, 32, false), 32).unwrap().wave_size, Some(32));
+}
+
 /// [`translate`]'s lowering, for what only the lowering counts.
 fn lowered(native: &NativeProgram, host_lanes: u32) -> super::lower::Lowered {
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
@@ -373,6 +602,39 @@ mod card {
         let body = [&MBCNT[..], &LDS_WRITE_T[..], &LDS_READ_MIRROR[..], &STORE_V1[..]].concat();
         let Some(out) = run_program(&native(&body, true, 64, true)) else { return };
         assert_eq!(out, (0..64).rev().collect::<Vec<u32>>());
+    }
+
+    /// A wave reduction is of all 64 console lanes. Each input makes at least one half's
+    /// own reduction differ from the wave's.
+    #[test]
+    fn a_wave_reduction_covers_both_halves() {
+        let rotated: u32 = (0..64).map(|t| (t + 20) & 63).sum();
+        let not_bit = [&V7_BIT[..], &[V7_NOT]].concat();
+        let cases = [
+            ("or", reduction(&V7_BIT, V_OR, ZERO), u32::MAX),
+            ("and", reduction(&not_bit, V_AND, ALL_ONES), 0),
+            ("sum", reduction(&V7_ROTATED, V_ADD_U, ZERO), rotated),
+            ("min", reduction(&V7_ROTATED, V_MIN_U, ALL_ONES), 0),
+            ("max", reduction(&V7_ROTATED, V_MAX_U, ZERO), 63),
+        ];
+        for (name, cs, want) in cases {
+            let Some(out) = run_program(&cs) else { return };
+            assert_eq!(out, vec![want; 64], "{name}");
+        }
+    }
+
+    /// A prefix sum in the upper half goes on from the lower half's total.
+    #[test]
+    fn a_wave_prefix_sum_runs_on_across_the_halves() {
+        let terms: Vec<u32> = (0..64).map(|t| (t + 20) & 63).collect();
+        for exclusive in [false, true] {
+            let Some(out) = run(&[&V7_ROTATED[..], &prefix_sum(exclusive)].concat()) else {
+                return;
+            };
+            let want: Vec<u32> =
+                (0..64).map(|t| terms[..t + usize::from(!exclusive)].iter().sum()).collect();
+            assert_eq!(out, want, "exclusive {exclusive}");
+        }
     }
 
     /// The lanes from 40 on take a scalar written in their branch; the others keep their

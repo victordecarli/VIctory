@@ -846,6 +846,7 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        let r = self.whole_wave(op, prefix.is_some(), r, x)?;
         Ok(if float { self.as_int(r) } else { r })
     }
 

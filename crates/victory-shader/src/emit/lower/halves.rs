@@ -17,8 +17,10 @@
 //!   in blocks every lane runs: the console compiler leaves out the
 //!   barriers one wave sharing LDS needs, so a group barrier before each
 //!   access keeps the console wave's order across the halves;
-//! - it has no whole-wave section ([`super::super::wave`]) and no
-//!   `ds_(b)permute`;
+//! - in a group of two host waves, its whole-wave sections
+//!   ([`super::super::wave`]) lie in blocks every lane runs, where the halves
+//!   exchange their results, and sum no floats (the console adds them in an
+//!   order of its own); it has no `ds_(b)permute`;
 //! - in a group of two host waves, every place the halves exchange lies in
 //!   a block every lane runs;
 //! - a block only some lanes run holds no group barrier, and a scalar
@@ -33,6 +35,7 @@
 //! `exchange_halves`, `branch_regions`, `all_lane_blocks`), restricted to
 //! the cases above.
 
+use super::super::wave::{Op as WaveOp, Shape};
 use super::*;
 
 /// LDS dwords a split program adds past its own: the counter numbering
@@ -84,14 +87,14 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
         64 => true,
         _ => return Some("a thread group of other than one console wave"),
     };
-    if (0..p.blocks.len()).any(|b| !super::super::wave::sections(p, b).is_empty()) {
-        return Some("a whole-wave section");
-    }
     let all = match all_lane_blocks(st) {
         Some(all) => all,
         None => return Some("an indirect exit"),
     };
     let every = |b: usize| all.get(b).copied().unwrap_or(false);
+    if let Some(why) = sections_keep_64(p, two, every) {
+        return Some(why);
+    }
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let written: HashMap<Value, usize> = p
         .blocks
@@ -168,6 +171,32 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
     }
     None
 }
+
+/// Why the whole-wave sections of `p` keep 64-lane waves. In a group of two
+/// host waves each section lies where every lane runs, so that both halves
+/// reach the exchange of their results ([`Lower::whole_wave`]), and sums no
+/// floats: the console adds them in its own order.
+fn sections_keep_64(p: &Program, two: bool, every: impl Fn(usize) -> bool) -> Option<Why> {
+    if !two {
+        return None;
+    }
+    for b in 0..p.blocks.len() {
+        for section in super::super::wave::sections(p, b).values() {
+            if !every(b) {
+                return Some("a whole-wave section where not every lane runs");
+            }
+            let float_sum = section.shapes.values().any(|s| {
+                matches!(s, Shape::Active(WaveOp::AddF, ..) | Shape::Prefix(WaveOp::AddF, ..))
+            });
+            if float_sum {
+                return Some(FLOAT_SUM);
+            }
+        }
+    }
+    None
+}
+
+const FLOAT_SUM: Why = "a float wave sum over two host waves";
 
 /// An access to the program's LDS: not `ds_swizzle` or `ds_(b)permute`,
 /// which move data between lanes without it.
@@ -358,6 +387,62 @@ impl Lower<'_> {
         let mine = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
         self.s.flags |= flags::WAVE_OPS;
         self.exchange(c, mine).0
+    }
+
+    /// The console wave's `op` over its lanes' terms `x` (integers), or with
+    /// `prefix` each lane's prefix sum, from `r`, this host wave's (of `op`'s
+    /// type). Two host waves exchange their results, where every lane runs
+    /// ([`keeps_64`]); a single host wave's are the console wave's.
+    pub(super) fn whole_wave(&mut self, op: WaveOp, prefix: bool, r: V, x: V) -> Result<V, Why> {
+        if self.halves.as_ref().and_then(|h| h.two).is_none() {
+            return Ok(r);
+        }
+        let (c, i32t) = (self.cur, self.s.t.i32);
+        if prefix {
+            match op {
+                WaveOp::AddU => {}
+                WaveOp::AddF => return Err(FLOAT_SUM),
+                WaveOp::MinU
+                | WaveOp::MaxU
+                | WaveOp::MinI
+                | WaveOp::MaxI
+                | WaveOp::MinF
+                | WaveOp::MaxF
+                | WaveOp::Or
+                | WaveOp::And
+                | WaveOp::Xor => return Err("a wave prefix of an operation other than a sum"),
+            }
+            // The upper half's prefix goes on from the lower half's total.
+            let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
+            let total =
+                self.s.op(c, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[x, sum, unsigned]);
+            let (lower, _) = self.exchange(c, total);
+            let lane = self.console_lane();
+            let (k32, zero) = (self.s.m.i32(32), self.s.m.i32(0));
+            let upper = self.s.m.cmp(c, pred::IUGE, lane, k32);
+            let add = self.s.m.select(c, upper, lower, zero);
+            return Ok(self.s.m.bin(c, Bin::Add, r, add));
+        }
+        let float = matches!(op, WaveOp::MinF | WaveOp::MaxF);
+        let mine = if float { self.as_int(r) } else { r };
+        let (lo, hi) = self.exchange(c, mine);
+        // DXIL's IMax, IMin, UMax, UMin
+        let code = match op {
+            WaveOp::AddU => return Ok(self.s.m.bin(c, Bin::Add, lo, hi)),
+            WaveOp::Or => return Ok(self.s.m.bin(c, Bin::Or, lo, hi)),
+            WaveOp::And => return Ok(self.s.m.bin(c, Bin::And, lo, hi)),
+            WaveOp::Xor => return Ok(self.s.m.bin(c, Bin::Xor, lo, hi)),
+            WaveOp::MinF | WaveOp::MaxF => {
+                let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+                return Ok(self.max_min(op == WaveOp::MaxF, lo, hi));
+            }
+            WaveOp::AddF => return Err(FLOAT_SUM),
+            WaveOp::MaxI => 37,
+            WaveOp::MinI => 38,
+            WaveOp::MaxU => 39,
+            WaveOp::MinU => 40,
+        };
+        Ok(self.s.op(c, "binary.i32", Attr::ReadNone, i32t, code, &[lo, hi]))
     }
 
     /// A group barrier with an LDS fence.
