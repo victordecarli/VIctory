@@ -194,6 +194,7 @@ mod tests {
             ])],
             root_cbvs: vec![7, 2],
             root_srvs: vec![4],
+            used: Vec::new(),
             wave_size: None,
         }
     }

@@ -51,13 +51,18 @@
 //! * **Buffer views in the heap** are declared by how the shader reads
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 //!   typed-format loads without an index; structured with the used-resource
-//!   entry's stride when indexed; typed with four 32-bit float channels for
+//!   entry's stride ([`HostShader::used`]) when indexed; typed with four 32-bit float channels for
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
 //!   title's view description says. Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way.
+//!
+//! * **Used resources** (added 2026-11-25): [`HostShader::used`] is the
+//!   translated program's used-resource list, as the container declares
+//!   it. The host binds descriptor tables from its table entries; nothing
+//!   else needs the container after translation.
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
@@ -109,7 +114,7 @@ mod wave;
 mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
-use crate::native::{HwStage, NativeProgram, RootType};
+use crate::native::{HwStage, NativeProgram, RootType, UsedResource};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use root_layout::{
@@ -175,6 +180,10 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// The used-resource list of the console program translated, as its
+    /// container declares it: the descriptor ranges the host binds tables
+    /// from.
+    pub used: Vec<UsedResource>,
     /// The lanes per wave the shader requires (`WaveSize`), if any: a
     /// console wave64 compute program that reads other lanes, or one wave
     /// sharing LDS, needs the console's. A host whose waves have fewer lanes
@@ -336,6 +345,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        used: native.used.clone(),
         wave_size: l.wave_size,
     })
 }
@@ -620,6 +630,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            used: Vec::new(),
             wave_size: None,
         };
         let file = |var: &str, stage| {
@@ -631,6 +642,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                used: Vec::new(),
                 wave_size: None,
             })
         };

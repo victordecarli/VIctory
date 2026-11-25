@@ -3,11 +3,12 @@
 //! Little-endian words and length-prefixed lists, behind a magic. The
 //! format is ours and changes freely: the cache keys every entry by the
 //! build that wrote it. Writing takes every struct apart without `..`, so a
-//! field added to [`HostShader`], [`UserData`] or [`StaticSampler`] does not
-//! compile until it is written here, and reading builds the value whole.
+//! field added to [`HostShader`], [`UserData`], [`StaticSampler`] or
+//! [`UsedResource`] does not compile until it is written here, and reading
+//! builds the value whole.
 
 use super::{HostShader, StaticSampler, UserData};
-use crate::native::{HwStage, RootType};
+use crate::native::{HwStage, ResourceType, RootType, UsedResource};
 
 const MAGIC: &[u8; 4] = b"VSH2";
 
@@ -123,6 +124,45 @@ fn read_sampler(r: &mut Reader) -> Option<StaticSampler> {
     })
 }
 
+fn write_used(w: &mut Writer, u: &UsedResource) {
+    let UsedResource {
+        kind,
+        root,
+        table_offset_dwords,
+        lower_bound,
+        stride,
+        dwords,
+        user_data,
+        slot,
+    } = *u;
+    for v in [
+        u32::from(kind.to_raw()),
+        root.to_raw(),
+        table_offset_dwords,
+        lower_bound,
+        stride,
+        u32::from(dwords),
+        u32::from(user_data),
+        u32::from(slot),
+    ] {
+        w.word(v);
+    }
+}
+
+fn read_used(r: &mut Reader) -> Option<UsedResource> {
+    let byte = |r: &mut Reader| u8::try_from(r.word()?).ok();
+    Some(UsedResource {
+        kind: ResourceType::from_raw(byte(r)?),
+        root: RootType::from_raw(r.word()?),
+        table_offset_dwords: r.word()?,
+        lower_bound: r.word()?,
+        stride: r.word()?,
+        dwords: byte(r)?,
+        user_data: byte(r)?,
+        slot: byte(r)?,
+    })
+}
+
 /// `n` items read by `item`, with no allocation the input cannot back.
 fn read_items<T>(r: &mut Reader, item: fn(&mut Reader) -> Option<T>) -> Option<Vec<T>> {
     let n = r.word()? as usize;
@@ -144,6 +184,7 @@ impl HostShader {
             static_samplers,
             root_cbvs,
             root_srvs,
+            used,
             wave_size,
         } = self;
         let mut w = Writer(MAGIC.to_vec());
@@ -165,6 +206,10 @@ impl HostShader {
         }
         w.list(root_cbvs);
         w.list(root_srvs);
+        w.word(used.len() as u32);
+        for u in used {
+            write_used(&mut w, u);
+        }
         // 0: no wave size required (`WaveSize` is never 0).
         w.word(wave_size.unwrap_or(0));
         w.0
@@ -184,6 +229,7 @@ impl HostShader {
         let static_samplers = read_items(&mut r, read_sampler)?;
         let root_cbvs = r.list()?;
         let root_srvs = r.list()?;
+        let used = read_items(&mut r, read_used)?;
         let wave_size = match r.word()? {
             0 => None,
             n => Some(n),
@@ -196,6 +242,7 @@ impl HostShader {
             static_samplers,
             root_cbvs,
             root_srvs,
+            used,
             wave_size,
         })
     }
@@ -204,7 +251,20 @@ impl HostShader {
 #[cfg(test)]
 mod tests {
     use crate::emit::{HostShader, StaticSampler, UserData};
-    use crate::native::{HwStage, RootType};
+    use crate::native::{HwStage, ResourceType, RootType, UsedResource};
+
+    fn used(kind: ResourceType) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 3,
+            stride: 16,
+            dwords: 8,
+            user_data: 4,
+            slot: 1,
+        }
+    }
 
     fn shader() -> HostShader {
         HostShader {
@@ -215,6 +275,7 @@ mod tests {
             static_samplers: vec![StaticSampler::from_words([0x400, 0xc0_0000, 0x18f0_0000, 0])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            used: vec![used(ResourceType::Srv)],
             wave_size: Some(64),
         }
     }
@@ -263,9 +324,37 @@ mod tests {
             static_samplers: vec![sampler, StaticSampler { min_lod: 1.0, ..sampler }],
             root_cbvs: vec![0, 7, 63],
             root_srvs: vec![5],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Other(9),
+                    root: RootType::Other(2),
+                    table_offset_dwords: u32::MAX,
+                    lower_bound: 77,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 255,
+                    slot: 200,
+                },
+                used(ResourceType::Cbv),
+            ],
             wave_size: Some(32),
         };
         assert_eq!(HostShader::from_bytes(&s.to_bytes()), Some(s));
+    }
+
+    #[test]
+    fn every_resource_type_comes_back() {
+        for kind in [
+            ResourceType::Srv,
+            ResourceType::Sampler,
+            ResourceType::Cbv,
+            ResourceType::Uav,
+            ResourceType::Other(4),
+            ResourceType::Other(u8::MAX),
+        ] {
+            let s = HostShader { used: vec![used(kind)], ..shader() };
+            assert_eq!(HostShader::from_bytes(&s.to_bytes()), Some(s), "{kind:?}");
+        }
     }
 
     #[test]
