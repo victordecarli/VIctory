@@ -92,7 +92,10 @@ does not map title DLLs; `victory run` without `--execute` does).
 instruction per machine instruction. `victory_shader::structure` then
 removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
 become per-lane branches, and vector instructions keep a guard only where
-a lane can reach them with its EXEC bit clear. `victory_shader::resource`
+a lane can reach them with its EXEC bit clear. For a console wave64
+compute program run as two host waves of 32, `structure_wide` keeps
+chosen branches as the console's one decision for the wave, which the
+two host waves exchange, with EXEC a guard inside them. `victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
 comes from (table, heap, root descriptor or constant). A descriptor a
 waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced

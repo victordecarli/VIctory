@@ -74,6 +74,12 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    let first = lower_once(parts)?;
+    Ok(halves::widened(parts, first))
+}
+
+/// [`lower`], with the lane branches `parts.st` has.
+fn lower_once(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -846,6 +852,7 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        let r = self.whole_wave(op, prefix.is_some(), r, x)?;
         Ok(if float { self.as_int(r) } else { r })
     }
 
@@ -4315,7 +4322,7 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" if self.halves.is_some() => {
                 let a = s(self, 0)?;
-                let r = self.console_first_lane(a);
+                let r = self.console_first_lane(a, guard);
                 int(self, r)
             }
             "v_readfirstlane_b32" => {
@@ -6843,6 +6850,10 @@ impl<'a> Lower<'a> {
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
+                    _ if self.x.st.wide.contains(&b) => {
+                        let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
+                        (c, taken, not_taken)
+                    }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)

@@ -11,6 +11,10 @@
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
 //!
+//! [`structure_wide`] keeps some of those branches as the console has them,
+//! one decision for the whole wave, for a console wave that runs as two host
+//! waves which must meet inside the branch.
+//!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
 //! their side effects are dropped too, and what they compute is only read
@@ -349,6 +353,13 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Blocks whose closing branch the whole wave takes together
+    /// ([`structure_wide`]); its `when` is still the lane's own bit.
+    pub wide: HashSet<usize>,
+    /// Per block closed by a branch on a lane mask: whether the console
+    /// takes it when some lane's `when` holds (`true`) or only when every
+    /// lane's does (`false`).
+    pub wave_any: Vec<Option<bool>>,
 }
 
 impl Structured {
@@ -363,7 +374,17 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
+    structure_wide(program, &HashSet::new())
+}
+
+/// [`structure`], with the branches closing the blocks of `wide` kept as the
+/// console has them: one decision for the whole wave
+/// ([`Structured::wave_any`]), which every lane follows. A lane then learns
+/// nothing about its own bit from the way it went, so past such a branch
+/// EXEC stays a guard on the vector instructions, as it is on the console.
+pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.wide = wide.clone();
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -401,6 +422,9 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    /// The SCC values of `scc_lane` that are set when every lane's bit is
+    /// (a compare of masks: "no lane differs").
+    scc_every: HashSet<Value>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -409,6 +433,10 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::wide`].
+    wide: HashSet<usize>,
+    /// See [`Structured::wave_any`].
+    wave_any: Vec<Option<bool>>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -468,10 +496,13 @@ impl<'a> Lanes<'a> {
             masks: Map::default(),
             other: Map::default(),
             scc_lane: Map::default(),
+            scc_every: HashSet::new(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            wide: HashSet::new(),
+            wave_any: vec![None; blocks.len()],
         })
     }
 
@@ -480,9 +511,11 @@ impl<'a> Lanes<'a> {
         self.masks.clear();
         self.other.clear();
         self.scc_lane.clear();
+        self.scc_every.clear();
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
+        self.wave_any.fill(None);
         self.active.clear();
     }
 
@@ -532,6 +565,7 @@ impl<'a> Lanes<'a> {
                 && let Some(last) = p.blocks[b].insts.last()
             {
                 self.when[b] = Some(self.branch(last));
+                self.wave_any[b] = self.wave_kind(last);
             }
         }
         execs
@@ -539,6 +573,10 @@ impl<'a> Lanes<'a> {
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
+        if self.wide.contains(&q) {
+            // The wave's decision says nothing about this lane's own bit.
+            return c;
+        }
         match self.when[q] {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
@@ -630,6 +668,8 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            wide: self.wide,
+            wave_any: self.wave_any,
         })
     }
 
@@ -929,6 +969,7 @@ impl<'a> Lanes<'a> {
                     let ne = self.b.xor(a, c);
                     let m = if rest.starts_with("eq") { self.b.not(ne) } else { ne };
                     self.scc_lane.insert(scc, m);
+                    self.scc_every.insert(scc);
                 }
             }
             Fields::Valu(v) => {
@@ -965,6 +1006,24 @@ impl<'a> Lanes<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Whether the console takes the branch `inst` when some lane's
+    /// [`Self::branch`] condition holds (`true`) or only when every lane's
+    /// does (`false`); None for a branch on a scalar.
+    fn wave_kind(&self, inst: &Inst) -> Option<bool> {
+        match inst.name() {
+            "s_cbranch_execnz" | "s_cbranch_vccnz" => Some(true),
+            "s_cbranch_execz" | "s_cbranch_vccz" => Some(false),
+            n @ ("s_cbranch_scc0" | "s_cbranch_scc1") => {
+                let scc = inst.read(Reg::Scc)?;
+                self.scc_lane.get(&scc)?;
+                // SCC is set when some lane's bit is (every lane's, for a compare).
+                let every = self.scc_every.contains(&scc);
+                Some((n == "s_cbranch_scc1") != every)
+            }
+            _ => None,
         }
     }
 
