@@ -13,14 +13,18 @@
 //! or with a stale scalar. A program is split only when ([`keeps_64`]):
 //! - its thread group is one console wave (64 threads), or at most 32
 //!   threads (a single host wave, which exchanges nothing);
-//! - a group of two host waves has no LDS of its own (the console compiler
-//!   leaves out the barriers one wave sharing LDS needs);
+//! - in a group of two host waves, the program's own LDS is accessed only
+//!   in blocks every lane runs: the console compiler leaves out the
+//!   barriers one wave sharing LDS needs, so a group barrier before each
+//!   access keeps the console wave's order across the halves;
 //! - it has no whole-wave section ([`super::super::wave`]) and no
 //!   `ds_(b)permute`;
 //! - in a group of two host waves, every place the halves exchange lies in
 //!   a block every lane runs;
-//! - a block only some lanes run holds no group barrier and writes no
-//!   scalar other than a lane mask.
+//! - a block only some lanes run holds no group barrier, and a scalar
+//!   written there (other than a lane mask) is read only past its write:
+//!   not through a phi at a join, nor where every lane runs. A half that
+//!   skipped the block keeps an older copy, which it then never reads.
 //!
 //! Every other console wave64 program keeps 64-lane waves.
 //!
@@ -36,6 +40,9 @@ use super::*;
 /// a single host wave. Values made once, in the entry block.
 pub(super) struct Halves {
     two: Option<(u32, u32)>,
+    /// Two host waves sharing the program's own LDS: a group barrier
+    /// before each access.
+    lds: bool,
     base: Option<V>,
     lane: Option<V>,
 }
@@ -44,12 +51,19 @@ impl Halves {
     /// The halves of a group of `group` threads, taking their LDS dwords
     /// past `lds_dwords`.
     pub(super) fn new(lds_dwords: &mut u32, group: u32) -> Self {
+        let lds = group > 32 && *lds_dwords > 0;
         let two = (group > 32).then(|| {
             let counter = *lds_dwords;
             *lds_dwords += DWORDS;
             (counter, counter + 1)
         });
-        Halves { two, base: None, lane: None }
+        Halves { two, lds, base: None, lane: None }
+    }
+
+    /// Whether each access to the program's own LDS needs a group barrier
+    /// before it.
+    pub(super) fn orders_lds(&self) -> bool {
+        self.lds
     }
 
     /// The LDS dwords these halves add past the program's own.
@@ -70,9 +84,6 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
         64 => true,
         _ => return Some("a thread group of other than one console wave"),
     };
-    if two && lds_dwords > 0 {
-        return Some("LDS shared within a console wave of two host waves");
-    }
     if (0..p.blocks.len()).any(|b| !super::super::wave::sections(p, b).is_empty()) {
         return Some("a whole-wave section");
     }
@@ -92,6 +103,8 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
             insts.chain(block.phis.iter().map(move |phi| (phi.value, b)))
         })
         .collect();
+    // Scalars written where not every lane runs.
+    let mut lane_scalars = HashSet::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for inst in &block.insts {
             let n = inst.name();
@@ -115,6 +128,9 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
             if every(b) {
                 continue;
             }
+            if two && lds_dwords > 0 && lds_access(inst) {
+                return Some("LDS accessed where not every lane runs");
+            }
             if n == "s_barrier" {
                 return Some("a group barrier where not every lane runs");
             }
@@ -131,12 +147,34 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
                     Reg::V(_) => false,
                 };
                 if scalar {
-                    return Some("a scalar written where not every lane runs");
+                    lane_scalars.insert(w);
                 }
             }
         }
     }
+    // Read past the write only (dominated by it, as SSA has every read but a phi's), the
+    // copy of a half that skipped the block is never read. Through a phi at a join, or where
+    // every lane runs, it would be, where the console's wave has the new value.
+    let phi_reads = p.blocks.iter().flat_map(|block| &block.phis).flat_map(|phi| &phi.args);
+    let all_lane_reads = p
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|&(b, _)| every(b))
+        .flat_map(|(_, block)| &block.insts)
+        .flat_map(|i| i.reads.iter().map(|&(_, v)| v));
+    if phi_reads.copied().chain(all_lane_reads).any(|v| lane_scalars.contains(&v)) {
+        return Some("a scalar written where not every lane runs, read past it");
+    }
     None
+}
+
+/// An access to the program's LDS: not `ds_swizzle` or `ds_(b)permute`,
+/// which move data between lanes without it.
+pub(super) fn lds_access(inst: &Inst) -> bool {
+    let n = inst.name();
+    matches!(inst.fields, Fields::Ds { .. })
+        && !(n.starts_with("ds_swizzle") || n.contains("permute"))
 }
 
 /// The values of the scalar operands of `inst`.
@@ -323,7 +361,7 @@ impl Lower<'_> {
     }
 
     /// A group barrier with an LDS fence.
-    fn group_sync(&mut self, at: usize) {
+    pub(super) fn group_sync(&mut self, at: usize) {
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);

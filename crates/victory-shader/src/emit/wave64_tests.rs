@@ -44,8 +44,19 @@ const BARRIER: u32 = 0xBF8A_0000;
 /// s_mov_b32 s14, 0 / s_mov_b32 s14, 5
 const S14_0: u32 = 0xBE8E_0380;
 const S14_5: u32 = 0xBE8E_0385;
+/// s_mov_b32 s14, 7; v_mov_b32 v1, s14
+const S14_7: u32 = 0xBE8E_0387;
+const V1_S14: u32 = 0x7E02_020E;
+/// Only the lanes from 40 on: s14 = 7, v1 = s14 (the branch skips the two dwords).
+const IF_FROM_40_V1_7: [u32; 6] = [VCC_FROM_40, IF_VCC[0], 0xBF88_0002, S14_7, V1_S14, END_IF];
 /// ds_write_b32 v2, v1
 const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0102];
+/// v_lshlrev_b32 v2, 2, v0; v_mov_b32 v1, v0; ds_write_b32 v2, v1: thread t writes t to
+/// LDS dword t.
+const LDS_WRITE_T: [u32; 4] = [0x3404_0082, 0x7E02_0300, DS_WRITE[0], DS_WRITE[1]];
+/// v_sub_nc_u32 v3, 63, v0; v_lshlrev_b32 v3, 2, v3; ds_read_b32 v1, v3: thread t reads
+/// LDS dword 63 - t, which the other half wrote.
+const LDS_READ_MIRROR: [u32; 4] = [0x4C06_00BF, 0x3406_0682, 0xD8D8_0000, 0x0100_0003];
 
 /// A compute program of `threads` threads (thread index in v0; console waves of 64 when
 /// `wave64`), 4 root constants in s0..s3 and a raw UAV's descriptor in s[8:11], then `body`.
@@ -130,7 +141,20 @@ fn encodings_decode_as_named() {
         ["s_and_saveexec_b64", "s_cbranch_execz", "s_barrier", "s_mov_b64"]
     );
     assert_eq!(names(&[S14_0, S14_5]), ["s_mov_b32", "s_mov_b32"]);
+    assert_eq!(
+        names(&IF_FROM_40_V1_7),
+        [
+            "v_cmp_le_u32",
+            "s_and_saveexec_b64",
+            "s_cbranch_execz",
+            "s_mov_b32",
+            "v_mov_b32",
+            "s_mov_b64"
+        ]
+    );
     assert_eq!(names(&DS_WRITE), ["ds_write_b32"]);
+    assert_eq!(names(&LDS_WRITE_T), ["v_lshlrev_b32", "v_mov_b32", "ds_write_b32"]);
+    assert_eq!(names(&LDS_READ_MIRROR), ["v_sub_nc_u32", "v_lshlrev_b32", "ds_read_b32"]);
 }
 
 /// A program that reads other lanes runs in halves on a 32-lane host, and keeps its
@@ -154,10 +178,22 @@ fn programs_whose_halves_could_part_keep_64_lane_waves() {
     };
     // A group barrier only the lanes from 40 on reach.
     assert_eq!(translate(&branch(BARRIER), 32).unwrap().wave_size, Some(64));
-    // A scalar written where only some lanes run.
-    assert_eq!(translate(&branch(S14_5), 32).unwrap().wave_size, Some(64));
+    // A scalar written where only some lanes run and read after the branch: the half that
+    // skipped it would keep the old value, where the console's whole wave has the new one.
+    let after =
+        wave(&[&MBCNT[..], &[S14_0, VCC_FROM_40], &IF_VCC[..], &[S14_5, END_IF, V1_S14]].concat());
+    assert_eq!(translate(&after, 32).unwrap().wave_size, Some(64));
     // The same branch around per-lane code only splits.
     assert_eq!(translate(&branch(0x7E02_0280), 32).unwrap().wave_size, Some(32));
+}
+
+/// A scalar written where only some lanes run and read only there (a descriptor loaded in
+/// the branch that samples with it, in the title's programs): a half reaching a read went
+/// through the write, so the program splits.
+#[test]
+fn a_scalar_read_only_where_it_is_written_splits() {
+    let cs = wave(&[&MBCNT[..], &IF_FROM_40_V1_7[..]].concat());
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
 }
 
 /// This first step splits one console wave per thread group, without LDS of the program's
@@ -166,7 +202,25 @@ fn programs_whose_halves_could_part_keep_64_lane_waves() {
 fn other_group_shapes_keep_64_lane_waves() {
     let body = [&MBCNT[..], &STORE_V1[..]].concat();
     assert_eq!(translate(&native(&body, true, 128, false), 32).unwrap().wave_size, Some(64));
-    assert_eq!(translate(&native(&body, true, 64, true), 32).unwrap().wave_size, Some(64));
+}
+
+/// LDS shared within one console wave: the console runs its accesses in program order, the
+/// two halves at a group barrier before each, which every thread must reach. So the program
+/// splits where every lane accesses LDS, and keeps 64-lane waves where only some lanes do.
+#[test]
+fn lds_of_one_console_wave_runs_in_halves_where_every_lane_reaches_it() {
+    let every = [&MBCNT[..], &LDS_WRITE_T[..], &LDS_READ_MIRROR[..], &STORE_V1[..]].concat();
+    assert_eq!(translate(&native(&every, true, 64, true), 32).unwrap().wave_size, Some(32));
+    // ds_write_b32 only for the lanes from 40 on (the branch skips its two dwords).
+    let some = [
+        &MBCNT[..],
+        &[STORE_V1[0], VCC_FROM_40, IF_VCC[0], 0xBF88_0002],
+        &DS_WRITE[..],
+        &[END_IF],
+        &STORE_V1[..],
+    ]
+    .concat();
+    assert_eq!(translate(&native(&some, true, 64, true), 32).unwrap().wave_size, Some(64));
 }
 
 /// The LDS dwords the halves add are theirs: a split program that allocates no LDS of its
@@ -183,6 +237,40 @@ fn lds_the_program_does_not_allocate_is_refused_in_halves() {
     }
 }
 
+/// [`translate`]'s lowering, for what only the lowering counts.
+fn lowered(native: &NativeProgram, host_lanes: u32) -> super::lower::Lowered {
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, native).unwrap();
+    super::lower::lower(&super::lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        host_lanes,
+    })
+    .unwrap()
+}
+
+/// A split program waits for both halves before each access to its LDS: one group barrier
+/// per access, the order the console's single wave keeps by itself. (The card test below
+/// cannot show that the barrier is needed: two waves of one group did not race there.)
+#[test]
+fn each_lds_access_of_a_split_program_waits_for_both_halves() {
+    let without = native(&[&MBCNT[..], &STORE_V1[..]].concat(), true, 64, true);
+    let body = [&MBCNT[..], &LDS_WRITE_T[..], &LDS_READ_MIRROR[..], &STORE_V1[..]].concat();
+    let with = native(&body, true, 64, true);
+    let barriers = |cs: &NativeProgram, lanes| lowered(cs, lanes).barriers;
+    assert_eq!(barriers(&with, 32) - barriers(&without, 32), 2);
+    assert_eq!(barriers(&with, 64), barriers(&without, 64));
+}
+
 /// Running the split programs on the host GPU, which must take waves of 32.
 #[cfg(windows)]
 mod card {
@@ -193,7 +281,12 @@ mod card {
     /// The UAV's 64 dwords after one group ran `body` (each thread storing its v1), or None
     /// without a hardware device that takes the program.
     fn run(body: &[u32]) -> Option<Vec<u32>> {
-        let shader = translate(&wave(body), 32).unwrap();
+        run_program(&wave(body))
+    }
+
+    /// [`run`] for a whole program of one console wave.
+    fn run_program(cs: &NativeProgram) -> Option<Vec<u32>> {
+        let shader = translate(cs, 32).unwrap();
         assert_eq!(shader.wave_size, Some(32), "not split");
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
@@ -261,6 +354,24 @@ mod card {
     fn a_lane_write_reaches_its_console_lane() {
         let Some(out) = run(&WRITELANE_40) else { return };
         let want: Vec<u32> = (0..64).map(|t| if t == 40 { 7 } else { 0 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// Each thread reads the LDS dword the mirror thread of the other half wrote just before:
+    /// in the console's one wave the write comes first.
+    #[test]
+    fn lds_written_by_one_half_is_read_by_the_other() {
+        let body = [&MBCNT[..], &LDS_WRITE_T[..], &LDS_READ_MIRROR[..], &STORE_V1[..]].concat();
+        let Some(out) = run_program(&native(&body, true, 64, true)) else { return };
+        assert_eq!(out, (0..64).rev().collect::<Vec<u32>>());
+    }
+
+    /// The lanes from 40 on take a scalar written in their branch; the others keep their
+    /// console lane.
+    #[test]
+    fn a_scalar_written_in_a_lane_branch_reaches_its_lanes() {
+        let Some(out) = run(&[&MBCNT[..], &IF_FROM_40_V1_7[..]].concat()) else { return };
+        let want: Vec<u32> = (0..64).map(|t| if t < 40 { t } else { 7 }).collect();
         assert_eq!(out, want);
     }
 }
