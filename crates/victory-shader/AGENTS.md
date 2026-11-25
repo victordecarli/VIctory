@@ -21,8 +21,10 @@ Change it in the same commit as the code it describes.
 
 ## Purity
 
-The crate is pure except `emit::host` (Windows, test or feature `host`),
-`emit::validator` (Windows) and the `VICTORY_WARP` read in `emit::host`.
+The crate is pure except `emit::host` (Windows, test or feature `host`;
+reads `VICTORY_WARP`), `emit::validator` (Windows; reads `VICTORY_DXIL`)
+and one environment read outside them: `VICTORY_SHADER_LOOP_LIMIT` in
+`emit::loop_limit`, only with the `diagnostics` feature.
 Code that needs D3D12, DXC or the validator goes in those two modules;
 everything else builds and tests on Linux.
 
