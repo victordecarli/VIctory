@@ -13,7 +13,7 @@ switches given here, then summarises the run.
 3. The VICTORY_* switches (and RUST_LOG) the session already has are left
    out of the run and listed, unless -KeepEnv; the configuration variables
    (VICTORY_CONFIG, VICTORY_GAME_DIR, VICTORY_CACHE_DIR, VICTORY_DATA_DIR,
-   VICTORY_TEST_TITLES) always pass. The session's environment is the same
+   VICTORY_LOG_DIR, VICTORY_TEST_TITLES) always pass. The session's environment is the same
    afterwards.
 4. Waits for every victory.exe the run started (a relaunched title, the
    audio recorder), then shows scripts\run-summary.ps1 for the run.
@@ -90,7 +90,7 @@ try {
     foreach ($name in $Env.Keys) { $wanted[$name] = [string]$Env[$name] }
 
     # Inherited switches are left out of the run; the session gets them back.
-    $config = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_TEST_TITLES'
+    $config = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_LOG_DIR', 'VICTORY_TEST_TITLES'
     $saved = @{}
     if (-not $KeepEnv) {
         $inherited = Get-ChildItem Env: |

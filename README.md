@@ -164,7 +164,7 @@ scripts\run.ps1 -GpuDebug -Log 'victory_gpu=debug,info'
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+data under the cache folder, run logs under the log folder (see Logging).
 
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
@@ -215,7 +215,9 @@ Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above; a filter that does not parse is reported and replaced by
 `info`). `victory run` also writes each process's log (a relaunch and the
 audio recorder are processes of their own) to
-`<data_dir>/logs/run-<UTC time>-<pid>.jsonl`, keeping the newest 20: one
+`<log_dir>/run-<UTC time>-<pid>.jsonl` (`log_dir`: `VICTORY_LOG_DIR` or
+`[paths].log_dir`, default `%LOCALAPPDATA%\victory\logs`; `victory config`
+prints it), keeping the newest 20: one
 JSON object per line, the event's fields beside `timestamp` (UTC),
 `level`, `target`, `threadId` and `threadName`. The console's first line
 names the file. A process names the other's id in both logs: a relaunch
