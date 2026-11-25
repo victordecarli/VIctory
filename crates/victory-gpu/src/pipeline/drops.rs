@@ -71,6 +71,10 @@ pub(crate) enum Cause {
     IndirectUnbounded,
     /// Indirect: the title's signature or buffers are not ones we execute.
     IndirectLayout,
+    /// A dispatch whose pipeline is a graphics pipeline.
+    ComputeKind,
+    /// A mesh dispatch whose group count is in GPU memory.
+    IndirectMesh,
 }
 
 /// Every cause this build has, in the order reports list them.
@@ -83,6 +87,8 @@ const CAUSES: &[Cause] = &[
     Cause::IndirectSignature,
     Cause::IndirectUnbounded,
     Cause::IndirectLayout,
+    Cause::ComputeKind,
+    Cause::IndirectMesh,
 ];
 
 impl Cause {
@@ -96,6 +102,8 @@ impl Cause {
             Cause::IndirectSignature => 3,
             Cause::IndirectUnbounded => 4,
             Cause::IndirectLayout => 5,
+            Cause::ComputeKind => 7,
+            Cause::IndirectMesh => 8,
         }
     }
 
@@ -109,14 +117,16 @@ impl Cause {
             Cause::IndirectSignature => "indirect: no host signature",
             Cause::IndirectUnbounded => "indirect: arguments not bounded",
             Cause::IndirectLayout => "indirect: signature or buffers not executed",
+            Cause::ComputeKind => "dispatch with a graphics pipeline",
+            Cause::IndirectMesh => "indirect mesh dispatch",
         }
     }
 }
 
 /// Drops by cause, at [`Cause::slot`] (one slot more than the causes of a
 /// build without `diagnostics`, which never uses it).
-static GENERAL: [Count; 7] =
-    [const { Count { drops: AtomicU64::new(0), seen: AtomicBool::new(false) } }; 7];
+static GENERAL: [Count; 9] =
+    [const { Count { drops: AtomicU64::new(0), seen: AtomicBool::new(false) } }; 9];
 
 /// The shaders and pipelines that dropped a draw, in the order they first did.
 static SHADERS: Mutex<Vec<Arc<Shader>>> = Mutex::new(Vec::new());
@@ -317,6 +327,25 @@ mod tests {
         pipeline(&p);
         assert_eq!(p.drops.being_made.load(Ordering::Relaxed), 1);
         assert_eq!(p.drops.refused.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_dispatch_causes_are_listed_with_names_of_their_own() {
+        for cause in [Cause::ComputeKind, Cause::IndirectMesh] {
+            assert!(CAUSES.contains(&cause));
+            assert_eq!(CAUSES.iter().filter(|c| c.name() == cause.name()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_general_drop_of_a_dispatch_cause_is_counted() {
+        let count = |cause: Cause| GENERAL.get(cause.slot()).map_or(0, Count::total);
+        let (kind, mesh) = (count(Cause::ComputeKind), count(Cause::IndirectMesh));
+        general(Cause::ComputeKind);
+        general(Cause::IndirectMesh);
+        general(Cause::IndirectMesh);
+        assert_eq!(count(Cause::ComputeKind), kind + 1);
+        assert_eq!(count(Cause::IndirectMesh), mesh + 2);
     }
 
     #[test]

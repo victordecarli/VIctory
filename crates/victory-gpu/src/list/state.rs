@@ -273,6 +273,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh_x(
     if indirect != 0 {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+        crate::draw::dropped_for(crate::pipeline::drops::Cause::IndirectMesh);
         return;
     }
     // SAFETY: as this function's contract gives them.

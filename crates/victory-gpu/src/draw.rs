@@ -128,6 +128,13 @@ fn dropped(pipeline: usize) {
     }
 }
 
+/// Counts a draw or dispatch dropped for a general `cause` (no pipeline to
+/// blame), here and in the drop totals.
+pub(crate) fn dropped_for(cause: crate::pipeline::drops::Cause) {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    crate::pipeline::drops::general(cause);
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -545,6 +552,7 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            dropped_for(crate::pipeline::drops::Cause::ComputeKind);
             return;
         }
         if !self.bind(list, p, true) {
