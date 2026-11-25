@@ -905,8 +905,12 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        let texture = unsafe { crate::resource::host_resource(resource) }?;
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        let copy = unsafe { crate::resource::host_copy(resource) }?;
         let wanted = legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {

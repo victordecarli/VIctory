@@ -3,10 +3,6 @@
 //! Heaps and resources are host memory and a resource's GPU address is its
 //! CPU address, as on the console; textures also get a host copy, and
 //! buffers a host copy when a draw reads them (`shadow`).
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
@@ -253,9 +249,14 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 #[cfg(windows)]
-pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
-    let host = host_resource(this)?;
+/// # Safety
+///
+/// `this` is null or a live resource this module created.
+pub(crate) unsafe fn view_format(this: This) -> Option<u32> {
+    // SAFETY: as this function's contract gives them.
+    let own = pc_format(unsafe { resource(this) }.desc.format);
+    // SAFETY: as this function's contract gives them.
+    let host = unsafe { host_resource(this) }?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     (format != own).then_some(own)
@@ -345,7 +346,13 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
 /// Device method: where each subresource goes in an upload buffer, rows
 /// 256-byte and subresources 512-byte aligned, as on PC. Unknown sizes give
 /// the documented all-ones values.
-pub(crate) extern "system" fn copyable_footprints(
+///
+/// # Safety
+///
+/// `desc` is null or valid for reads of a `ResourceDesc`, and `layouts`,
+/// `rows`, `row_sizes` and `total` are each null or valid for writes of
+/// `count` entries (`total`: one).
+pub(crate) unsafe extern "system" fn copyable_footprints(
     _: This,
     desc: *const ResourceDesc,
     first: u32,
@@ -357,7 +364,7 @@ pub(crate) extern "system" fn copyable_footprints(
     total: *mut u64,
 ) {
     const PLACEMENT: u64 = 512;
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let desc = unsafe { desc.as_ref() };
     let mut end = base;
     let mut known = desc.is_some();
@@ -377,7 +384,8 @@ pub(crate) extern "system" fn copyable_footprints(
             }
         };
         let i = i as usize;
-        // SAFETY: each output is null or holds `count` entries.
+        // SAFETY: each output is null or holds `count` entries, per this
+        // function's contract.
         unsafe {
             if !layouts.is_null() {
                 layouts.add(i).write(layout);
@@ -394,7 +402,7 @@ pub(crate) extern "system" fn copyable_footprints(
         tracing::warn!(?desc, "no footprint for this resource");
     }
     if !total.is_null() {
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { total.write(if known { end - base } else { u64::MAX }) };
     }
 }
@@ -402,7 +410,12 @@ pub(crate) extern "system" fn copyable_footprints(
 /// Device method: the footprint of resources placed one after another.
 /// Returns a 16-byte value, through a hidden first argument. Invalid input
 /// gives the documented size `u64::MAX`.
-pub(crate) extern "system" fn allocation_info(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of an `AllocationInfo`, and `descs`
+/// is null or valid for reads of `count` `ResourceDesc` entries.
+pub(crate) unsafe extern "system" fn allocation_info(
     out: *mut AllocationInfo,
     _: This,
     _visible: u32,
@@ -412,10 +425,11 @@ pub(crate) extern "system" fn allocation_info(
     let descs = if descs.is_null() {
         &[][..]
     } else {
-        // SAFETY: the title passes `count` descriptions.
+        // SAFETY: non-null, and `count` descriptions, per this function's
+        // contract.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
-    // SAFETY: the caller passes room for the value.
+    // SAFETY: `out` is writable, per this function's contract.
     unsafe { out.write(place(descs.iter(), |_, _| ())) };
     out
 }
@@ -439,7 +453,13 @@ pub(crate) struct AllocationInfo1 {
 
 /// Device method 0x360 (`ID3D12Device8`): [`allocation_info`] for newer
 /// descriptions, also telling where each resource goes.
-pub(crate) extern "system" fn allocation_info2(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of an `AllocationInfo`, `descs` is
+/// null or valid for reads of `count` `ResourceDesc1` entries, and `each`
+/// is null or valid for writes of `count` `AllocationInfo1` entries.
+pub(crate) unsafe extern "system" fn allocation_info2(
     out: *mut AllocationInfo,
     _: This,
     _visible: u32,
@@ -450,16 +470,18 @@ pub(crate) extern "system" fn allocation_info2(
     let descs = if descs.is_null() {
         &[][..]
     } else {
-        // SAFETY: the title passes `count` descriptions.
+        // SAFETY: non-null, and `count` descriptions, per this function's
+        // contract.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
     let total = place(descs.iter().map(|d| &d.desc), |i, info| {
         if !each.is_null() {
-            // SAFETY: the title passes room for `count` entries.
+            // SAFETY: non-null, and room for `count` entries, per this function's
+            // contract.
             unsafe { each.add(i).write(info) };
         }
     });
-    // SAFETY: the caller passes room for the value.
+    // SAFETY: `out` is writable, per this function's contract.
     unsafe { out.write(total) };
     out
 }
@@ -603,13 +625,19 @@ struct Heap {
     memory: Memory,
 }
 
-pub(crate) extern "system" fn create_heap(
+/// # Safety
+///
+/// `desc` is null or valid for reads of a `HeapDesc`, and when it asks for
+/// a placement, 16 further bytes after it are readable. `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_heap(
     _: This,
     desc: *const HeapDesc,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -631,15 +659,29 @@ pub(crate) extern "system" fn create_heap(
     object::hand_out(HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
-extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// # Safety
+///
+/// `this` is a live heap this module created. `iid` is null or points to an
+/// interface id valid for reads, and `out` is null or valid for a write of
+/// an object pointer, for the duration of the call.
+unsafe extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(HEAP, iid, object::is(iid, &HEAP_IIDS).then_some(this), out)
 }
-extern "system" fn heap_release(this: This) -> u32 {
+/// # Safety
+///
+/// `this` is a live heap this module created, holding the reference the
+/// caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn heap_release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
+/// # Safety
+///
+/// `this` is a live heap this module created, and `out` is null or valid
+/// for a write of a `HeapDesc`.
+unsafe extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
     if !out.is_null() {
-        // SAFETY: `this` is a heap; the title passes room for a description.
+        // SAFETY: `this` is a live heap and `out` is writable, per this
+        // function's contract.
         unsafe { out.write((*this.cast::<Heap>()).desc) };
     }
 }
@@ -659,7 +701,8 @@ enum Backing {
 impl Drop for Backing {
     fn drop(&mut self) {
         if let Backing::Placed { heap, .. } = *self {
-            heap_release(heap);
+            // SAFETY: as this function's contract gives them.
+            unsafe { heap_release(heap) };
         }
     }
 }
@@ -692,37 +735,54 @@ pub(crate) struct HostTexture {
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
-pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
+/// # Safety
+///
+/// `this` is null or a live resource this module created.
+pub(crate) unsafe fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    // SAFETY: as this function's contract gives them.
+    let host = unsafe { resource(this) }.host.as_ref()?;
     let before = host.state.swap(wanted, std::sync::atomic::Ordering::Relaxed);
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
 /// The host GPU's copy of a title resource, if it has one.
 #[cfg(windows)]
-pub(crate) fn host_resource<'a>(
+/// # Safety
+///
+/// `this` is null or a live resource this module created, which stays alive
+/// for `'a`.
+pub(crate) unsafe fn host_resource<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    // SAFETY: as this function's contract gives them.
+    unsafe { resource(this) }.host.as_deref().map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
-pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+/// # Safety
+///
+/// `this` is null or a live resource this module created.
+pub(crate) unsafe fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    // SAFETY: as this function's contract gives them.
+    unsafe { resource(this) }.host.clone()
 }
 
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
-fn host_texture(
+/// # Safety
+///
+/// `clear` is null or valid for reads of a console clear value (five
+/// `u32`).
+unsafe fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
@@ -761,7 +821,8 @@ fn host_texture(
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
-        // SAFETY: the title passes a whole clear value.
+        // SAFETY: non-null, and a whole clear value, per this function's
+        // contract.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
         value
@@ -795,20 +856,31 @@ fn host_texture(
 }
 
 /// A texture's console memory and description; `None` for buffers.
-pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
+///
+/// # Safety
+///
+/// `this` is null or a live resource this module created.
+pub(crate) unsafe fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
         return None;
     }
-    let r = resource(this);
+    // SAFETY: as this function's contract gives them.
+    let r = unsafe { resource(this) };
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
 /// A buffer's host memory and size; `None` for textures.
-pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
+///
+/// # Safety
+///
+/// `this` is null or a live resource this module created; the memory it
+/// returns stays valid while the resource lives.
+pub(crate) unsafe fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
         return None;
     }
-    let r = resource(this);
+    // SAFETY: as this function's contract gives them.
+    let r = unsafe { resource(this) };
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
@@ -825,13 +897,23 @@ impl Resource {
     }
 }
 
-fn resource<'a>(this: This) -> &'a Resource {
-    // SAFETY: called from resource methods only.
+/// # Safety
+///
+/// `this` is a live resource this module created, and it stays alive for
+/// `'a`.
+unsafe fn resource<'a>(this: This) -> &'a Resource {
+    // SAFETY: `this` is a live resource, per this function's contract.
     unsafe { &*this.cast::<Resource>() }
 }
 
 #[allow(clippy::too_many_arguments, reason = "the creation methods' own arguments, passed on")]
-fn hand_out_resource(
+/// # Safety
+///
+/// `clear` is null or valid for reads of a console clear value (five
+/// `u32`), `backing` memory outlives the resource, and `iid` is null or
+/// points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
+unsafe fn hand_out_resource(
     desc: ResourceDesc,
     heap: HeapProperties,
     heap_flags: u32,
@@ -844,7 +926,8 @@ fn hand_out_resource(
     #[cfg(not(windows))]
     let _ = (state, clear);
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    // SAFETY: as this function's contract gives them.
+    let host = unsafe { host_texture(&desc, state, clear) };
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -893,7 +976,14 @@ impl Drop for Resource {
     }
 }
 
-pub(crate) extern "system" fn create_committed(
+/// # Safety
+///
+/// `heap` and `desc` are null or valid for reads of a `HeapProperties` and
+/// a `ResourceDesc`. `clear` is null or valid for reads of a console clear
+/// value (five `u32`). `iid` is null or points to an interface id valid for
+/// reads, and `out` is null or valid for a write of an object pointer, for
+/// the duration of the call.
+pub(crate) unsafe extern "system" fn create_committed(
     _: This,
     heap: *const HeapProperties,
     heap_flags: u32,
@@ -921,7 +1011,19 @@ pub(crate) extern "system" fn create_committed(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
-    hand_out_resource(desc, heap, heap_flags, Backing::Committed(memory), state, clear, iid, out)
+    // SAFETY: as this function's contract gives them.
+    unsafe {
+        hand_out_resource(
+            desc,
+            heap,
+            heap_flags,
+            Backing::Committed(memory),
+            state,
+            clear,
+            iid,
+            out,
+        )
+    }
 }
 
 /// Device method 0x3f8, inferred from Grand Theft Auto VI's calls
@@ -934,7 +1036,14 @@ pub(crate) extern "system" fn create_committed(
     clippy::too_many_arguments,
     reason = "the method's own arguments, fixed by the D3D12.X table it sits in"
 )]
-pub(crate) extern "system" fn create_committed3(
+/// # Safety
+///
+/// `heap` and `desc` are null or valid for reads of a `HeapProperties` and
+/// a `ResourceDesc`. `clear` is null or valid for reads of a console clear
+/// value (five `u32`); `_castable` is not read. `iid` is null or points to
+/// an interface id valid for reads, and `out` is null or valid for a write
+/// of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_committed3(
     this: This,
     heap: *const HeapProperties,
     heap_flags: u32,
@@ -948,7 +1057,8 @@ pub(crate) extern "system" fn create_committed3(
     out: *mut This,
 ) -> HRESULT {
     const COMMON: u32 = 0;
-    create_committed(this, heap, heap_flags, desc, COMMON, clear, iid, out)
+    // SAFETY: as this function's contract gives them.
+    unsafe { create_committed(this, heap, heap_flags, desc, COMMON, clear, iid, out) }
 }
 
 /// Registered page pools (64 KiB pages the title maps into tiled
@@ -961,7 +1071,13 @@ fn page_pools() -> std::sync::MutexGuard<'static, Vec<Option<(u64, u32)>>> {
 }
 
 /// Device method 0x250: `(address, page count, handle out)`.
-pub(crate) extern "system" fn register_page_pool(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `usize`, and `address` names
+/// `pages` 64 KiB pages of title memory that stay mapped until the pool is
+/// unregistered.
+pub(crate) unsafe extern "system" fn register_page_pool(
     _: This,
     address: u64,
     pages: u32,
@@ -973,7 +1089,7 @@ pub(crate) extern "system" fn register_page_pool(
     tracing::debug!(address = format_args!("{address:#x}"), pages, "page pool");
     let mut pools = page_pools();
     pools.push(Some((address, pages)));
-    // SAFETY: checked non-null; the title passes room for a handle.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(pools.len()) };
     S_OK
 }
@@ -996,7 +1112,16 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
 /// enhanced barriers. GPU addresses are CPU addresses, so the resource is
 /// a view of that memory. `D3D12_RESOURCE_DESC1` starts like the plain
 /// description; its sampler feedback region is not needed.
-pub(crate) extern "system" fn create_at_address(
+///
+/// # Safety
+///
+/// `address` is null or the start of title memory, mapped for as many bytes
+/// as the described resource needs and kept mapped while it lives, and
+/// `desc` is null or valid for reads of a `ResourceDesc`. `clear` is null
+/// or valid for reads of a console clear value (five `u32`). `iid` is null
+/// or points to an interface id valid for reads, and `out` is null or valid
+/// for a write of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_at_address(
     _: This,
     address: u64,
     desc: *const ResourceDesc,
@@ -1005,7 +1130,7 @@ pub(crate) extern "system" fn create_at_address(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -1022,16 +1147,19 @@ pub(crate) extern "system" fn create_at_address(
     const COMMON: u32 = 0;
     const DEFAULT: HeapProperties =
         HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 1, visible_nodes: 1 };
-    hand_out_resource(
-        desc,
-        DEFAULT,
-        0,
-        Backing::Address(address as *mut u8),
-        COMMON,
-        clear,
-        iid,
-        out,
-    )
+    // SAFETY: as this function's contract gives them.
+    unsafe {
+        hand_out_resource(
+            desc,
+            DEFAULT,
+            0,
+            Backing::Address(address as *mut u8),
+            COMMON,
+            clear,
+            iid,
+            out,
+        )
+    }
 }
 
 /// Textures the title placed in its own memory and views without a
@@ -1048,7 +1176,11 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+/// # Safety
+///
+/// `address` is the start of title memory, mapped for as many bytes as the
+/// described resource needs and kept mapped while it lives.
+pub(crate) unsafe fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
@@ -1059,23 +1191,34 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
-    );
+    // SAFETY: as this function's contract gives them.
+    let made = unsafe {
+        create_at_address(
+            std::ptr::null(),
+            address,
+            &d,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        )
+    };
     if made != S_OK {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    // SAFETY: as this function's contract gives them.
+    unsafe { resource(out) }.host.is_some().then_some(out)
 }
 
-pub(crate) extern "system" fn create_placed(
+/// # Safety
+///
+/// `heap` is null or a live heap this module created, and `desc` is null or
+/// valid for reads of a `ResourceDesc`. `clear` is null or valid for reads
+/// of a console clear value (five `u32`). `iid` is null or points to an
+/// interface id valid for reads, and `out` is null or valid for a write of
+/// an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_placed(
     _: This,
     heap: This,
     offset: u64,
@@ -1085,14 +1228,14 @@ pub(crate) extern "system" fn create_placed(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
     if heap.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: the title passes one of our heaps.
+    // SAFETY: `heap` is a live heap, per this function's contract.
     let h = unsafe { &*heap.cast::<Heap>() };
     let fits = footprint(&desc).is_some_and(|info| {
         offset.is_multiple_of(info.alignment)
@@ -1104,28 +1247,54 @@ pub(crate) extern "system" fn create_placed(
     }
     object::add_ref(heap);
     let backing = Backing::Placed { heap, offset };
-    hand_out_resource(desc, h.desc.properties, h.desc.flags, backing, state, clear, iid, out)
+    // SAFETY: as this function's contract gives them.
+    unsafe {
+        hand_out_resource(desc, h.desc.properties, h.desc.flags, backing, state, clear, iid, out)
+    }
 }
 
-extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// # Safety
+///
+/// `this` is a live resource this module created. `iid` is null or points
+/// to an interface id valid for reads, and `out` is null or valid for a
+/// write of an object pointer, for the duration of the call.
+unsafe extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(RESOURCE, iid, object::is(iid, &RESOURCE_IIDS).then_some(this), out)
 }
-extern "system" fn resource_release(this: This) -> u32 {
+/// # Safety
+///
+/// `this` is a live resource this module created, holding the reference the
+/// caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
 /// `out` only asks for residency.
-extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
+///
+/// # Safety
+///
+/// `this` is a live resource this module created, and `out` is null or
+/// valid for a write of a pointer.
+unsafe extern "system" fn map(
+    this: This,
+    _sub: u32,
+    _read: *const c_void,
+    out: *mut *mut u8,
+) -> HRESULT {
     if !out.is_null() {
-        // SAFETY: checked non-null; the title passes room for a pointer.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { out.write(resource(this).data()) };
     }
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+/// # Safety
+///
+/// `this` is a live resource this module created, and `out` is null or
+/// valid for a write of a `ResourceDesc`.
+unsafe extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
     if !out.is_null() {
-        // SAFETY: checked non-null; the title passes room for a description.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { out.write(resource(this).desc) };
     }
 }
@@ -1134,7 +1303,11 @@ extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
 /// Memory is unified and cache-coherent (as the architecture query says),
 /// so every type is in pool L0, default heaps are not CPU-visible and the
 /// others are write-back.
-pub(crate) extern "system" fn custom_heap_properties(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `HeapProperties`.
+pub(crate) unsafe extern "system" fn custom_heap_properties(
     out: *mut HeapProperties,
     _: This,
     nodes: u32,
@@ -1157,15 +1330,19 @@ pub(crate) extern "system" fn custom_heap_properties(
         creation_nodes: nodes,
         visible_nodes: nodes,
     };
-    // SAFETY: the title passes room for the result (null is tolerated).
+    // SAFETY: `out` is null or writable, per this function's contract.
     if let Some(out) = unsafe { out.as_mut() } {
         *out = properties;
     }
     out
 }
 
-extern "system" fn gpu_address(this: This) -> u64 {
-    let r = resource(this);
+/// # Safety
+///
+/// `this` is a live resource this module created.
+unsafe extern "system" fn gpu_address(this: This) -> u64 {
+    // SAFETY: as this function's contract gives them.
+    let r = unsafe { resource(this) };
     let at = r.data() as u64;
     // The console's GPU addresses fit in 40 bits; its ray-tracing builder
     // refuses others (diagnostics: which memory breaks that).
@@ -1183,13 +1360,19 @@ extern "system" fn gpu_address(this: This) -> u64 {
     }
     at
 }
-extern "system" fn heap_properties(
+/// # Safety
+///
+/// `this` is a live resource this module created, and `properties` and
+/// `flags` are each null or valid for a write of their type.
+unsafe extern "system" fn heap_properties(
     this: This,
     properties: *mut HeapProperties,
     flags: *mut u32,
 ) -> HRESULT {
-    let r = resource(this);
-    // SAFETY: either pointer may be null; otherwise the title passes room.
+    // SAFETY: as this function's contract gives them.
+    let r = unsafe { resource(this) };
+    // SAFETY: either pointer may be null; otherwise writable, per this
+    // function's contract.
     unsafe {
         if let Some(p) = properties.as_mut() {
             *p = r.heap;

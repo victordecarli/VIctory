@@ -277,7 +277,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }
-    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let (memory, desc) = unsafe { crate::resource::texture_memory(resource) }?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
         once!(?desc, "texture contents without a console layout not uploaded");

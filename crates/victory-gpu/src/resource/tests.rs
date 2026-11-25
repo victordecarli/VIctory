@@ -31,7 +31,8 @@ fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
 fn heap(size: u64) -> This {
     let desc = HeapDesc { size, properties: PROPERTIES, alignment: 0, flags: 0 };
     let mut heap = std::ptr::null();
-    assert_eq!(create_heap(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap), S_OK);
+    // SAFETY: this test's own locals and resources, live for the call.
+    assert_eq!(unsafe { create_heap(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap) }, S_OK);
     crate::test_support::valid(heap)
 }
 
@@ -49,7 +50,11 @@ fn heaps_are_zeroed_aligned_memory() {
 
     let bad = HeapDesc { size: 1 << 20, properties: PROPERTIES, alignment: 3, flags: 0 };
     let mut out = std::ptr::null();
-    assert_eq!(create_heap(std::ptr::null(), &bad, &HEAP_IIDS[0], &mut out), E_INVALIDARG);
+    assert_eq!(
+        // SAFETY: a local description, a static id and a local to write.
+        unsafe { create_heap(std::ptr::null(), &bad, &HEAP_IIDS[0], &mut out) },
+        E_INVALIDARG
+    );
 }
 
 #[test]
@@ -119,9 +124,11 @@ fn sizes_cover_every_mip() {
 
     let mut info = AllocationInfo { size: 0, alignment: 0 };
     let descs = [buffer(100), texture(256, 256, 28, 0)];
-    allocation_info(&mut info, std::ptr::null(), 0, 2, descs.as_ptr());
+    // SAFETY: this test's own locals and resources, live for the call.
+    unsafe { allocation_info(&mut info, std::ptr::null(), 0, 2, descs.as_ptr()) };
     assert_eq!(info, AllocationInfo { size: KIB_64 + size(&descs[1]).unwrap(), alignment: KIB_64 });
-    allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
+    // SAFETY: this test's own locals and resources, live for the call.
+    unsafe { allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1)) };
     assert_eq!(info.size, u64::MAX);
 }
 
@@ -132,7 +139,8 @@ fn upload_footprints_follow_the_pc_rules() {
     let (mut rows, mut sizes, mut total) = ([0; 2], [0; 2], 0);
     let mut footprints = |desc: &ResourceDesc, first, count| {
         let (l, r, s) = (layouts.as_mut_ptr(), rows.as_mut_ptr(), sizes.as_mut_ptr());
-        copyable_footprints(null, desc, first, count, 0, l, r, s, &mut total);
+        // SAFETY: this test's own locals and resources, live for the call.
+        unsafe { copyable_footprints(null, desc, first, count, 0, l, r, s, &mut total) };
         (layouts, rows, sizes, total)
     };
     // 100x60 RGBA8, 2 mips: 400-byte rows pitched to 512.
@@ -165,14 +173,21 @@ fn buffer_data_reaches_the_host_texture() {
     let (mut image, mut source) = (null, null);
     let rgba = texture(4, 4, 28, 1);
     assert_eq!(
-        create_committed(null, &PROPERTIES, 0, &rgba, COPY_DEST, null.cast(), iid, &mut image),
+        // SAFETY: this test's own locals and resources, live for the call.
+        unsafe {
+            create_committed(null, &PROPERTIES, 0, &rgba, COPY_DEST, null.cast(), iid, &mut image)
+        },
         S_OK
     );
     assert_eq!(
-        create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut source),
+        // SAFETY: this test's own locals and resources, live for the call.
+        unsafe {
+            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut source)
+        },
         S_OK
     );
-    let (data, _) = buffer_bytes(source).unwrap();
+    // SAFETY: this test's own locals and resources, live for the call.
+    let (data, _) = unsafe { buffer_bytes(source) }.unwrap();
     // SAFETY: the buffer holds 1024 bytes.
     let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
     for (i, b) in bytes.iter_mut().enumerate() {
@@ -250,11 +265,14 @@ fn buffer_data_reaches_the_host_texture() {
             .unwrap();
     }
     let readback = readback.unwrap();
-    let host_image = host_resource(image).unwrap();
+    // SAFETY: this test's own locals and resources, live for the call.
+    let host_image = unsafe { host_resource(image) }.unwrap();
     let back = host.new_list().unwrap();
-    let (_, before) = host_transition(image, 0x800).unwrap();
+    // SAFETY: this test's own locals and resources, live for the call.
+    let (_, before) = unsafe { host_transition(image, 0x800) }.unwrap();
     // The upload list holds the texture until it is reset.
-    assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+    // SAFETY: this test's own locals and resources, live for the call.
+    assert!(std::sync::Arc::strong_count(&unsafe { host_copy(image) }.unwrap()) > 2);
     use windows::core::Interface;
     let out_to =
         Location { resource: readback.as_raw().cast_const().cast(), kind: 1, footprint: rows };
@@ -297,16 +315,19 @@ fn buffer_data_reaches_the_host_texture() {
 fn committed_and_placed_resources_map_at_their_gpu_address() {
     let null = std::ptr::null();
     let mut committed = null;
-    let hr = create_committed(
-        null,
-        &PROPERTIES,
-        0,
-        &buffer(256),
-        0,
-        null.cast(),
-        &RESOURCE_IIDS[0],
-        &mut committed,
-    );
+    // SAFETY: this test's own locals and resources, live for the call.
+    let hr = unsafe {
+        create_committed(
+            null,
+            &PROPERTIES,
+            0,
+            &buffer(256),
+            0,
+            null.cast(),
+            &RESOURCE_IIDS[0],
+            &mut committed,
+        )
+    };
     assert_eq!(hr, S_OK);
     let mut data = std::ptr::null_mut();
     assert_eq!(slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data), S_OK);
@@ -317,7 +338,8 @@ fn committed_and_placed_resources_map_at_their_gpu_address() {
 
     let heap = heap(4 * KIB_64);
     let place = |offset, desc: &ResourceDesc, out: &mut This| {
-        create_placed(null, heap, offset, desc, 0, null.cast(), &RESOURCE_IIDS[0], out)
+        // SAFETY: this test's own locals and resources, live for the call.
+        unsafe { create_placed(null, heap, offset, desc, 0, null.cast(), &RESOURCE_IIDS[0], out) }
     };
     let mut placed = null;
     assert_eq!(place(KIB_64, &buffer(KIB_64), &mut placed), S_OK);

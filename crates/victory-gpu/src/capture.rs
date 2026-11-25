@@ -202,7 +202,9 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        && let Some(copy) = unsafe { crate::resource::host_copy(resource) }
     {
         targets.push((resource as usize, copy));
     }

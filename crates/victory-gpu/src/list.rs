@@ -311,7 +311,11 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    let host = |r: This| {
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        unsafe { crate::resource::host_resource(r) }.map(|h| h.as_raw().cast_const().cast())
+    };
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -369,7 +373,11 @@ unsafe extern "system" fn barrier(this: This, count: u32, barriers: *const Barri
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            b.kind != 1
+                && !b.first.is_null()
+                && unsafe { crate::resource::buffer_bytes(b.first) }.is_some()
         }) {
             host.push(UAV_BARRIER);
         }
@@ -418,7 +426,9 @@ const COPY_SOURCE: u32 = 0x800;
 /// `buffer` is null or a buffer this crate created, which stays alive while
 /// the returned pointer is used.
 unsafe fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
-    let (data, size) = crate::resource::buffer_bytes(buffer)?;
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let (data, size) = unsafe { crate::resource::buffer_bytes(buffer) }?;
     let end = offset.checked_add(len)?;
     if end > size {
         tracing::warn!(offset, len, size, "copy outside its buffer");
@@ -469,7 +479,11 @@ unsafe extern "system" fn copy_resource(this: This, dst: This, src: This) {
             return;
         };
         if let (Some(to), Some(from)) =
-            (crate::resource::host_resource(dst), crate::resource::host_resource(src))
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::host_resource(dst) }, unsafe {
+                    crate::resource::host_resource(src)
+                })
         {
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
@@ -484,7 +498,11 @@ unsafe extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) =
-            (crate::resource::buffer_bytes(dst), crate::resource::buffer_bytes(src))
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::buffer_bytes(dst) }, unsafe {
+                    crate::resource::buffer_bytes(src)
+                })
         {
             list.defer_copy(to, from, a.min(b) as usize);
         }
@@ -543,7 +561,10 @@ unsafe extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        let found = unsafe { crate::resource::host_resource(dst.resource) };
+        let Some(to) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
@@ -576,7 +597,10 @@ unsafe extern "system" fn copy_texture_region(
             }
             _upload = buffer;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            let found = unsafe { crate::resource::host_resource(src.resource) };
+            let Some(texture) = found else {
                 return;
             };
             if crate::texture::title_written(texture) {
@@ -672,7 +696,11 @@ unsafe extern "system" fn resolve(
     // SAFETY: as this function's contract gives them.
     if let Some(list) = unsafe { host_list(this) }
         && let (Some(to), Some(from)) =
-            (crate::resource::host_resource(dst), crate::resource::host_resource(src))
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::host_resource(dst) }, unsafe {
+                    crate::resource::host_resource(src)
+                })
     {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
@@ -750,7 +778,9 @@ unsafe extern "system" fn clear_rtv(
             return;
         };
         let (Some(texture), Some(host)) =
-            (crate::resource::host_resource(record.resource), crate::host::host())
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::host_resource(record.resource) }, crate::host::host())
         else {
             return;
         };
@@ -808,7 +838,9 @@ unsafe extern "system" fn clear_dsv(
             return;
         };
         let (Some(texture), Some(host)) =
-            (crate::resource::host_resource(record.resource), crate::host::host())
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::host_resource(record.resource) }, crate::host::host())
         else {
             return;
         };
@@ -917,7 +949,10 @@ unsafe extern "system" fn resolve_queries(
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
-    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let found = unsafe { crate::resource::buffer_bytes(buffer) };
+    let Some((data, size)) = found else {
         return;
     };
     let (what, bytes) = match kind {
@@ -1100,8 +1135,14 @@ unsafe extern "system" fn execute_indirect(
     let Some((stride, args)) = (unsafe { crate::signature::layout(signature) }) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let address =
+        unsafe { crate::resource::buffer_bytes(arguments) }.map(|(p, _)| p as u64 + offset);
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let counter =
+        unsafe { crate::resource::buffer_bytes(count) }.map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
