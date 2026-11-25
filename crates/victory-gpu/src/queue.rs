@@ -469,10 +469,7 @@ unsafe extern "system" fn copy_page_mappings(
         }
     }
     if !ok {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
-        });
+        crate::warn::warn_once!("a page mapping failed", pool = format_args!("{pool:#x}"));
     }
     S_OK
 }

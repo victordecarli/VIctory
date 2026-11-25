@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use crate::warn::Warning;
 
 pub type HRESULT = i32;
 pub const S_OK: HRESULT = 0;
@@ -266,22 +268,26 @@ const KINDS: [&str; 16] = [
 
 const MAX_SLOTS: usize = 160;
 
-/// Which unwritten slots have been reported; each is logged once.
-static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
-    [const { [const { AtomicBool::new(false) }; MAX_SLOTS] }; KINDS.len()];
+/// The unwritten slots that were called, counted; each is logged once.
+static REPORTED: [[Warning; MAX_SLOTS]; KINDS.len()] = [const {
+    [const { Warning::new(concat!(file!(), ":", line!()), "method not implemented") }; MAX_SLOTS]
+}; KINDS.len()];
 
 /// Logged once per slot, with the caller's offset in its module (the title
 /// image for title calls). Wrong for a slot that returns a value instead of
 /// an `HRESULT`.
 extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
-    if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            object = KINDS[KIND],
-            slot = format_args!("{:#x}", SLOT * 8),
-            caller = caller(),
-            "method not implemented"
-        );
-    }
+    REPORTED[KIND][SLOT].hit_with(
+        || format!("{} slot {:#x}", KINDS[KIND], SLOT * 8),
+        || {
+            tracing::warn!(
+                object = KINDS[KIND],
+                slot = format_args!("{:#x}", SLOT * 8),
+                caller = caller(),
+                "method not implemented"
+            );
+        },
+    );
     E_NOTIMPL
 }
 

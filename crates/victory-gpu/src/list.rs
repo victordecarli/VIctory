@@ -565,8 +565,7 @@ unsafe extern "system" fn copy_texture_region(
         // while it is in use.
         let found = unsafe { crate::resource::host_resource(dst.resource) };
         let Some(to) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            crate::warn::warn_once!("texture to buffer copies not implemented");
             return;
         };
         let mut from = src;

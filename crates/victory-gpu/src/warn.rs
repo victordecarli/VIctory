@@ -61,7 +61,6 @@ impl Warning {
 
     /// As [`Warning::hit`], keeping `detail()` from the first case for
     /// the report: the object or slot a warning with a fixed key is about.
-    #[allow(dead_code, reason = "the warnings with a fixed key use it from the next change on")]
     pub(crate) fn hit_with(&'static self, detail: impl FnOnce() -> String, first: impl FnOnce()) {
         self.total.fetch_add(1, Ordering::Relaxed);
         if !self.registered.swap(true, Ordering::Relaxed) {

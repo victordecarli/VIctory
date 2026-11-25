@@ -94,11 +94,17 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// Logs a cache failure: the first at warn, the rest at debug (a broken
 /// cache fails for every shader).
 fn cache_failed(e: &anyhow::Error) {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if WARNED.swap(true, Ordering::Relaxed) {
-        tracing::debug!(error = format!("{e:#}"), "shader cache failed; translating without it");
-    } else {
+    static FAILED: crate::warn::Warning = crate::warn::Warning::new(
+        concat!(file!(), ":", line!()),
+        "shader cache failed; translating without it",
+    );
+    let mut first = false;
+    FAILED.hit(|| {
+        first = true;
         tracing::warn!(error = format!("{e:#}"), "shader cache failed; translating without it");
+    });
+    if !first {
+        tracing::debug!(error = format!("{e:#}"), "shader cache failed; translating without it");
     }
 }
 

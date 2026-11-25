@@ -1,5 +1,6 @@
 use super::{This, host_list, with_state};
 use crate::draw::{IndexView, VertexView};
+use crate::warn::warn_once;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
@@ -249,8 +250,7 @@ pub(super) unsafe extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32
 pub(super) unsafe extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
     super::count_draw();
     if y * z != 1 {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+        warn_once!("a mesh dispatch with y or z groups", x, y, z);
     }
     // SAFETY: as this function's contract gives them.
     unsafe { with_state(this, |list, s| s.dispatch_mesh(list, x)) };
@@ -271,8 +271,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh_x(
 ) {
     super::count_draw();
     if indirect != 0 {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+        warn_once!("indirect mesh dispatches dropped");
         crate::draw::dropped_for(crate::pipeline::drops::Cause::IndirectMesh);
         return;
     }
