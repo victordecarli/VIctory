@@ -89,7 +89,12 @@ GPUs with 32-lane waves ([#47](https://github.com/victordecarli/VIctory/issues/4
   So do programs whose LDS accesses every lane runs (with a group barrier
   before each), and programs that write a scalar in a lane branch and do
   not read it past that branch (`f09e903`,
-  [#63](https://github.com/victordecarli/VIctory/pull/63)).
+  [#63](https://github.com/victordecarli/VIctory/pull/63)). Their wave
+  reductions and prefix sums combine both waves; a lane branch or a loop
+  lanes leave on their own is taken as the console's one decision for the
+  wave, so both waves go the same way; `v_readfirstlane` reads the
+  console wave's first lane in EXEC (`e9fac6b`, `08af544`, `9a7e803`,
+  `f10c1f0`, [#78](https://github.com/victordecarli/VIctory/pull/78)).
   The [Shader translation](#shader-translation) block is measured for a
   32-lane GPU.
 
