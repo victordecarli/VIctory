@@ -92,6 +92,7 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod persist;
 mod root_layout;
 mod sampler;
 mod shader;
@@ -154,7 +155,8 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
-/// A translated shader and what the host binds for it.
+/// A translated shader and what the host binds for it. It is stored as the
+/// bytes of [`HostShader::to_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,

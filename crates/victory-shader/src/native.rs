@@ -356,7 +356,7 @@ pub enum RootType {
 }
 
 impl RootType {
-    fn from_raw(raw: u32) -> Self {
+    pub(crate) fn from_raw(raw: u32) -> Self {
         match raw {
             0 => RootType::Constants,
             1 => RootType::Descriptor,
@@ -365,6 +365,22 @@ impl RootType {
             5 => RootType::ResourceHeap,
             6 => RootType::SamplerHeap,
             n => RootType::Other(n),
+        }
+    }
+
+    /// The console's number for the type, which [`RootType::from_raw`]
+    /// reads back. `Other` carries a number no named type has when it comes
+    /// from a container; one built with a named type's number reads back as
+    /// that type.
+    pub(crate) fn to_raw(self) -> u32 {
+        match self {
+            RootType::Constants => 0,
+            RootType::Descriptor => 1,
+            RootType::Table => 3,
+            RootType::ImmediateSampler => 4,
+            RootType::ResourceHeap => 5,
+            RootType::SamplerHeap => 6,
+            RootType::Other(n) => n,
         }
     }
 }
