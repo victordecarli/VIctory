@@ -143,13 +143,18 @@ mod tests {
     use super::*;
 
     /// In a child process of the next test: calls an unimplemented import
-    /// that traps, with the crash log where `VICTORY_TRAP_LOG` says.
+    /// that traps, with the crash log where `VICTORY_TRAP_LOG` says and a
+    /// run log in `logs` beside it.
     #[test]
     fn trap_child() {
         let Some(log) = std::env::var_os("VICTORY_TRAP_LOG") else {
             return;
         };
-        crate::log_crashes_to(log.into());
+        let log = std::path::PathBuf::from(log);
+        if let Some(dir) = log.parent() {
+            victory_core::logging::init_run("info", &dir.join("logs"));
+        }
+        crate::log_crashes_to(log);
         let site = Box::leak(Box::new(ImportSite {
             dll: "probe.dll".into(),
             symbol: "Missing".into(),
@@ -172,5 +177,11 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         let named = text.contains("VIctory: unimplemented import probe.dll!Missing called");
         assert!(named, "crash log: {text:?}");
+        let runs: Vec<_> = std::fs::read_dir(dir.path().join("logs")).unwrap().collect();
+        assert_eq!(runs.len(), 1, "one run log");
+        let run = std::fs::read_to_string(runs[0].as_ref().unwrap().path()).unwrap();
+        let last = run.lines().last().unwrap_or_default();
+        assert!(last.contains(r#""message":"crash""#), "run log ends with the crash: {run}");
+        assert!(last.contains("unimplemented import probe.dll!Missing called"), "{last}");
     }
 }

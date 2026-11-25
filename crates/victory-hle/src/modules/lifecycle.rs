@@ -282,21 +282,23 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
 }
 
 /// In a relaunched `victory`: waits (30 s at most) for the process it
-/// replaces to be gone, so the two never share the title's files.
-pub fn wait_for_previous() {
+/// replaces to be gone, so the two never share the title's files, and
+/// returns that process's id (`None` if this run was not relaunched, or
+/// the id could not be read).
+pub fn wait_for_previous() -> Option<u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    let Some(handle) = std::env::var(RELAUNCHED_FROM).ok().and_then(|h| h.parse::<usize>().ok())
-    else {
-        return;
-    };
+    use windows_sys::Win32::System::Threading::{GetProcessId, WaitForSingleObject};
+    let handle = std::env::var(RELAUNCHED_FROM).ok().and_then(|h| h.parse::<usize>().ok())?;
     // SAFETY: removing our own variable before any other thread reads it.
     unsafe { std::env::remove_var(RELAUNCHED_FROM) };
     let handle = handle as HANDLE;
-    // SAFETY: the inherited process handle the previous process gave us.
+    // SAFETY: the inherited process handle the previous process gave us,
+    // closed only after its id is read.
     unsafe {
+        let pid = GetProcessId(handle);
         WaitForSingleObject(handle, 30_000);
         CloseHandle(handle);
+        (pid != 0).then_some(pid)
     }
 }
 

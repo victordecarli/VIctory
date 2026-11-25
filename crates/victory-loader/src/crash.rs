@@ -8,7 +8,8 @@
 //! exception too), is reported from the unhandled-exception filter
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
-//! often states the reason. Panics of ours go to the crash log too.
+//! often states the reason. Panics of ours go to the crash log too. Each
+//! report is also the last line of the run's log (`victory_core::logging`).
 
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{
@@ -63,6 +64,14 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
+#[allow(
+    clippy::print_stderr,
+    reason = "mid-crash, the subscriber may be held by the faulting thread; the console is the last resort"
+)]
+fn not_in_run_log(e: &std::io::Error) {
+    eprintln!("VIctory: crash not written to the run log: {e}");
+}
+
 #[allow(clippy::print_stderr, reason = "the report must reach the console even if logging is down")]
 pub fn log_crash(text: &str) {
     let text = format!(
@@ -74,8 +83,13 @@ pub fn log_crash(text: &str) {
     append_to_log(&text);
 }
 
+/// Appends `text` to the run's log (if the process has one) and to the
+/// crash log (if one was set).
 fn append_to_log(text: &str) {
     use std::io::Write;
+    if let Err(e) = victory_core::logging::append_crash(text) {
+        not_in_run_log(&e);
+    }
     let Some(file) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

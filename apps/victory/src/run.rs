@@ -16,15 +16,18 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    use victory_core::logging::SUMMARY;
+
     // A title that relaunched itself: the old process must be gone first.
-    victory_hle::modules::lifecycle::wait_for_previous();
+    let previous = victory_hle::modules::lifecycle::wait_for_previous();
+    crate::run_log::start("run", previous);
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
-        None => println!("build          unknown ({hash})"),
+        Some(build) => tracing::info!(target: SUMMARY, build = build.label, %hash, "title build"),
+        None => tracing::info!(target: SUMMARY, build = "unknown", %hash, "title build"),
     }
 
     let images = cfg.cache_subdir("images")?;
@@ -32,7 +35,12 @@ pub fn run(
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
-    println!("mapped at      {:#x} (preferred {:#x})", image.base(), image.info().image_base);
+    tracing::info!(
+        target: SUMMARY,
+        base = format_args!("{:#x}", image.base()),
+        preferred = format_args!("{:#x}", image.info().image_base),
+        "title mapped"
+    );
     let resolver =
         HleResolver::new(if strict { HostPolicy::none() } else { HostPolicy::default() });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
@@ -42,11 +50,12 @@ pub fn run(
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
-    println!(
-        "title          {:08X}, storage {} ({} MB)",
-        title.id,
-        storage.display(),
-        title.storage_bytes >> 20
+    tracing::info!(
+        target: SUMMARY,
+        id = format_args!("{:08X}", title.id),
+        storage = %storage.display(),
+        storage_mb = title.storage_bytes >> 20,
+        "title"
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
@@ -57,10 +66,10 @@ pub fn run(
         Console::SeriesX => victory_hle::console::Console::SeriesX,
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
-    println!("console        {}", victory_hle::console::current().name());
+    tracing::info!(target: SUMMARY, console = victory_hle::console::current().name(), "console");
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
-        println!("title dll      {name} at {:#x}", dll.base());
+        tracing::info!(target: SUMMARY, dll = %name, base = format_args!("{:#x}", dll.base()), "title dll");
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
 
@@ -70,15 +79,17 @@ pub fn run(
     };
     let with_dlls = WithTitleDlls { inner: &resolver, dlls: &dlls };
     let show = |name: &str, report: BindReport| {
-        println!(
-            "bound          {name}: {} hle, {} host, {} title, {} missing",
-            report.hle,
-            report.host,
-            report.title,
-            report.missing.len()
+        tracing::info!(
+            target: SUMMARY,
+            image = name,
+            hle = report.hle,
+            host = report.host,
+            title = report.title,
+            missing = report.missing.len(),
+            "imports bound"
         );
         for m in &report.missing {
-            println!("  missing      {}!{}", m.dll, m.symbol);
+            tracing::info!(target: SUMMARY, image = name, dll = %m.dll, symbol = %m.symbol, "import missing");
         }
     };
     for (name, dll) in &dlls {
@@ -87,7 +98,7 @@ pub fn run(
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
     if !execute {
-        println!("not executing (pass --execute to start the title)");
+        tracing::info!(target: SUMMARY, "not executing (pass --execute to start the title)");
         return Ok(());
     }
     victory_loader::report_crashes();
@@ -109,7 +120,7 @@ pub fn run(
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main.join().map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    println!("title exited with {code}");
+    tracing::info!(target: SUMMARY, code, "title exited");
     Ok(())
 }
 
@@ -217,7 +228,12 @@ impl LateDlls {
                 let old = victory_loader::WithTitleDlls { inner: &hle, dlls: &mapped };
                 let resolver = victory_loader::WithTitleDlls { inner: &old, dlls: &new };
                 for (name, dll) in &new {
-                    println!("title dll      {name} at {:#x} (loaded by the title)", dll.base());
+                    tracing::info!(
+                        target: victory_core::logging::SUMMARY,
+                        dll = %name,
+                        base = format_args!("{:#x}", dll.base()),
+                        "title dll loaded by the title"
+                    );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }

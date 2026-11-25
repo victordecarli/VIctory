@@ -73,13 +73,21 @@ pub fn start() {
     }
 }
 
+/// In the recorder's environment: the process to record and the file.
+fn recorder() -> Option<(u32, std::ffi::OsString)> {
+    let pid = std::env::var(TARGET).ok()?.parse().ok()?;
+    Some((pid, std::env::var_os("VICTORY_AUDIO_CAPTURE")?))
+}
+
+/// Whether this process is the recorder [`start`] starts.
+pub fn is_child() -> bool {
+    recorder().is_some()
+}
+
 /// In the recorder (a child started by [`start`]): records until the
 /// target exits and returns true; false in any other process.
 pub fn child() -> bool {
-    let (Some(pid), Some(path)) = (
-        std::env::var(TARGET).ok().and_then(|p| p.parse().ok()),
-        std::env::var_os("VICTORY_AUDIO_CAPTURE"),
-    ) else {
+    let Some((pid, path)) = recorder() else {
         return false;
     };
     if let Err(e) = record(pid, Path::new(&path)) {
