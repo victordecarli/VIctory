@@ -64,6 +64,9 @@ pub(crate) struct Shader {
     /// Shared, so a host pipeline's stages can hold it (see `host::Stage`).
     #[cfg(windows)]
     translated: OnceLock<Result<Arc<HostShader>, ShaderError>>,
+    /// Draws dropped because it does not translate (see [`drops`]).
+    #[cfg(windows)]
+    drops: drops::Count,
 }
 
 impl std::fmt::Debug for Shader {
@@ -89,6 +92,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                drops: drops::Count::default(),
             })
         })
         .clone()
@@ -194,11 +199,6 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
-/// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
-
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn parse_skip_hashes(value: &str) -> Vec<ShaderHash> {
@@ -239,43 +239,25 @@ pub(crate) unsafe fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(unsafe { pipeline(this) }).is_some()
 }
 
-/// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Counts a draw or dispatch of `this` the host did not run, where its
+/// cause lives (see [`drops`]).
+#[cfg(windows)]
 /// # Safety
 ///
 /// `this` is null or a live pipeline this module created.
-pub(crate) unsafe fn note_drop(this: This) {
-    let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
-    } else {
-        // SAFETY: non-null, so a live pipeline, per this function's contract.
-        let p = unsafe { pipeline(this) };
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
-    };
-    if let Some(why) = why {
-        note_why(why);
+pub(crate) unsafe fn count_drop(this: This) {
+    if this.is_null() {
+        drops::general(drops::Cause::NoPipeline);
+        return;
     }
-}
-
-/// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_why(why: String) {
-    let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
-}
-
-/// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn take_drops() -> Vec<(String, u64)> {
-    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
-    // Frame reports only show the first 40 reasons. Keep ties ordered so
-    // a HashMap iteration order change cannot change which reasons appear.
-    drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    drops
+    // SAFETY: non-null, so a live pipeline, per this function's contract.
+    let p = unsafe { pipeline(this) };
+    #[cfg(feature = "diagnostics")]
+    if skipped_shader(p).is_some() {
+        drops::general(drops::Cause::Skipped);
+        return;
+    }
+    drops::pipeline(&p.host);
 }
 
 /// The stage's container, if it has one.
@@ -531,6 +513,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(windows)]
+pub(crate) mod drops;
 mod hash;
 #[cfg(windows)]
 pub(crate) mod host;

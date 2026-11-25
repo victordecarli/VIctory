@@ -2,7 +2,7 @@
 //! the first 8 bytes of its BLAKE3, written as 16 lowercase hex digits.
 
 /// The first 8 bytes of a shader container's BLAKE3.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ShaderHash([u8; 8]);
 
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
