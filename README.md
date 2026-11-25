@@ -206,7 +206,12 @@ the audio recorder in `run_start` (`parent_pid`) and its parent's
 are logged whatever the filter: `run_start` (the BLAKE3 of `victory.exe`,
 the arguments and every `VICTORY_*` variable), the title's build, DLLs and
 missing imports, the host adapter and its wave lanes, the frame reports
-(every 5 s), the draws the host did not run, and a crash
+(`"frame report"` every 5 s: per frame over every frame since the last
+one, `fps`, `ms_per_frame`, `cpu_ms` preparing submissions with its
+`copies_ms`/`copies_mb` and `textures_ms`/`textures_mb`, `gpu_ms`
+waiting for the GPU, `copy_back_ms`/`copy_back_mb`, `draws_per_frame`,
+`dropped_per_frame`, `indirect_per_frame`; `pipelines_making` now; and
+the `frame` the drop lines also name), the draws the host did not run, and a crash
 (`"message":"crash"`, the report in `report`), which also goes to
 `crashes.log` as before. A dropped draw is counted where its cause lives,
 in every build: on the shader that does not translate (with the

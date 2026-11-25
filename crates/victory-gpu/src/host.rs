@@ -251,6 +251,8 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+mod frame_report;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1492,7 +1494,11 @@ struct Meter {
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
+    /// When the frame report was last logged, and the frames presented and
+    /// draws done since.
     logged: std::time::Instant,
+    logged_frames: u32,
+    logged_drawn: u64,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -1507,6 +1513,8 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            logged_frames: 0,
+            logged_drawn: crate::draw::drawn(),
             caption: None,
         }
     }
@@ -1516,6 +1524,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        self.logged_frames += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -1530,28 +1539,29 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] =
-            [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] =
-            [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
-            tracing::info!(
-                target: crate::SUMMARY,
-                "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect",
-                making = crate::pipeline::making()
-            );
+        // The report covers every frame since the last one, not the
+        // caption's last second.
+        let since_logged = self.logged.elapsed();
+        if since_logged >= std::time::Duration::from_secs(5) {
+            let take = |counter: &std::sync::atomic::AtomicU64| counter.swap(0, Ordering::Relaxed);
+            let counts = frame_report::Counts {
+                frames: self.logged_frames,
+                seconds: since_logged.as_secs_f64(),
+                draws: drawn - self.logged_drawn,
+                submission_us: SUBMISSION_US.each_ref().map(take),
+                preparing: PREPARING.each_ref().map(take),
+                copy_back: COPY_BACK.each_ref().map(take),
+                dropped: crate::draw::take_dropped(),
+                indirect: crate::list::take_indirect(),
+            };
+            (self.logged, self.logged_frames, self.logged_drawn) =
+                (std::time::Instant::now(), 0, drawn);
+            frame_report::FrameReport::per_frame(
+                &counts,
+                crate::pipeline::making(),
+                crate::frame::current(),
+            )
+            .log();
             crate::pipeline::drops::report();
             #[cfg(feature = "diagnostics")]
             crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
