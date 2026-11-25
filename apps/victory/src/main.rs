@@ -139,9 +139,9 @@ fn main() -> Result<()> {
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`: a
     // process of its own, with a log file of its own.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if victory_hle::modules::audio::capture::is_child() {
+    if let Some(parent) = victory_hle::modules::audio::capture::parent() {
         start_run_log();
-        run_log::start("audio-capture", None);
+        run_log::start("audio-capture", None, Some(parent));
         victory_hle::modules::audio::capture::child();
         return Ok(());
     }

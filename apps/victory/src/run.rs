@@ -20,7 +20,7 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     let previous = victory_hle::modules::lifecycle::wait_for_previous();
-    crate::run_log::start("run", previous);
+    crate::run_log::start("run", previous, None);
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
