@@ -218,9 +218,12 @@ audio recorder are processes of their own) to
 `<data_dir>/logs/run-<UTC time>-<pid>.jsonl`, keeping the newest 20: one
 JSON object per line, the event's fields beside `timestamp` (UTC),
 `level`, `target`, `threadId` and `threadName`. The console's first line
-names the file. Events with the target `victory::summary` are logged
-whatever the filter: `run_start` (the BLAKE3 of `victory.exe`, the
-arguments and every `VICTORY_*` variable), the title's build, DLLs and
+names the file. A process names the other's id in both logs: a relaunch
+in `run_start` (`previous_pid`) and the old process's `relaunched` line,
+the audio recorder in `run_start` (`parent_pid`) and its parent's
+`audio capture started` line. Events with the target `victory::summary`
+are logged whatever the filter: `run_start` (the BLAKE3 of `victory.exe`,
+the arguments and every `VICTORY_*` variable), the title's build, DLLs and
 missing imports, the host adapter and its wave lanes, the frame reports
 (every 5 s), the draws the host did not run, and a crash
 (`"message":"crash"`, the report in `report`), which also goes to
