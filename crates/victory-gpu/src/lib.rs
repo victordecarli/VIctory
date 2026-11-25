@@ -16,6 +16,8 @@
 //! presented through the queue ([`queue`]) on a host window and swap chain
 //! of our own.
 
+#[cfg(windows)]
+mod adapter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;

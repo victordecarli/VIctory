@@ -181,7 +181,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            device = Some(crate::adapter::create_device()?);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug.then(|| device.cast::<ID3D12InfoQueue>().ok()).flatten();
