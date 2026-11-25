@@ -203,10 +203,16 @@ names the file. Events with the target `victory::summary` are logged
 whatever the filter: `run_start` (the BLAKE3 of `victory.exe`, the
 arguments and every `VICTORY_*` variable), the title's build, DLLs and
 missing imports, the host adapter and its wave lanes, the frame reports
-(every 5 s, with the reasons draws were dropped in a `diagnostics`
-build), and a crash (`"message":"crash"`, the report in
-`report`), which also goes to `crashes.log` as before. For example, with
-`jq`:
+(every 5 s), the draws the host did not run, and a crash
+(`"message":"crash"`, the report in `report`), which also goes to
+`crashes.log` as before. A dropped draw is counted where its cause lives,
+in every build: on the shader that does not translate (with the
+translator's error and its `class`), on the pipeline still being made,
+refused by the host or not prepared, or by a general `cause` (no pipeline
+set, indirect arguments the host cannot read). Each shader, pipeline and
+cause logs a `"first drop"` line once, and each frame report is followed
+by `"drop totals"` and the run's totals for the 40 costliest of each.
+For example, with `jq`:
 `jq -c 'select(.target == "victory::summary")' run-*.jsonl`.
 
 ## Debugging

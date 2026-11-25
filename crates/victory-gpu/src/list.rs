@@ -1158,12 +1158,8 @@ unsafe extern "system" fn execute_indirect(
             })
         };
     } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
-        crate::pipeline::note_why(format!(
-            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
-            address.is_some(),
-            count.is_null() || counter.is_some()
-        ));
+        #[cfg(windows)]
+        crate::pipeline::drops::general(crate::pipeline::drops::Cause::IndirectLayout);
     }
     if ran {
         return;

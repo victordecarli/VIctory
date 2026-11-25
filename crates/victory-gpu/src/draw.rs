@@ -116,12 +116,13 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
-#[cfg(feature = "diagnostics")]
+/// Counts a draw not run on the host where its cause lives, and marks the
+/// last traced draw (diagnostics).
 fn dropped(pipeline: usize) {
     // SAFETY: `pipeline` is the pipeline the title set, which it keeps alive
     // while a list uses it.
-    unsafe { crate::pipeline::note_drop(pipeline as This) };
+    unsafe { crate::pipeline::count_drop(pipeline as This) };
+    #[cfg(feature = "diagnostics")]
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -525,7 +526,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
             // while a list uses it.
-            unsafe { crate::pipeline::note_drop(self.pipeline as This) };
+            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
             return;
         }
         // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
@@ -537,12 +538,9 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
             // while a list uses it.
-            unsafe {
-                crate::pipeline::note_drop(self.pipeline as This)
-            };
+            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
             return;
         };
         if !p.compute {
@@ -551,6 +549,9 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+            // while a list uses it.
+            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -621,7 +622,6 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -866,7 +866,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -955,7 +954,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -982,27 +980,24 @@ impl State {
         if unsafe { crate::pipeline::is_skipped(self.pipeline as This) } {
             // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
             // while a list uses it.
-            unsafe { crate::pipeline::note_drop(self.pipeline as This) };
+            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
             return false;
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        use crate::pipeline::drops::{Cause, general as why};
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
-            why("arguments outside title buffers");
+            why(Cause::IndirectArguments);
             return false;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
-                    why("count outside title buffers");
+                    why(Cause::IndirectCount);
                     return false;
                 }
             },
@@ -1012,7 +1007,7 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
-            why("no host signature");
+            why(Cause::IndirectSignature);
             return false;
         };
         args.refresh(list, arguments, len);
@@ -1021,7 +1016,7 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            why(Cause::IndirectUnbounded);
             return false;
         }
         self.host_pipeline = 0;
@@ -1039,15 +1034,9 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &args.buffer);
-            #[cfg(feature = "diagnostics")]
             // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
             // while a list uses it.
-            match unsafe { crate::pipeline::host_pipeline(self.pipeline as This) } {
-                // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
-                // while a list uses it.
-                None => unsafe { crate::pipeline::note_drop(self.pipeline as This) },
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
-            }
+            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
             return false;
         }
         #[cfg(feature = "diagnostics")]

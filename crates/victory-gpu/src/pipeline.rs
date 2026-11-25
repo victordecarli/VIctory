@@ -21,8 +21,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(windows)]
 use victory_shader::emit::HostShader;
 
+#[cfg(windows)]
+use victory_shader::ShaderError;
+
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+use hash::ShaderHash;
 
 const PIPELINE_IIDS: [Iid; 4] = [
     guid(0x765a30f3, 0xf624, 0x4c6f, [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45]),
@@ -54,12 +58,15 @@ pub(crate) struct ComputeHead {
 /// same bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
-    /// The first 8 bytes of its BLAKE3, as logged.
-    pub(crate) hash: String,
+    /// Its name in logs.
+    pub(crate) hash: ShaderHash,
     container: Vec<u8>,
     /// Shared, so a host pipeline's stages can hold it (see `host::Stage`).
     #[cfg(windows)]
-    translated: OnceLock<Option<Arc<HostShader>>>,
+    translated: OnceLock<Result<Arc<HostShader>, ShaderError>>,
+    /// Draws dropped because it does not translate (see [`drops`]).
+    #[cfg(windows)]
+    drops: drops::Count,
 }
 
 impl std::fmt::Debug for Shader {
@@ -81,10 +88,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                hash: ShaderHash::of(&full),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                drops: drops::Count::default(),
             })
         })
         .clone()
@@ -113,9 +122,10 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
-                done.ok().map(Arc::new)
+                done.map(Arc::new)
             })
             .as_ref()
+            .ok()
     }
 }
 
@@ -189,32 +199,26 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
-/// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
-
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+fn parse_skip_hashes(value: &str) -> Vec<ShaderHash> {
     value
         .split(',')
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
-            if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                Some(hash.to_ascii_lowercase())
-            } else {
+            let parsed = ShaderHash::parse(hash);
+            if parsed.is_none() {
                 tracing::warn!(hash, "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes");
-                None
             }
+            parsed
         })
         .collect()
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+fn skipped_shader(p: &Pipeline) -> Option<ShaderHash> {
+    static HASHES: OnceLock<Vec<ShaderHash>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
@@ -222,7 +226,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders.iter().find(|shader| hashes.contains(&shader.hash)).map(|shader| shader.hash.as_str())
+    p.shaders.iter().map(|shader| shader.hash).find(|hash| hashes.contains(hash))
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -235,43 +239,25 @@ pub(crate) unsafe fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(unsafe { pipeline(this) }).is_some()
 }
 
-/// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Counts a draw or dispatch of `this` the host did not run, where its
+/// cause lives (see [`drops`]).
+#[cfg(windows)]
 /// # Safety
 ///
 /// `this` is null or a live pipeline this module created.
-pub(crate) unsafe fn note_drop(this: This) {
-    let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
-    } else {
-        // SAFETY: non-null, so a live pipeline, per this function's contract.
-        let p = unsafe { pipeline(this) };
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
-    };
-    if let Some(why) = why {
-        note_why(why);
+pub(crate) unsafe fn count_drop(this: This) {
+    if this.is_null() {
+        drops::general(drops::Cause::NoPipeline);
+        return;
     }
-}
-
-/// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_why(why: String) {
-    let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
-}
-
-/// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn take_drops() -> Vec<(String, u64)> {
-    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
-    // Frame reports only show the first 40 reasons. Keep ties ordered so
-    // a HashMap iteration order change cannot change which reasons appear.
-    drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    drops
+    // SAFETY: non-null, so a live pipeline, per this function's contract.
+    let p = unsafe { pipeline(this) };
+    #[cfg(feature = "diagnostics")]
+    if skipped_shader(p).is_some() {
+        drops::general(drops::Cause::Skipped);
+        return;
+    }
+    drops::pipeline(&p.host);
 }
 
 /// The stage's container, if it has one.
@@ -528,6 +514,9 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+pub(crate) mod drops;
+mod hash;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
@@ -553,10 +542,10 @@ mod tests {
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
-        assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
-            ["0123456789abcdef", "0011223344556677"]
-        );
+        let parsed =
+            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,");
+        let written: Vec<String> = parsed.iter().map(ToString::to_string).collect();
+        assert_eq!(written, ["0123456789abcdef", "0011223344556677"]);
     }
 
     use super::*;

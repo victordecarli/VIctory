@@ -4,7 +4,9 @@
 //! that translated it (the BLAKE3 of our executable), so a rebuilt
 //! translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! atomically; an entry that does not read back is translated again, and a
+//! cache that cannot be read or written is translated around (logged), so
+//! only the translator decides that a shader has no translation.
 //!
 //! The entry is the bytes of [`HostShader::to_bytes`], whose format
 //! `victory-shader` owns.
@@ -14,6 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
+use victory_shader::ShaderError;
 use victory_shader::emit::HostShader;
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -77,13 +80,25 @@ fn build() -> &'static [u8; 32] {
 }
 
 /// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+/// there is one. Only the translator refuses a shader: a cache that fails
+/// is translated around.
+pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, ShaderError> {
     let lanes = host_lanes();
-    let translate = |c: &[u8]| victory_shader::emit::translate(c, lanes).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| victory_shader::emit::translate(c, lanes);
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
+    }
+}
+
+/// Logs a cache failure: the first at warn, the rest at debug (a broken
+/// cache fails for every shader).
+fn cache_failed(e: &anyhow::Error) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(error = format!("{e:#}"), "shader cache failed; translating without it");
+    } else {
+        tracing::warn!(error = format!("{e:#}"), "shader cache failed; translating without it");
     }
 }
 
@@ -94,7 +109,7 @@ struct Translate<F> {
     ran: AtomicBool,
 }
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl<F: Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
@@ -104,7 +119,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        // Typed, so `cached` can tell the translator's refusal from the
+        // cache's own failure.
+        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::new)?;
         Ok(shader.to_bytes())
     }
 }
@@ -113,12 +130,21 @@ fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
-    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> Result<HostShader, String> {
+    translate: impl Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync,
+) -> Result<HostShader, ShaderError> {
     let input = [&build[..], container].concat();
     let converter = Translate { translate, ran: AtomicBool::new(false) };
     for _ in 0..2 {
-        let path = cache.get_or_convert(&converter, &input).map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => match e.downcast::<ShaderError>() {
+                Ok(refused) => return Err(refused),
+                Err(e) => {
+                    cache_failed(&e);
+                    break;
+                }
+            },
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| HostShader::from_bytes(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -187,7 +213,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        let fail = |_: &[u8]| Err::<HostShader, _>(ShaderError::NotDxbc);
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }
 
@@ -201,6 +227,32 @@ mod tests {
             }
         }
         files
+    }
+
+    /// A translation the translator refuses comes back through the cache
+    /// with the translator's own error, not as text.
+    #[test]
+    fn a_refused_translation_keeps_its_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let unsupported = || ShaderError::Unsupported { offset: 0x40, what: "v_example" };
+        let refuse = |_: &[u8]| Err::<HostShader, _>(unsupported());
+        let refused = cached(&cache, &[7; 32], b"a container", refuse);
+        assert_eq!(refused, Err(unsupported()));
+    }
+
+    /// A cache that cannot store the translation still hands it over: the
+    /// shader translated, so its draws must not be dropped.
+    #[test]
+    fn a_cache_that_cannot_store_still_returns_the_translation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let cache = Cache::open(&root).unwrap();
+        // A file where the cache's folder was: nothing can be written there.
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::write(&root, b"not a folder").unwrap();
+        let translate = |_: &[u8]| Ok(shader());
+        assert_eq!(cached(&cache, &[7; 32], b"a container", translate), Ok(shader()));
     }
 
     /// A host of other wave lanes translates differently: its entries are
