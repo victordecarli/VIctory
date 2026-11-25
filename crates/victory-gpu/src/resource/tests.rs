@@ -158,6 +158,40 @@ fn upload_footprints_follow_the_pc_rules() {
     assert_eq!(t, u64::MAX, "no second subresource");
 }
 
+/// The two 2560x1440 targets the title creates at its "press Enter"
+/// screen, as the run log shows them after `pc_format`, each with the
+/// clear value a render target comes with.
+#[cfg(windows)]
+#[test]
+fn full_screen_targets_get_a_host_texture() {
+    if crate::host::host().is_none() {
+        return; // no host GPU here
+    }
+    const RENDER_TARGET: u32 = 1;
+    const UNORDERED: u32 = 4;
+    // (format, flags asked, flags the host copy has): B5G5R5A1_UNORM has
+    // no typed UAV on PC, B4G4R4A4_UNORM no render target or UAV; a format
+    // the host supports in full keeps every flag.
+    let cases = [
+        (86, RENDER_TARGET | UNORDERED, RENDER_TARGET),
+        (115, RENDER_TARGET, 0),
+        (28, RENDER_TARGET | UNORDERED, RENDER_TARGET | UNORDERED),
+    ];
+    let wrong: Vec<_> = cases
+        .into_iter()
+        .filter_map(|(format, flags, kept)| {
+            let desc = ResourceDesc { flags, ..texture(2560, 1440, format, 1) };
+            let clear: [u32; 5] = [format, 0, 0, 0, 0];
+            // SAFETY: a whole clear value.
+            let made = unsafe { host_texture(&desc, 0, clear.as_ptr().cast()) };
+            // SAFETY: a live resource.
+            let has = made.map(|t| unsafe { t.GetDesc() }.Flags.0 as u32);
+            (has != Some(kept)).then_some((format, flags, has))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "(format, flags asked, host flags) {wrong:?}");
+}
+
 /// A 4x4 texture filled from a title buffer through our list and queue,
 /// then read back from the host GPU.
 #[cfg(windows)]
