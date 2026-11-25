@@ -5,7 +5,7 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-/// The fields both forms share.
+/// The description's fields the host sampler is made from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Fields {
     /// Point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3.
