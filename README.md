@@ -48,7 +48,9 @@ What each part does today and what it still needs:
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+`rust-toolchain.toml`). With more than one GPU, the title runs on the
+highest-performance hardware one (DXGI's order: external, discrete, then
+integrated); the log names it at start-up (`host device adapter`).
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
