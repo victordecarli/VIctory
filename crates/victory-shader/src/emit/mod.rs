@@ -6,6 +6,15 @@
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
+//! * **The root signature** is [`HostRootLayout`]'s, the one place that
+//!   decides it. Per stage, in the order given: the user data (a root
+//!   constants parameter, only when the shader reads any), the root CBVs in
+//!   the order of [`HostShader::root_cbvs`], then the root SRVs; every
+//!   parameter is visible to its own stage only (all stages for compute), so
+//!   a view two stages read is one parameter per stage, and root views are
+//!   `DATA_VOLATILE`. Static samplers are `s<n>` per stage. Only a compute
+//!   layout leaves out the input assembler flag. Neither the parameter
+//!   indices nor the flags are part of the shader: read them from the layout.
 //! * **User data** at `b0, space 0` (32-bit root constants or a constant
 //!   buffer, per stage): dword `index` holds a root parameter's value, as
 //!   [`UserData`] lists. A root-constant dword is the constant. A
@@ -83,6 +92,7 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod root_layout;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -101,6 +111,10 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use root_layout::{
+    BoundView, GraphicsStage, HostRootLayout, HostRootParam, HostRootStage, HostSampler, ParamKind,
+    RootConstants, RootFlags, RootView, Visibility,
+};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 

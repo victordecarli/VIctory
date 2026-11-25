@@ -274,7 +274,7 @@ fn each_lds_access_of_a_split_program_waits_for_both_halves() {
 /// Running the split programs on the host GPU, which must take waves of 32.
 #[cfg(windows)]
 mod card {
-    use super::super::host::{Dispatch, Host, Root, View};
+    use super::super::host::{Dispatch, Host, View};
     use super::super::validator;
     use super::*;
 
@@ -299,17 +299,17 @@ mod card {
             eprintln!("no SM 6.6 hardware device; not run");
             return None;
         };
-        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        let Ok(pipe) = host.compute_pipeline(&shader) else {
             eprintln!("the device does not take 32-lane waves; not run");
             return None;
         };
-        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let ud = pipe.user_data(0, |_| 0);
         let out = host
             .dispatch(
-                &root,
-                &pso,
+                &pipe.root,
+                &pipe.pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots: ud.into_iter().collect(),
                     views: &[View::RawUav(64)],
                     samplers: &[],
                     groups: [1, 1, 1],

@@ -8,6 +8,9 @@ use crate::ShaderError;
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
+/// The register of the user data: `b<USER_DATA_REGISTER>` in
+/// [`USER_DATA_SPACE`].
+pub const USER_DATA_REGISTER: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
@@ -167,7 +170,7 @@ impl Shader {
     pub fn user_data_handle(&mut self) -> V {
         let bind = [
             self.m.i32(0),
-            self.m.i32(0),
+            self.m.i32(USER_DATA_REGISTER),
             self.m.i32(USER_DATA_SPACE),
             self.m.i8(2), // CBV
         ];
@@ -315,7 +318,7 @@ impl Shader {
                     Some(self.m.md_value(u)),
                     Some(empty),
                     Some(i32c(&mut self, USER_DATA_SPACE)),
-                    Some(i32c(&mut self, 0)),
+                    Some(i32c(&mut self, USER_DATA_REGISTER)),
                     Some(i32c(&mut self, 1)),
                     Some(i32c(&mut self, ud_size)),
                     None,
@@ -324,7 +327,7 @@ impl Shader {
                 bindings.push(Binding {
                     kind: 2,
                     space: USER_DATA_SPACE,
-                    register: 0,
+                    register: USER_DATA_REGISTER,
                     dxil_kind: 13,
                 });
             }

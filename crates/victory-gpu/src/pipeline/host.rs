@@ -3,13 +3,15 @@
 //! signature of our own that the translated shaders' bindings define
 //! (`victory_shader::emit`): per stage one block of root constants for the
 //! user data, root views for the title's root views, static samplers for
-//! the immediate samplers, and directly indexed heaps.
+//! the immediate samplers, and directly indexed heaps. The root signature
+//! is `HostRootLayout`'s, made by `emit::host::root_signature`; a [`Stage`]
+//! keeps where its bindings are in it.
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use victory_shader::emit::host::root_signature;
+use victory_shader::emit::{GraphicsStage, HostRootLayout, HostRootStage};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
@@ -251,25 +253,24 @@ pub(crate) struct Stage {
     /// The shader's translation, held from construction (private: a stage
     /// exists only through [`Stage::new`], so it always has one).
     translated: Arc<Translated>,
-    /// The root parameter of its user data, and its size in dwords.
-    pub(crate) user_data: Option<(u32, u32)>,
-    /// Root parameters of its root views: (title root parameter, ours).
-    pub(crate) root_cbvs: Vec<(u8, u32)>,
-    pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// Where its user data and root views are in the root signature.
+    root: HostRootStage,
 }
 
 impl Stage {
-    /// A stage of `shader` with no bindings yet; `None` if the shader does
-    /// not translate (logged once by [`Shader::translated`]).
-    fn new(shader: &Arc<Shader>) -> Option<Stage> {
+    /// A stage of `shader` whose bindings are `root`; `None` if the shader
+    /// does not translate (logged once by [`Shader::translated`]).
+    fn new(shader: &Arc<Shader>, root: HostRootStage) -> Option<Stage> {
         Some(Stage {
             translated: Arc::clone(shader.translated()?),
             #[cfg(feature = "diagnostics")]
             shader: Arc::clone(shader),
-            user_data: None,
-            root_cbvs: Vec::new(),
-            root_srvs: Vec::new(),
+            root,
         })
+    }
+
+    pub(crate) fn root(&self) -> &HostRootStage {
+        &self.root
     }
 
     pub(crate) fn translated(&self) -> &Translated {
@@ -324,96 +325,44 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
-        let stages = if let Some(cs) = compute {
-            vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
+        let graphics = if compute.is_some() {
+            Vec::new()
         } else {
             let first = match (mesh, find("vertex")) {
-                (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
-                (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+                (Some(ms), _) => (ms, GraphicsStage::Mesh),
+                (None, Some(vs)) => (vs, GraphicsStage::Vertex),
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(find("pixel").map(|ps| (ps, GraphicsStage::Pixel)));
             stages
+        };
+        let stages: Vec<&Arc<Shader>> = match compute {
+            Some(cs) => vec![cs],
+            None => graphics.iter().map(|&(s, _)| s).collect(),
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
-        for (s, _) in &stages {
-            s.translated()?;
-        }
         let host = host()?;
 
         // The root signature the translated shaders' bindings define.
-        let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
-        let mut samplers = Vec::new();
-        let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
-            let mut stage = Stage::new(shader)?;
-            let translated = Arc::clone(&stage.translated);
-            let t = &translated.host;
-            let dwords = t.user_data_dwords();
-            if dwords > 0 {
-                stage.user_data = Some((params.len() as u32, dwords));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
-                            Num32BitValues: dwords,
-                        },
-                    },
-                    ShaderVisibility: visibility,
-                });
+        let layout = match compute {
+            Some(cs) => HostRootLayout::compute(&cs.translated()?.host),
+            None => {
+                let typed = graphics
+                    .iter()
+                    .map(|&(s, kind)| s.translated().map(|t| (&t.host, kind)))
+                    .collect::<Option<Vec<_>>>()?;
+                HostRootLayout::graphics(&typed)
             }
-            for (slots, kind, out) in [
-                (
-                    &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
-                    &mut stage.root_cbvs,
-                ),
-                (
-                    &t.root_srvs,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    &mut stage.root_srvs,
-                ),
-            ] {
-                for &slot in slots {
-                    out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
-                }
-            }
-            for (n, s) in t.static_samplers.iter().enumerate() {
-                samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
-                    AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
-                    AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
-                    AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
-                    ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
-                    BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
-                    MinLOD: s.min_lod,
-                    MaxLOD: s.max_lod,
-                    ShaderRegister: n as u32,
-                    RegisterSpace: SAMPLER_SPACE,
-                    ShaderVisibility: visibility,
-                });
-            }
-            bound.push(stage);
-        }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        };
+        let bound = stages
+            .iter()
+            .zip(layout.stages())
+            .map(|(s, root)| Stage::new(s, root.clone()))
+            .collect::<Option<Vec<_>>>()?;
+        let (root, root_blob) = match root_signature(&host.device, &layout) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -421,7 +370,7 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            stages.get(i).and_then(|s| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
@@ -631,53 +580,6 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
-fn root_signature(
-    device: &ID3D12Device,
-    params: &[D3D12_ROOT_PARAMETER1],
-    samplers: &[D3D12_STATIC_SAMPLER_DESC],
-    compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
-    let input = if compute {
-        D3D12_ROOT_SIGNATURE_FLAG_NONE
-    } else {
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-    };
-    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
-        Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
-        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
-            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                NumParameters: params.len() as u32,
-                pParameters: params.as_ptr(),
-                NumStaticSamplers: samplers.len() as u32,
-                pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
-            },
-        },
-    };
-    // SAFETY: the description points at live arrays; the blob is read in
-    // full before it is released.
-    unsafe {
-        let mut blob: Option<ID3DBlob> = None;
-        let mut error: Option<ID3DBlob> = None;
-        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
-            if let Some(error) = error {
-                let text = std::slice::from_raw_parts(
-                    error.GetBufferPointer().cast::<u8>(),
-                    error.GetBufferSize(),
-                );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
-            }
-            return Err(e);
-        }
-        let blob = blob.ok_or_else(windows::core::Error::empty)?;
-        let bytes =
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
-    }
-}
-
 // Windows-only like the whole module (`pipeline.rs` declares it under
 // `#[cfg(windows)]`); the attribute repeats that where the test is read.
 #[cfg(test)]
@@ -692,7 +594,7 @@ mod tests {
     fn untranslated_shader_makes_no_stage_or_pipeline() {
         let shader = super::super::shader("vertex", b"not a shader container");
         assert!(shader.translated().is_none());
-        assert!(Stage::new(&shader).is_none());
+        assert!(Stage::new(&shader, HostRootStage::default()).is_none());
         assert!(HostPipeline::new(&[shader], None).is_none());
     }
 }

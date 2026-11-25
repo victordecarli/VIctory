@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -180,24 +180,21 @@ fn run_cases(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
+        let pipe = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         for (i, &inputs) in cases.iter().enumerate() {
-            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-            for u in &shader.user_data {
-                ud[u.index as usize] = match (u.root, u.slot) {
-                    (RootType::Constants, 0) => inputs[u.dword as usize],
-                    (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
-                };
-            }
+            let ud = pipe.user_data(0, |u| match (u.root, u.slot) {
+                (RootType::Constants, 0) => inputs[u.dword as usize],
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            });
             let out = host
                 .dispatch(
-                    &root,
-                    &pso,
+                    &pipe.root,
+                    &pipe.pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
+                        roots: ud.into_iter().collect(),
                         views: &[View::RawUav(1)],
                         samplers: &[],
                         groups: [1, 1, 1],

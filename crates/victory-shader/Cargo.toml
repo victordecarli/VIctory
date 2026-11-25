@@ -12,7 +12,9 @@ thiserror.workspace = true
 miniz_oxide.workspace = true
 
 [features]
-# Host D3D12 pipeline checks (`emit::host`).
+# Host D3D12 root signatures and pipeline checks (`emit::host`): the tests,
+# `victory translate` and `victory-gpu`, which builds the game's root
+# signatures with it.
 host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []

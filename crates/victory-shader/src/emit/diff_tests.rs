@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::host::{Draw, Host, Root};
-use super::{HostShader, RootType, translate};
+use super::{RootType, RootView, UserData, translate};
 
 const RS: &str = "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), \
                   RootConstants(num32BitConstants=4, b0), \
@@ -689,23 +689,20 @@ fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec
     std::fs::read(output).unwrap()
 }
 
-/// Root arguments for a translated stage: user data from the root values.
-fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
-    let mut data = vec![0; (s.user_data_dwords() as usize).max(1)];
-    for u in &s.user_data {
-        data[u.index as usize] = match (u.root, u.slot) {
-            (RootType::Constants, 0) => k[u.dword as usize],
-            // The texture and sampler tables start at heap index 1, the UAV
-            // table (compute) at 5, in the console's units.
-            (RootType::Table, 1) => 32,
-            (RootType::Table, 2) => 16,
-            (RootType::Table, 3) => 5 * 32,
-            // The typed views of `raw` (compute) from 9.
-            (RootType::Table, 6) => 9 * 32,
-            other => panic!("unexpected user data {other:?}"),
-        };
+/// The value of one user-data dword of a translated stage, from the root
+/// values.
+fn user_data(u: &UserData, k: &[u32; 4]) -> u32 {
+    match (u.root, u.slot) {
+        (RootType::Constants, 0) => k[u.dword as usize],
+        // The texture and sampler tables start at heap index 1, the UAV
+        // table (compute) at 5, in the console's units.
+        (RootType::Table, 1) => 32,
+        (RootType::Table, 2) => 16,
+        (RootType::Table, 3) => 5 * 32,
+        // The typed views of `raw` (compute) from 9.
+        (RootType::Table, 6) => 9 * 32,
+        other => panic!("unexpected user data {other:?}"),
     }
-    data
 }
 
 #[test]
@@ -785,15 +782,16 @@ fn translated_shaders_draw_as_pc_ones() {
                 v.validate(&mut s.dxil.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
             }
         }
-        let (root_t, pso_t) = host.pipeline(&vs_c, &ps_c).unwrap();
+        let ours_pipe = host.pipeline(&vs_c, &ps_c).unwrap();
         let ours = host
             .draw(
-                &root_t,
-                &pso_t,
-                &draw(vec![
-                    (0, Root::Constants(user_data(&vs_c, &k))),
-                    (1, Root::Constants(user_data(&ps_c, &k))),
-                ]),
+                &ours_pipe.root,
+                &ours_pipe.pso,
+                &draw(
+                    (0..2)
+                        .filter_map(|stage| ours_pipe.user_data(stage, |u| user_data(u, &k)))
+                        .collect(),
+                ),
             )
             .unwrap();
 
@@ -880,16 +878,15 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         ) {
             v.validate(&mut ms_c.dxil.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
-        let (root_t, pso_t) = host.mesh_pipeline(&ms_c, &ps_c).unwrap();
+        let ours_pipe = host.mesh_pipeline(&ms_c, &ps_c).unwrap();
         let ours = host
             .draw(
-                &root_t,
-                &pso_t,
+                &ours_pipe.root,
+                &ours_pipe.pso,
                 &draw(
-                    vec![
-                        (0, Root::Constants(user_data(&ms_c, &k))),
-                        (1, Root::Constants(user_data(&ps_c, &k))),
-                    ],
+                    (0..2)
+                        .filter_map(|stage| ours_pipe.user_data(stage, |u| user_data(u, &k)))
+                        .collect(),
                     groups,
                 ),
             )
@@ -966,7 +963,7 @@ fn float_semantics_are_the_consoles() {
             outb.Store(64 + 4 * i, asuint(i == 3 ? cos(r) : sin(r)));
         }"#;
     let cs = translate(&compile(&console, &dir, src, "cs", "cs_6_5"), super::CONSOLE_WAVE).unwrap();
-    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    let pipe = host.compute_pipeline(&cs).unwrap();
     // 1e30, NaN, 3.5, 0.
     let k = [1e30f32.to_bits(), 0x7FC0_0000, 3.5f32.to_bits(), 0];
     let views = [
@@ -980,10 +977,10 @@ fn float_semantics_are_the_consoles() {
     ];
     let out = host
         .dispatch(
-            &root,
-            &pso,
+            &pipe.root,
+            &pipe.pso,
             &Dispatch {
-                roots: vec![(0, Root::Constants(user_data(&cs, &k)))],
+                roots: pipe.user_data(0, |u| user_data(u, &k)).into_iter().collect(),
                 views: &views,
                 samplers: &[],
                 groups: [1, 1, 1],
@@ -1128,7 +1125,7 @@ fn translated_compute_matches_pc() {
         ) {
             v.validate(&mut cs_c.dxil.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
-        let (root_t, pso_t) = match host.compute_pipeline(&cs_c) {
+        let ours_pipe = match host.compute_pipeline(&cs_c) {
             Ok(p) => p,
             // WARP runs no fixed wave size of 64.
             Err(e) if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") => {
@@ -1137,17 +1134,16 @@ fn translated_compute_matches_pc() {
             }
             Err(e) => panic!("{name}: {e}"),
         };
-        // Our root views follow the user data in root parameter order.
-        let mut roots = vec![(0, Root::Constants(user_data(&cs_c, &k)))];
-        let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
-        root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
-        root_views.sort_unstable();
-        for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+        // The layout says where the user data and each root view went.
+        let mut roots: Vec<(u32, Root)> =
+            ours_pipe.user_data(0, |u| user_data(u, &k)).into_iter().collect();
+        for v in ours_pipe.layout.stages()[0].views() {
+            let srv = v.view == RootView::Srv;
+            assert_eq!(v.slot, 4 + u8::from(srv), "{name}: root view");
             let data = if srv { root_srv.clone() } else { root_cbv.clone() };
-            roots.push((1 + n as u32, Root::View { srv, data }));
+            roots.push((v.param, Root::View { srv, data }));
         }
-        let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
+        let ours = host.dispatch(&ours_pipe.root, &ours_pipe.pso, &dispatch(roots));
         if name.starts_with("terminates") {
             match ours {
                 Ok(_) => eprintln!("{name}: finished"),
