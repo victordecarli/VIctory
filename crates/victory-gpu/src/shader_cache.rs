@@ -203,6 +203,8 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    // 0: no wave size required (`WaveSize` is never 0).
+    word(&mut out, s.wave_size.unwrap_or(0));
     out
 }
 
@@ -259,6 +261,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let wave_size = match r.word()? {
+        0 => None,
+        n => Some(n),
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -267,6 +273,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        wave_size,
     })
 }
 
@@ -283,6 +290,7 @@ mod tests {
             static_samplers: vec![StaticSampler::from_words([0x400, 0xc0_0000, 0x18f0_0000, 0])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            wave_size: Some(64),
         }
     }
 
@@ -338,5 +346,16 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    /// The wave size a shader requires comes back from the cache, absent or
+    /// not; an entry written before it was stored reads as damaged (a miss).
+    #[test]
+    fn entries_keep_the_wave_size() {
+        let none = HostShader { wave_size: None, ..shader() };
+        assert_eq!(decode(&encode(&none)), Some(none));
+        let bytes = encode(&shader());
+        let before_the_field = &bytes[..bytes.len() - 4];
+        assert_eq!(decode(before_the_field), None);
     }
 }

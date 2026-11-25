@@ -157,6 +157,11 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// The lanes per wave the shader requires (`WaveSize`), if any: a
+    /// console wave64 compute program that reads other lanes, or one wave
+    /// sharing LDS, needs the console's. A host whose waves have fewer lanes
+    /// refuses its pipeline.
+    pub wave_size: Option<u32>,
 }
 
 impl HostShader {
@@ -303,6 +308,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        wave_size: l.wave_size,
     })
 }
 
@@ -513,6 +519,39 @@ mod tests {
         }
     }
 
+    /// The lanes a compute program's waves must have travel with its
+    /// translation: a wave64 program that reads another lane needs the
+    /// console's 64 (a host whose waves have 32 refuses it); one whose lanes
+    /// read only their own needs none.
+    #[test]
+    fn a_compute_program_states_the_wave_size_it_needs() {
+        // One console wave of 64 threads, no LDS.
+        let emit_cs = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 2,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [64, 1, 1] }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let container = crate::dxbc::build(&[]);
+            let c = Container::parse(&container).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap()
+        };
+        // v_readlane_b32 s2, v0, 3; s_endpgm
+        let other_lane = emit_cs(&[0xD760_0002, 0x0001_0700, 0xBF81_0000]);
+        assert_eq!(other_lane.wave_size, Some(64));
+        // v_mov_b32 v1, v0; s_endpgm
+        let own_lane = emit_cs(&[0x7E02_0300, 0xBF81_0000]);
+        assert_eq!(own_lane.wave_size, None);
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
@@ -553,6 +592,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            wave_size: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -563,6 +603,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                wave_size: None,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

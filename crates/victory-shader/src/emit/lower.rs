@@ -37,6 +37,8 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// The lanes per wave the program declares it needs (`WaveSize`).
+    pub wave_size: Option<u32>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -917,6 +919,7 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            wave_size: self.s.wave_size,
             dxil: self.s.finish().map_err(Stop::Fail)?,
             user_data,
             samplers: self.samplers,

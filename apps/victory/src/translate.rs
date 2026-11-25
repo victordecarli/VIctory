@@ -166,8 +166,9 @@ pub fn run(
         t.emitted, t.emit_programs, t.validated, t.pipelines
     );
     println!(
-        "             {} emitted of {} compute programs; {} validated, {} pipelines",
-        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
+        "             {} emitted of {} compute programs; {} validated, {} pipelines; \
+         {} need 64-lane waves (a 32-lane host refuses them)",
+        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines, t.cs_wave64
     );
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
@@ -319,6 +320,9 @@ fn program(
                 match emit::emit(container, p, &program, &s, &i, &r) {
                     Ok(shader) => {
                         *counters(t, p.stage)[1] += 1;
+                        if shader.stage == HwStage::Cs && shader.wave_size == Some(64) {
+                            t.cs_wave64 += 1;
+                        }
                         check(shader, t, checks, label);
                     }
                     Err(ShaderError::Unsupported { offset, what }) => t
