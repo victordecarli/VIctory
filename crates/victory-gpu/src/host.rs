@@ -1563,6 +1563,7 @@ impl Meter {
             )
             .log();
             crate::pipeline::drops::report();
+            crate::warn::report();
             #[cfg(feature = "diagnostics")]
             crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
         }

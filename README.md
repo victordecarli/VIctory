@@ -240,6 +240,12 @@ set, indirect arguments the host cannot read, a dispatch with a graphics
 pipeline, an indirect mesh dispatch). Each shader, pipeline and
 cause logs a `"first drop"` line once, and each frame report is followed
 by `"drop totals"` and the run's totals for the 40 costliest of each.
+A case the host skips or does not implement yet logs one `warn` line the
+first time; every case after it is counted, and each frame report is also
+followed by a `"warning total"` line for each such warning that had new
+cases since the previous report (`site`, `message`, `detail` when the
+warning is about one object or slot, `total` for the run, `since_last`,
+`frame`).
 For example, with `jq`:
 `jq -c 'select(.target == "victory::summary")' run-*.jsonl`.
 
