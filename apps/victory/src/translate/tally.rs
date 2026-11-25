@@ -52,6 +52,9 @@ pub(super) struct Tally {
     pub(super) exports: BTreeMap<&'static str, usize>,
     /// Exports still packed as f16 pairs after the export patch.
     pub(super) compressed: usize,
+    /// Every vertex and pixel (and other graphics stage) program found,
+    /// whichever stage stopped it: the base of a translated share.
+    pub(super) found: usize,
     /// Vertex and pixel programs every earlier stage handled, and how far
     /// emission got with them.
     pub(super) emit_programs: usize,
@@ -59,6 +62,7 @@ pub(super) struct Tally {
     pub(super) validated: usize,
     pub(super) pipelines: usize,
     /// The same for compute programs.
+    pub(super) cs_found: usize,
     pub(super) cs_programs: usize,
     pub(super) cs_emitted: usize,
     pub(super) cs_validated: usize,
@@ -67,6 +71,7 @@ pub(super) struct Tally {
     /// a host whose waves have 32 lanes (NVIDIA) refuses their pipelines.
     pub(super) cs_wave64: usize,
     /// The same for mesh programs.
+    pub(super) ms_found: usize,
     pub(super) ms_programs: usize,
     pub(super) ms_emitted: usize,
     pub(super) ms_validated: usize,
@@ -168,15 +173,18 @@ impl Tally {
             vertex_values,
             exports,
             compressed,
+            found,
             emit_programs,
             emitted,
             validated,
             pipelines,
+            cs_found,
             cs_programs,
             cs_emitted,
             cs_validated,
             cs_pipelines,
             cs_wave64,
+            ms_found,
             ms_programs,
             ms_emitted,
             ms_validated,
@@ -218,15 +226,18 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.compressed += compressed;
+        self.found += found;
         self.emit_programs += emit_programs;
         self.emitted += emitted;
         self.validated += validated;
         self.pipelines += pipelines;
+        self.cs_found += cs_found;
         self.cs_programs += cs_programs;
         self.cs_emitted += cs_emitted;
         self.cs_validated += cs_validated;
         self.cs_pipelines += cs_pipelines;
         self.cs_wave64 += cs_wave64;
+        self.ms_found += ms_found;
         self.ms_programs += ms_programs;
         self.ms_emitted += ms_emitted;
         self.ms_validated += ms_validated;

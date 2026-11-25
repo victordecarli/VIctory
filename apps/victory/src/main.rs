@@ -91,6 +91,10 @@ enum Command {
         /// waves of 32 do. The default, 64, splits nothing.
         #[arg(long, default_value_t = victory_shader::emit::CONSOLE_WAVE)]
         host_lanes: u32,
+        /// Also write the counts per kind of program as JSON to this file
+        /// (read by `cargo xtask progress --record`).
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -143,8 +147,8 @@ fn main() -> Result<()> {
         Command::ShaderInfo { paths, verbose, disasm } => {
             shader::run(paths, verbose || disasm, disasm)
         }
-        Command::Translate { paths, validate, pipelines, list, jobs, host_lanes } => {
-            translate::run(paths, validate, pipelines, list, jobs, host_lanes)
+        Command::Translate { paths, validate, pipelines, list, jobs, host_lanes, json } => {
+            translate::run(paths, validate, pipelines, list, jobs, host_lanes, json)
         }
         Command::Run { exe, unimplemented, strict, execute, console, title_args: _ } => {
             run::run(&exe, unimplemented, strict, execute, console)

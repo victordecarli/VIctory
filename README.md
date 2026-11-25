@@ -95,6 +95,7 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N] [--host-lanes N]
+                  [--json <file>]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -105,7 +106,9 @@ given: an unreadable file, a failed directory walk or a panic in a program
 each count as an infrastructure failure and are listed at the end. Files
 above 2 GiB are not read and are not failures: they are logged and counted
 in the `files` line. Shaders the translator cannot handle yet do not change
-the exit code.
+the exit code. `--json <file>` also writes the counts per kind of program
+(found, emitted as DXIL, and the compute programs emitted for 64-lane
+waves), aggregate numbers only.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
