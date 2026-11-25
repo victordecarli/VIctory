@@ -1434,9 +1434,14 @@ mod tests {
             crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue)
         };
         assert_eq!(created, S_OK);
-        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
         assert_eq!(
-            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            // SAFETY: this test's own locals, valid for the call.
+            unsafe { crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator) },
+            S_OK
+        );
+        assert_eq!(
+            // SAFETY: this test's own locals, valid for the call.
+            unsafe { crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list) },
             S_OK
         );
 

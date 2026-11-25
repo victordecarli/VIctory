@@ -113,7 +113,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
+    // SAFETY: `resource` is one this crate created, which the title keeps
+    // alive.
+    unsafe { crate::list::ensure_state(list, resource, COPY_DEST) };
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {

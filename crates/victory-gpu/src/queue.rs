@@ -141,7 +141,10 @@ unsafe extern "system" fn execute(_: This, count: u32, lists: *const This) {
         // SAFETY: non-null, and `count` pointers, per this function's
         // contract.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists.iter().filter_map(|&l| crate::list::host_list(l)).collect();
+        // SAFETY: each list is a live one this crate created, per this
+        // function's contract.
+        let host_lists: Vec<_> =
+            lists.iter().filter_map(|&l| unsafe { crate::list::host_list(l) }).collect();
         host.execute(&host_lists);
         return;
     }

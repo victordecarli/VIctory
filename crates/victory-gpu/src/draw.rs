@@ -394,10 +394,12 @@ impl State {
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
+            unsafe { crate::list::ensure_state(list, t as This, RENDER_TARGET) };
         }
         if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
+            unsafe { crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE) };
         }
         true
     }
@@ -1134,7 +1136,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             {
                 crate::texture::upload(list, *resource as This, t);
             }
-            crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
+            unsafe { crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE) };
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -1151,7 +1154,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
-            crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
+            unsafe { crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS) };
         }
         _ => {}
     }
