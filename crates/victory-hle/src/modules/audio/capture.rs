@@ -64,12 +64,14 @@ pub fn start() {
             }
         });
     }
-    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some()
-        && let Err(e) = std::env::current_exe().and_then(|exe| {
+    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some() {
+        let spawned = std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe).env(TARGET, std::process::id().to_string()).spawn()
-        })
-    {
-        tracing::warn!("audio capture not started: {e}");
+        });
+        match spawned {
+            Ok(child) => tracing::info!(pid = child.id(), "audio capture started"),
+            Err(e) => tracing::warn!("audio capture not started: {e}"),
+        }
     }
 }
 
@@ -79,9 +81,10 @@ fn recorder() -> Option<(u32, std::ffi::OsString)> {
     Some((pid, std::env::var_os("VICTORY_AUDIO_CAPTURE")?))
 }
 
-/// Whether this process is the recorder [`start`] starts.
-pub fn is_child() -> bool {
-    recorder().is_some()
+/// In the recorder [`start`] starts: the process that started it, which it
+/// records; `None` in any other process.
+pub fn parent() -> Option<u32> {
+    recorder().map(|(pid, _)| pid)
 }
 
 /// In the recorder (a child started by [`start`]): records until the
