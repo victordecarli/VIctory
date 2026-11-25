@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "complete": true,
+  "host_lanes": 32,
+  "vertex_pixel": {
+    "found": 14649,
+    "emitted": 12243
+  },
+  "compute": {
+    "found": 2734,
+    "emitted": 1441
+  },
+  "compute_wave64": 294,
+  "mesh": {
+    "found": 8765,
+    "emitted": 8214
+  },
+  "commit": "a63023112b",
+  "commit_date": "2026-11-25"
+}

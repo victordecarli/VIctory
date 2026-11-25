@@ -27,7 +27,7 @@ out and the gotchas local to it. This file still applies there.
 | `victory-gpu` | D3D12.X objects, command lists, GPU memory → host D3D12 | shader translation logic | compiles, with dead-code warnings |
 | `victory-hle` | console API implementations called by title code | format decoders (call `victory-formats`) | **no** (see the ratchet) |
 | `apps/victory` | CLI: inspect, census, translate, run | library logic that other crates need | no (depends on `victory-hle`) |
-| `xtask` | asset-policy check, citation check, Windows-target clippy (`wincheck`), code metrics (`audit-metrics`), git hooks | product code | yes |
+| `xtask` | asset-policy check, citation check, Windows-target clippy (`wincheck`), code metrics (`audit-metrics`), the README's shader progress block (`progress`), git hooks | product code | yes |
 
 Dependency direction (enforced by review, keep it acyclic and downward):
 
@@ -90,6 +90,15 @@ per-crate counts (text counts always; with `--lints`, clippy's counts
 outside tests, using `wincheck`'s setup), and grades each crate by the
 written rules in `xtask/src/audit/grade.rs`, giving a reason for each
 level. The JSON format is documented in `xtask/src/audit.rs`.
+
+`cargo xtask progress` writes the shader progress block of `README.md`
+from `docs/progress/shaders.json`; never edit the block by hand. To
+measure again, on Windows with your game files, run
+`victory translate --host-lanes 32 --json <file>` (the block is measured
+for a 32-lane GPU) and then
+`cargo xtask progress --record <file>`. The
+`readme_progress_matches_the_measurement` test, part of `cargo test`,
+fails when the block and the file disagree.
 
 Claude Code sessions run `.claude/hooks/check_edit.ps1` before every file
 edit and shell command (configured in `.claude/settings.json`; needs
