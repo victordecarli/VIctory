@@ -3,7 +3,8 @@
 //! * [`config`]: where the user's files live (never inside the repository).
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
-//! * [`logging`]: one tracing setup for all binaries.
+//! * [`logging`]: one tracing setup for all binaries, and the run log file
+//!   (JSON lines) of `victory run`.
 
 pub mod config;
 pub mod logging;

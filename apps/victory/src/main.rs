@@ -11,6 +11,8 @@
 mod census;
 mod inspect;
 mod run;
+#[cfg(windows)]
+mod run_log;
 mod shader;
 mod translate;
 mod walk;
@@ -134,13 +136,21 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
-    // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
+    // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`: a
+    // process of its own, with a log file of its own.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if victory_hle::modules::audio::capture::child() {
+    if victory_hle::modules::audio::capture::is_child() {
+        start_run_log();
+        run_log::start("audio-capture", None);
+        victory_hle::modules::audio::capture::child();
         return Ok(());
     }
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Run { .. }) {
+        start_run_log();
+    } else {
+        victory_core::logging::init("info");
+    }
     match cli.command {
         Command::Inspect { file, imports, exports } => inspect::run(&file, imports, exports),
         Command::Census { paths, strict, missing } => census::run(paths, strict, missing),
@@ -155,6 +165,21 @@ fn main() -> Result<()> {
             run::run(&exe, unimplemented, strict, execute, console)
         }
         Command::Config => show_config(),
+    }
+}
+
+/// Logs to the console and to a run log file in the data directory's
+/// `logs`; to the console only if there is no data directory (the command
+/// then fails on it too, and says why).
+fn start_run_log() {
+    match victory_core::Config::load().and_then(|cfg| cfg.data_subdir("logs")) {
+        Ok(dir) => {
+            victory_core::logging::init_run("info", &dir);
+        }
+        Err(e) => {
+            victory_core::logging::init("info");
+            tracing::warn!(error = format!("{e:#}"), "no run log file: no data directory");
+        }
     }
 }
 

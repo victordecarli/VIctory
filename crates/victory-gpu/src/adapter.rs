@@ -114,6 +114,7 @@ fn log_adapter(device: &ID3D12Device) {
                 Err(e) => format!("unknown ({e})"),
             };
             tracing::info!(
+                target: crate::SUMMARY,
                 adapter = %name,
                 vendor = format_args!("{:#06x}", desc.VendorId),
                 dedicated_mb = desc.DedicatedVideoMemory >> 20,
@@ -143,6 +144,7 @@ pub(crate) fn wave_lanes(device: &ID3D12Device) -> u32 {
     match queried {
         Ok(()) => {
             tracing::info!(
+                target: crate::SUMMARY,
                 min = o1.WaveLaneCountMin,
                 max = o1.WaveLaneCountMax,
                 wave_ops = o1.WaveOps.as_bool(),
