@@ -46,12 +46,20 @@ impl Halves {
     pub(super) fn new(lds_dwords: &mut u32, group: u32) -> Self {
         let two = (group > 32).then(|| {
             let counter = *lds_dwords;
-            *lds_dwords += 3;
+            *lds_dwords += DWORDS;
             (counter, counter + 1)
         });
         Halves { two, base: None, lane: None }
     }
+
+    /// The LDS dwords these halves add past the program's own.
+    pub(super) fn dwords(&self) -> u32 {
+        if self.two.is_some() { DWORDS } else { 0 }
+    }
 }
+
+/// The counter and the exchange pair.
+const DWORDS: u32 = 3;
 
 /// Why the console wave64 compute program `p` (`group` threads, `lds_dwords`
 /// of LDS) keeps 64-lane waves on a host of 32-lane waves; None when it runs

@@ -44,6 +44,8 @@ const BARRIER: u32 = 0xBF8A_0000;
 /// s_mov_b32 s14, 0 / s_mov_b32 s14, 5
 const S14_0: u32 = 0xBE8E_0380;
 const S14_5: u32 = 0xBE8E_0385;
+/// ds_write_b32 v2, v1
+const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0102];
 
 /// A compute program of `threads` threads (thread index in v0; console waves of 64 when
 /// `wave64`), 4 root constants in s0..s3 and a raw UAV's descriptor in s[8:11], then `body`.
@@ -128,6 +130,7 @@ fn encodings_decode_as_named() {
         ["s_and_saveexec_b64", "s_cbranch_execz", "s_barrier", "s_mov_b64"]
     );
     assert_eq!(names(&[S14_0, S14_5]), ["s_mov_b32", "s_mov_b32"]);
+    assert_eq!(names(&DS_WRITE), ["ds_write_b32"]);
 }
 
 /// A program that reads other lanes runs in halves on a 32-lane host, and keeps its
@@ -164,6 +167,20 @@ fn other_group_shapes_keep_64_lane_waves() {
     let body = [&MBCNT[..], &STORE_V1[..]].concat();
     assert_eq!(translate(&native(&body, true, 128, false), 32).unwrap().wave_size, Some(64));
     assert_eq!(translate(&native(&body, true, 64, true), 32).unwrap().wave_size, Some(64));
+}
+
+/// The LDS dwords the halves add are theirs: a split program that allocates no LDS of its
+/// own and still accesses LDS is refused, as it is unsplit, instead of reaching them.
+#[test]
+fn lds_the_program_does_not_allocate_is_refused_in_halves() {
+    let cs = wave(&[&MBCNT[..], &[STORE_V1[0]], &DS_WRITE[..]].concat());
+    for host_lanes in [32, 64] {
+        let e = translate(&cs, host_lanes).err().map(|e| e.to_string());
+        assert!(
+            e.as_deref().is_some_and(|e| e.contains("LDS the program does not allocate")),
+            "host of {host_lanes} lanes: {e:?}"
+        );
+    }
 }
 
 /// Running the split programs on the host GPU, which must take waves of 32.

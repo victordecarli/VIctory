@@ -2189,7 +2189,9 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
+        // The halves' own dwords are not the program's.
+        let reserved = self.halves.as_ref().map_or(0, halves::Halves::dwords);
+        if self.s.lds_dwords == reserved {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
