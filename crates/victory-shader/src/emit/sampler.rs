@@ -10,9 +10,12 @@
 //! linear). Word 3: border colour (30-31: transparent black, opaque black,
 //! opaque white, custom).
 //!
-//! Comparison is the sampling instruction's, not the sampler's: the console
-//! encodes a comparison function in every sampler (D3D's default, less or
-//! equal, when unused).
+//! Comparison is the sampling instruction's, not the sampler's: every
+//! sampler holds a comparison function, which only the comparison
+//! instructions use, so its value does not say whether the sampler
+//! compares (Grand Theft Auto VI's samplers used without comparison hold
+//! never; the console compiler's words in the test below hold less or
+//! equal).
 
 /// A static sampler in D3D12 terms; the integers are the `D3D12_FILTER`,
 /// `D3D12_TEXTURE_ADDRESS_MODE`, `D3D12_COMPARISON_FUNC` and

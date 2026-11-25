@@ -152,6 +152,11 @@ been run on as they are (see the `cargo fmt` row of the lint ratchet).
     `mem::forget`, `result.ok();`, or `unwrap`/`expect` outside tests (all
     enforced). Lints are configured
     once, in the root `Cargo.toml`; every crate has `[lints] workspace = true`.
+    A line every run should keep (a periodic report, a first occurrence, a
+    total) uses the `victory::summary` target, which passes any filter,
+    with its numbers as fields beside a fixed message, so `jq` reads them.
+    `victory-gpu` does not depend on `victory-core` and repeats that target
+    as `crate::SUMMARY`; rename both together.
 
 ## Citations
 
