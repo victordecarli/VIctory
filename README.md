@@ -194,7 +194,9 @@ JSON object per line, the event's fields beside `timestamp` (UTC),
 names the file. Events with the target `victory::summary` are logged
 whatever the filter: `run_start` (the BLAKE3 of `victory.exe`, the
 arguments and every `VICTORY_*` variable), the title's build, DLLs and
-missing imports. For example, with `jq`:
+missing imports, and a crash (`"message":"crash"`, the report in
+`report`), which also goes to `crashes.log` as before. For example, with
+`jq`:
 `jq -c 'select(.target == "victory::summary")' run-*.jsonl`.
 
 ## Debugging
