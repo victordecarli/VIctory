@@ -110,7 +110,8 @@ fn current(hub: &Hub, kind: u32, device: usize) -> Result<*const Reading, HRESUL
 fn walk(hub: &Hub, offset: usize, from: *const Reading) -> Result<*const Reading, HRESULT> {
     type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
     let mut out = std::ptr::null();
-    let device = reading(from).device;
+    // SAFETY: this test's own locals, valid for the call.
+    let device = unsafe { reading(from) }.device;
     let hr =
         slot::<Walk, _>(&hub.object, offset)(&hub.object, from, GAMEPAD_KIND, device, &mut out);
     result(hr, out)
