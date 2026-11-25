@@ -30,7 +30,6 @@ pub(crate) fn create_device() -> windows::core::Result<ID3D12Device> {
         }
     };
     log_adapter(&device);
-    log_wave_lanes(&device);
     Ok(device)
 }
 
@@ -126,10 +125,12 @@ fn log_adapter(device: &ID3D12Device) {
     }
 }
 
-/// Logs the lanes a wave of `device` has. A console wave64 program that
-/// needs its 64 lanes declares `WaveSize(64)`, which a host whose maximum is
-/// 32 (NVIDIA) refuses at pipeline creation.
-fn log_wave_lanes(device: &ID3D12Device) {
+/// The most lanes a wave of `device` has, logged with the least. A console
+/// wave64 program that needs its 64 lanes declares `WaveSize(64)`, which a
+/// host whose maximum is 32 (NVIDIA) refuses, so shaders are translated for
+/// it ([`victory_shader::emit::translate`]). If the query fails: 64, which
+/// translates as if the host's waves held the console's.
+pub(crate) fn wave_lanes(device: &ID3D12Device) -> u32 {
     let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
     // SAFETY: the query writes the structure of the given size.
     let queried = unsafe {
@@ -140,13 +141,19 @@ fn log_wave_lanes(device: &ID3D12Device) {
         )
     };
     match queried {
-        Ok(()) => tracing::info!(
-            min = o1.WaveLaneCountMin,
-            max = o1.WaveLaneCountMax,
-            wave_ops = o1.WaveOps.as_bool(),
-            "host wave lanes"
-        ),
-        Err(e) => tracing::warn!(error = %e, "the host's wave lanes could not be queried"),
+        Ok(()) => {
+            tracing::info!(
+                min = o1.WaveLaneCountMin,
+                max = o1.WaveLaneCountMax,
+                wave_ops = o1.WaveOps.as_bool(),
+                "host wave lanes"
+            );
+            o1.WaveLaneCountMax
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "the host's wave lanes could not be queried; taken as 64");
+            victory_shader::emit::CONSOLE_WAVE
+        }
     }
 }
 

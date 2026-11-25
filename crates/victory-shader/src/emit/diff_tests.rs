@@ -759,14 +759,16 @@ fn translated_shaders_draw_as_pc_ones() {
     for (name, src) in CASES.iter().filter(|c| only.as_ref().is_none_or(|o| o == c.0)) {
         // A case may bring its own vertex shader.
         let vs = if src.contains(" vs16(") { "vs16" } else { "vs" };
-        let vs_c = translate(&compile(&console, &dir, src, vs, "vs_6_5")).unwrap();
-        let ps_c = match translate(&compile(&console, &dir, src, "ps", "ps_6_5")) {
-            Ok(s) => s,
-            Err(e) => {
-                failures.push(format!("{name}: {e}"));
-                continue;
-            }
-        };
+        let vs_c =
+            translate(&compile(&console, &dir, src, vs, "vs_6_5"), super::CONSOLE_WAVE).unwrap();
+        let ps_c =
+            match translate(&compile(&console, &dir, src, "ps", "ps_6_5"), super::CONSOLE_WAVE) {
+                Ok(s) => s,
+                Err(e) => {
+                    failures.push(format!("{name}: {e}"));
+                    continue;
+                }
+            };
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(
@@ -859,14 +861,15 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();
     for &(name, groups, src) in MS_CASES.iter().filter(|c| only.as_ref().is_none_or(|o| o == c.0)) {
         let console_ms = compile(&console, &dir, src, "ms", "ms_6_5");
-        let ms_c = match translate(&console_ms) {
+        let ms_c = match translate(&console_ms, super::CONSOLE_WAVE) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("{name}: {e}"));
                 continue;
             }
         };
-        let ps_c = translate(&compile(&console, &dir, src, "mps", "ps_6_5")).unwrap();
+        let ps_c =
+            translate(&compile(&console, &dir, src, "mps", "ps_6_5"), super::CONSOLE_WAVE).unwrap();
         if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(format!("{out}/{stem}.ms.cdxil"), &console_ms).unwrap();
@@ -962,7 +965,7 @@ fn float_semantics_are_the_consoles() {
                     : i == 2 ? k.w - 3.14159274 : k.w + 1.57079637;
             outb.Store(64 + 4 * i, asuint(i == 3 ? cos(r) : sin(r)));
         }"#;
-    let cs = translate(&compile(&console, &dir, src, "cs", "cs_6_5")).unwrap();
+    let cs = translate(&compile(&console, &dir, src, "cs", "cs_6_5"), super::CONSOLE_WAVE).unwrap();
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
     // 1e30, NaN, 3.5, 0.
     let k = [1e30f32.to_bits(), 0x7FC0_0000, 3.5f32.to_bits(), 0];
@@ -1109,7 +1112,7 @@ fn translated_compute_matches_pc() {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(format!("{out}/{stem}.cs.cdxil"), &console_cs).unwrap();
         }
-        let cs_c = match translate(&console_cs) {
+        let cs_c = match translate(&console_cs, super::CONSOLE_WAVE) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("{name}: {e}"));

@@ -86,6 +86,11 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Translate for a host whose waves have at most this many lanes
+        /// (32 on NVIDIA): console wave64 programs that can run as two
+        /// waves of 32 do. The default, 64, splits nothing.
+        #[arg(long, default_value_t = victory_shader::emit::CONSOLE_WAVE)]
+        host_lanes: u32,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -138,8 +143,8 @@ fn main() -> Result<()> {
         Command::ShaderInfo { paths, verbose, disasm } => {
             shader::run(paths, verbose || disasm, disasm)
         }
-        Command::Translate { paths, validate, pipelines, list, jobs } => {
-            translate::run(paths, validate, pipelines, list, jobs)
+        Command::Translate { paths, validate, pipelines, list, jobs, host_lanes } => {
+            translate::run(paths, validate, pipelines, list, jobs, host_lanes)
         }
         Command::Run { exe, unimplemented, strict, execute, console, title_args: _ } => {
             run::run(&exe, unimplemented, strict, execute, console)

@@ -37,9 +37,25 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// The most lanes a host wave has, which translations depend on: the host
+/// device's, or 64 (nothing split) without one.
+fn host_lanes() -> u32 {
+    crate::host::host().map_or(victory_shader::emit::CONSOLE_WAVE, |h| h.wave_lanes)
+}
+
+/// The BLAKE3 of our executable file and of the translation settings it
+/// runs with: the loop limit, which a diagnostics build can change at run
+/// time, and the host's wave lanes, which decide how wave64 programs are
+/// translated.
+fn fingerprint(exe: &[u8], limit: u32, lanes: u32) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(exe);
+    h.update(&limit.to_le_bytes());
+    h.update(&lanes.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// What identifies this build and host ([`fingerprint`]).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -49,10 +65,7 @@ fn build() -> &'static [u8; 32] {
             tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner");
         }
         match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
+            Ok(bytes) => fingerprint(&bytes, limit, host_lanes()),
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
                 tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
@@ -68,7 +81,8 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let lanes = host_lanes();
+    let translate = |c: &[u8]| victory_shader::emit::translate(c, lanes).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
@@ -346,6 +360,16 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    /// A host of other wave lanes translates differently: its entries are
+    /// apart, as another build's are.
+    #[test]
+    fn the_host_wave_lanes_key_the_cache() {
+        let exe = b"our executable";
+        assert_ne!(fingerprint(exe, 1 << 20, 32), fingerprint(exe, 1 << 20, 64));
+        assert_eq!(fingerprint(exe, 1 << 20, 32), fingerprint(exe, 1 << 20, 32));
+        assert_ne!(fingerprint(exe, 1 << 20, 32), fingerprint(exe, 1 << 19, 32));
     }
 
     /// The wave size a shader requires comes back from the cache, absent or
