@@ -1,7 +1,7 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
 //! so fence signals complete at once.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -148,10 +148,7 @@ unsafe extern "system" fn execute(_: This, count: u32, lists: *const This) {
         host.execute(&host_lists);
         return;
     }
-    static ONCE: AtomicBool = AtomicBool::new(false);
-    if !ONCE.swap(true, Ordering::Relaxed) {
-        tracing::warn!(count, "command lists submitted; no host GPU runs them");
-    }
+    crate::warn::warn_once!("command lists submitted; no host GPU runs them", count);
 }
 
 /// The start of a present plane: frame token, then the plane's resources.
@@ -472,10 +469,7 @@ unsafe extern "system" fn copy_page_mappings(
         }
     }
     if !ok {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
-        });
+        crate::warn::warn_once!("a page mapping failed", pool = format_args!("{pool:#x}"));
     }
     S_OK
 }

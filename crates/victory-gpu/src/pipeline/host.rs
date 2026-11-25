@@ -294,15 +294,19 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
-        tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
-    }
-    None
+/// Logs a pipeline that gets no host pipeline, once per reason (each
+/// reason is written at one place), and is `None`.
+macro_rules! refuse {
+    ($reason:literal, $shaders:expr) => {{
+        static WARNING: crate::warn::Warning = crate::warn::Warning::new(
+            concat!(file!(), ":", line!()),
+            concat!("no host pipeline: ", $reason),
+        );
+        WARNING.hit(|| {
+            tracing::warn!(shaders = ?$shaders, concat!("no host pipeline: ", $reason, " (logged once)"));
+        });
+        None
+    }};
 }
 
 impl HostPipeline {
@@ -319,10 +323,7 @@ impl HostPipeline {
                 .iter()
                 .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
         {
-            return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
-                shaders,
-            );
+            return refuse!("only vertex, mesh, pixel and compute stages are translated", shaders);
         }
         let mesh = find("mesh");
         let graphics = if compute.is_some() {
@@ -331,7 +332,7 @@ impl HostPipeline {
             let first = match (mesh, find("vertex")) {
                 (Some(ms), _) => (ms, GraphicsStage::Mesh),
                 (None, Some(vs)) => (vs, GraphicsStage::Vertex),
-                (None, None) => return refuse("no vertex or mesh shader", shaders),
+                (None, None) => return refuse!("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, GraphicsStage::Pixel)));
@@ -342,7 +343,7 @@ impl HostPipeline {
             None => graphics.iter().map(|&(s, _)| s).collect(),
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+            return refuse!("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         let host = host()?;
 
@@ -415,7 +416,7 @@ impl HostPipeline {
             });
         }
         let Some(g) = g else {
-            return refuse("graphics state not kept (plain description)", shaders);
+            return refuse!("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
         if mesh.is_some() {

@@ -54,6 +54,7 @@ pub mod signature;
 mod test_support;
 #[cfg(windows)]
 mod texture;
+mod warn;
 #[cfg(windows)]
 mod watch;
 

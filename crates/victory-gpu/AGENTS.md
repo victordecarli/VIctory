@@ -27,9 +27,10 @@ method a newer title adds logs and fails instead of jumping past the
 table. Fill a slot by writing the `extern "system"` method and putting it
 in that slot.
 
-A method that is not written yet, or a case it skips, logs once (a
-`std::sync::Once` or the file's `once!`) with enough context that a run
-lists what to do next.
+A method that is not written yet, or a case it skips, logs once with
+`warn_once!` (`crates/victory-gpu/src/warn.rs`), with enough context that a
+run lists what to do next; the same module counts every later case, and
+each frame report logs the totals of the warnings that had new ones.
 
 ## Title memory on the host
 

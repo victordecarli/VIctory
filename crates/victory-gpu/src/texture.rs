@@ -21,13 +21,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
-
-macro_rules! once {
-    ($($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
-    }};
-}
+use crate::warn::warn_once;
 
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
@@ -282,11 +276,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let (memory, desc) = unsafe { crate::resource::texture_memory(resource) }?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
-        once!(?desc, "texture contents without a console layout not uploaded");
+        warn_once!("texture contents without a console layout not uploaded", ?desc);
         return None;
     };
     if layout.desc.swizzle.xor() {
-        once!(?desc, "texture contents in an XOR mode not uploaded");
+        warn_once!("texture contents in an XOR mode not uploaded", ?desc);
         return None;
     }
     let host = host()?;

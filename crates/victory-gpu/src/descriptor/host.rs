@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::warn::warn_once;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -246,10 +247,7 @@ impl HostHeap {
             }
         }
         let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
-            });
+            warn_once!("no free dynamic descriptor slots: a table is not made", n);
             return None;
         };
         taken[first..first + n].fill(true);
@@ -388,14 +386,6 @@ impl HostHeap {
     }
 }
 
-/// Logs `what` the first time it happens.
-macro_rules! once {
-    ($($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
-    }};
-}
-
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -490,7 +480,7 @@ fn buffer_srv(
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        once!(offset, element, "buffer view not on an element of its host copy");
+        warn_once!("buffer view not on an element of its host copy", offset, element);
         return None;
     }
     buffer.FirstElement += offset / element;
@@ -515,7 +505,7 @@ fn buffer_uav(
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
+        warn_once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
     // SAFETY: a buffer view's union member.
@@ -529,7 +519,7 @@ fn buffer_uav(
     };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+        warn_once!("unordered buffer view not on an element of its host copy", offset, element);
         return None;
     }
     buffer.FirstElement += offset / element;
@@ -566,7 +556,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     };
     let own = d.Format.0 as u32;
     if !allowed || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
-        once!(unordered, format = own, flags = d.Flags.0, "view the host does not allow");
+        warn_once!("view the host does not allow", unordered, format = own, flags = d.Flags.0);
         return false;
     }
     // Every family has more than one format, its typeless one first.
@@ -583,7 +573,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         return !typeless;
     }
     if family(view) != family(own) {
-        once!(view, own, "view format of another family");
+        warn_once!("view format of another family", view, own);
         return false;
     }
     if let Some(format) = format
@@ -604,9 +594,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
+                warn_once!(
+                    "constant buffer not 256-byte aligned on the host",
+                    address = format_args!("{address:#x}")
                 );
                 return None;
             }
@@ -699,7 +689,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                warn_once!("placed unordered texture view not mirrored", dimension = resource[0]);
                 return None;
             }
             // The resource description's width, after the alignment.

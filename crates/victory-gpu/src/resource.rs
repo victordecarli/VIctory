@@ -955,15 +955,16 @@ impl Drop for Resource {
         if self.host.as_ref().is_some_and(|h| std::sync::Arc::strong_count(h) > 1) {
             // Before lists held their textures, this freed a texture that
             // lists not yet run still named (a GPU page fault).
-            static OUTLIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = OUTLIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
+            static OUTLIVED: crate::warn::Warning = crate::warn::Warning::new(
+                concat!(file!(), ":", line!()),
+                "a title texture was released while a list not yet reset names its host copy",
+            );
+            OUTLIVED.hit(|| {
                 tracing::info!(
-                    n,
                     desc = ?self.desc,
                     "a title texture was released while a list not yet reset names its host copy"
                 );
-            }
+            });
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -1348,15 +1349,21 @@ unsafe extern "system" fn gpu_address(this: This) -> u64 {
     // refuses others (diagnostics: which memory breaks that).
     #[cfg(feature = "diagnostics")]
     if at >> 40 != 0 {
-        static ONCE: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+        static WARNINGS: [crate::warn::Warning; 2] = [const {
+            crate::warn::Warning::new(concat!(file!(), ":", line!()), "a GPU address above 40 bits")
+        }; 2];
         let backing = match r.backing {
             Backing::Committed(ref m) => format!("committed, attributes {:?}", m.attributes),
             Backing::Placed { offset, .. } => format!("placed in a heap at {offset:#x}"),
             Backing::Address(_) => "at a title address".into(),
         };
-        ONCE[usize::from(r.desc.dimension == BUFFER)].call_once(|| {
-            tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")
-        });
+        let buffer = r.desc.dimension == BUFFER;
+        WARNINGS[usize::from(buffer)].hit_with(
+            || String::from(if buffer { "buffer" } else { "texture" }),
+            || {
+                tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")
+            },
+        );
     }
     at
 }

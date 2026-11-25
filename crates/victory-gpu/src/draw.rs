@@ -23,6 +23,7 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+use crate::warn::warn_once;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -128,6 +129,13 @@ fn dropped(pipeline: usize) {
     }
 }
 
+/// Counts a draw or dispatch dropped for a general `cause` (no pipeline to
+/// blame), here and in the drop totals.
+pub(crate) fn dropped_for(cause: crate::pipeline::drops::Cause) {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    crate::pipeline::drops::general(cause);
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -153,13 +161,6 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
-macro_rules! once {
-    ($($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
-    }};
-}
-
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -181,7 +182,7 @@ impl State {
         let host = match topology {
             RECTANGLES => 4,
             TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
-                once!(topology, "console topology drawn as a triangle list");
+                warn_once!("console topology drawn as a triangle list", topology);
                 4
             }
             t => t,
@@ -259,7 +260,10 @@ impl State {
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
-                once!(handle = format_args!("{h:#x}"), "render target without a recorded view");
+                warn_once!(
+                    "render target without a recorded view",
+                    handle = format_args!("{h:#x}")
+                );
                 continue;
             };
             // SAFETY: a resource this crate created, which the title keeps alive
@@ -301,9 +305,9 @@ impl State {
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
                 Some(heap) => (handle - heap.start) as u32,
                 None => {
-                    once!(
-                        handle = format_args!("{handle:#x}"),
-                        "descriptor table outside the bound heaps"
+                    warn_once!(
+                        "descriptor table outside the bound heaps",
+                        handle = format_args!("{handle:#x}")
                     );
                     0
                 }
@@ -312,7 +316,7 @@ impl State {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
             _ => {
-                once!(slot, ?root, "a shader reads a root argument the title did not set");
+                warn_once!("a shader reads a root argument the title did not set", slot, ?root);
                 0
             }
         }
@@ -350,7 +354,7 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            warn_once!("a draw or mesh dispatch with another kind of pipeline", mesh);
             return false;
         }
         if !self.bind(list, p, false) {
@@ -466,14 +470,7 @@ impl State {
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
-                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
-                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(
-                        dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
-                    );
-                }
+                warn_once!("a draw or dispatch dropped: no dynamic slots for its tables");
                 return false;
             }
             let constants = stage.root().user_data(|u| {
@@ -497,7 +494,7 @@ impl State {
                 let (slot, param, srv) = (v.slot, v.param, v.view == RootView::Srv);
                 let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                 else {
-                    once!(slot, "a shader reads a root view the title did not set");
+                    warn_once!("a shader reads a root view the title did not set", slot);
                     continue;
                 };
                 let Some(gpu) = root_view(list, *address, srv) else {
@@ -533,9 +530,9 @@ impl State {
         // while a list uses it.
         let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
         let Some(p) = ready else {
-            once!(
-                pipeline = format_args!("{:#x}", self.pipeline),
-                "a dispatch without a host pipeline dropped"
+            warn_once!(
+                "a dispatch without a host pipeline dropped",
+                pipeline = format_args!("{:#x}", self.pipeline)
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
@@ -544,7 +541,8 @@ impl State {
             return;
         };
         if !p.compute {
-            once!("a dispatch with a graphics pipeline");
+            warn_once!("a dispatch with a graphics pipeline");
+            dropped_for(crate::pipeline::drops::Cause::ComputeKind);
             return;
         }
         if !self.bind(list, p, true) {
@@ -762,7 +760,7 @@ impl State {
                     None => {
                         host.make_null(index);
                         if used.is_some() {
-                            once!(slot, "a table entry without a view");
+                            warn_once!("a table entry without a view", slot);
                         }
                     }
                 }
@@ -898,7 +896,7 @@ impl State {
                 || u64::from(first + count) * stride > u64::from(v.size)
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
-                once!(slot, "rectangle vertices outside their buffer");
+                warn_once!("rectangle vertices outside their buffer", slot);
                 return false;
             }
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
@@ -940,7 +938,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
-            once!("indexed rectangles not drawn");
+            warn_once!("indexed rectangles not drawn");
         }
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
         if ran {
@@ -1098,7 +1096,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         )
     };
     if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
+        warn_once!("host command signature refused", error = %e, kind, stride);
         return None;
     }
     let signature = signature?;
