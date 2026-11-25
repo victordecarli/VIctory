@@ -30,6 +30,25 @@ const V1_S12: u32 = 0x7E02_020C;
 const READLANE_40: [u32; 2] = [0xD760_000C, 0x0001_5100];
 /// v_readfirstlane_b32 s12, v0
 const READFIRSTLANE: u32 = 0x7E18_0500;
+/// v_readfirstlane_b32 s14, v0
+const READFIRSTLANE_V0_S14: u32 = 0x7E1C_0500;
+/// v_readlane_b32 s14, v0, 10
+const READLANE_10: [u32; 2] = [0xD760_000E, 0x0001_1500];
+/// v_mov_b32 v1, v0
+const V1_V0: u32 = 0x7E02_0300;
+/// v1 = v0; each lane adds 1 to v1 until it reaches 40 (EXEC saved in s[12:13]), reading
+/// lane 10 into s14 in each iteration.
+const LANE_LOOP: [u32; 9] = [
+    V1_V0,
+    0xBE8C_047E, // s_mov_b64 s[12:13], exec
+    READLANE_10[0],
+    READLANE_10[1],
+    vop2(0x25, 1, 0x81, 1), // v_add_nc_u32 v1, 1, v1
+    0x7D86_02A8,            // v_cmp_le_u32 vcc, 40, v1
+    0x8AFE_6A7E,            // s_andn2_b64 exec, exec, vcc
+    0xBF89_FFFA,            // s_cbranch_execnz back to the v_readlane
+    END_IF,
+];
 /// v_mov_b32 v1, 0; s_mov_b32 s12, 7; v_writelane_b32 v1, s12, 40
 const WRITELANE_40: [u32; 4] = [0x7E02_0280, 0xBE8C_0387, 0xD761_0001, 0x0001_500C];
 /// v_lshlrev_b32 v2, 2, v0; buffer_store_dword v1, v2, s[8:11], 0 offen: v1 to dword
@@ -286,20 +305,24 @@ fn a_cross_lane_program_runs_in_halves_only_on_a_32_lane_host() {
     assert_eq!(translate(&w32, 32).unwrap().wave_size, Some(32));
 }
 
+/// s14 = 0; s14 = 5 for the lanes from 40 on; v1 = s14 after the branch.
+fn scalar_after_a_branch() -> NativeProgram {
+    wave(&[&MBCNT[..], &[S14_0, VCC_FROM_40], &IF_VCC[..], &[S14_5, END_IF, V1_S14]].concat())
+}
+
 /// Where the two halves could part, a split program could hang at a group barrier or
-/// keep two different copies of a scalar: those programs keep 64-lane waves.
+/// keep two different copies of a scalar. The console's wave branches as one: taken
+/// wave-wide, the branch keeps both halves together, and the program splits.
 #[test]
-fn programs_whose_halves_could_part_keep_64_lane_waves() {
+fn a_branch_the_halves_could_part_at_is_taken_wave_wide() {
     let branch = |inside: u32| {
         wave(&[&MBCNT[..], &[S14_0, VCC_FROM_40], &IF_VCC[..], &[inside, END_IF]].concat())
     };
     // A group barrier only the lanes from 40 on reach.
-    assert_eq!(translate(&branch(BARRIER), 32).unwrap().wave_size, Some(64));
+    assert_eq!(translate(&branch(BARRIER), 32).unwrap().wave_size, Some(32));
     // A scalar written where only some lanes run and read after the branch: the half that
     // skipped it would keep the old value, where the console's whole wave has the new one.
-    let after =
-        wave(&[&MBCNT[..], &[S14_0, VCC_FROM_40], &IF_VCC[..], &[S14_5, END_IF, V1_S14]].concat());
-    assert_eq!(translate(&after, 32).unwrap().wave_size, Some(64));
+    assert_eq!(translate(&scalar_after_a_branch(), 32).unwrap().wave_size, Some(32));
     // The same branch around per-lane code only splits.
     assert_eq!(translate(&branch(0x7E02_0280), 32).unwrap().wave_size, Some(32));
 }
@@ -323,7 +346,8 @@ fn other_group_shapes_keep_64_lane_waves() {
 
 /// LDS shared within one console wave: the console runs its accesses in program order, the
 /// two halves at a group barrier before each, which every thread must reach. So the program
-/// splits where every lane accesses LDS, and keeps 64-lane waves where only some lanes do.
+/// splits where every lane accesses LDS, and where only some lanes do once the branch
+/// around the access is taken wave-wide.
 #[test]
 fn lds_of_one_console_wave_runs_in_halves_where_every_lane_reaches_it() {
     let every = [&MBCNT[..], &LDS_WRITE_T[..], &LDS_READ_MIRROR[..], &STORE_V1[..]].concat();
@@ -337,7 +361,7 @@ fn lds_of_one_console_wave_runs_in_halves_where_every_lane_reaches_it() {
         &STORE_V1[..],
     ]
     .concat();
-    assert_eq!(translate(&native(&some, true, 64, true), 32).unwrap().wave_size, Some(64));
+    assert_eq!(translate(&native(&some, true, 64, true), 32).unwrap().wave_size, Some(32));
 }
 
 /// The LDS dwords the halves add are theirs: a split program that allocates no LDS of its
@@ -361,6 +385,24 @@ fn sp3(words: &[u32]) -> Vec<String> {
     let mut text: Vec<String> = decoded.iter().map(|i| i.text(true)).collect();
     assert_eq!(text.pop().as_deref(), Some("s_endpgm"));
     text
+}
+
+#[test]
+fn branch_encodings_decode_as_named() {
+    assert_eq!(
+        sp3(&LANE_LOOP),
+        [
+            "v_mov_b32 v1, v0",
+            "s_mov_b64 s[12:13], exec",
+            "v_readlane_b32 s14, v0, 10",
+            "v_add_nc_u32 v1, 1, v1",
+            "v_cmp_le_u32 vcc, 40, v1",
+            "s_andn2_b64 exec, exec, vcc",
+            "s_cbranch_execnz label_0008",
+            "s_mov_b64 exec, s[12:13]",
+        ]
+    );
+    assert_eq!(sp3(&[READFIRSTLANE_V0_S14]), ["v_readfirstlane_b32 s14, v0"]);
 }
 
 #[test]
@@ -453,16 +495,30 @@ fn a_wave_reduction_where_every_lane_runs_splits() {
 }
 
 /// A whole-wave section only some lanes reach: a half none of whose lanes is there would
-/// not come to the exchange, so the program keeps 64-lane waves.
+/// not come to the exchange, so the branch around it is taken wave-wide.
 #[test]
-fn a_wave_reduction_in_a_lane_branch_keeps_64_lane_waves() {
-    let section = [&reduce(V_ADD_U, ZERO)[..], &[V1_S7]].concat();
-    let skip = 0xBF88_0000 | section.len() as u32; // s_cbranch_execz past the section
-    let cs = wave(
-        &[&MBCNT[..], &V7_ROTATED[..], &[VCC_FROM_40, IF_VCC[0], skip], &section, &[END_IF]]
-            .concat(),
-    );
-    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(64));
+fn a_wave_reduction_in_a_lane_branch_splits() {
+    assert_eq!(translate(&sum_in_a_branch(), 32).unwrap().wave_size, Some(32));
+}
+
+/// The lanes from 40 on store the sum of their (rotated) v7 over themselves; the others
+/// store nothing.
+fn sum_in_a_branch() -> NativeProgram {
+    let body = [&reduce(V_ADD_U, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
+    let skip = 0xBF88_0000 | body.len() as u32; // s_cbranch_execz past the body
+    let words = [&V7_ROTATED[..], &[VCC_FROM_40, IF_VCC[0], skip], &body, &[END_IF]].concat();
+    native(&words, true, 64, false)
+}
+
+/// What taking a branch wave-wide cannot make exact keeps 64-lane waves: a lane read in a
+/// loop each lane leaves on its own (a back edge, which is never taken wave-wide), and the
+/// first lane read where EXEC was narrowed without a branch (not lane 0).
+#[test]
+fn lane_loops_and_first_lanes_of_a_narrowed_exec_keep_64_lane_waves() {
+    assert_eq!(translate(&wave(&LANE_LOOP), 32).unwrap().wave_size, Some(64));
+    // (`v_mbcnt` asks for the console's lanes, which `v_readfirstlane` alone does not)
+    let first = [&MBCNT[..], &[VCC_FROM_40, IF_VCC[0], READFIRSTLANE_V0_S14, END_IF, V1_S14]];
+    assert_eq!(translate(&wave(&first.concat()), 32).unwrap().wave_size, Some(64));
 }
 
 /// The console adds floats in its own tree, which the halves' wave sums do not follow: a
@@ -520,6 +576,12 @@ mod card {
     /// without a hardware device that takes the program.
     fn run(body: &[u32]) -> Option<Vec<u32>> {
         run_program(&wave(body))
+    }
+
+    /// v1 = v0; for the lanes from 40 on, v1 = v_readlane(v0, 10) (through s14).
+    fn lane_read_in_a_branch() -> NativeProgram {
+        let body = [READLANE_10[0], READLANE_10[1], V1_S14];
+        wave(&[&[V1_V0, VCC_FROM_40, IF_VCC[0], 0xBF88_0003], &body[..], &[END_IF]].concat())
     }
 
     /// [`run`] for a whole program of one console wave.
@@ -635,6 +697,30 @@ mod card {
                 (0..64).map(|t| terms[..t + usize::from(!exclusive)].iter().sum()).collect();
             assert_eq!(out, want, "exclusive {exclusive}");
         }
+    }
+
+    /// Only lanes of the upper half take the branch, and read a lane of the lower half.
+    #[test]
+    fn a_lane_read_in_a_lane_branch_reaches_the_other_half() {
+        let Some(out) = run_program(&lane_read_in_a_branch()) else { return };
+        let want: Vec<u32> = (0..64).map(|t| if t < 40 { t } else { 10 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// The console's wave takes the branch, so its one s14 is 5 in every lane.
+    #[test]
+    fn a_scalar_written_in_a_lane_branch_is_the_whole_waves() {
+        let Some(out) = run_program(&scalar_after_a_branch()) else { return };
+        assert_eq!(out, vec![5; 64]);
+    }
+
+    /// A wave sum in a branch is of the lanes that took it.
+    #[test]
+    fn a_wave_sum_in_a_lane_branch_is_of_its_lanes() {
+        let Some(out) = run_program(&sum_in_a_branch()) else { return };
+        let sum: u32 = (40..64).map(|t| (t + 20) & 63).sum();
+        let want: Vec<u32> = (0..64).map(|t| if t < 40 { 0 } else { sum }).collect();
+        assert_eq!(out, want);
     }
 
     /// The lanes from 40 on take a scalar written in their branch; the others keep their

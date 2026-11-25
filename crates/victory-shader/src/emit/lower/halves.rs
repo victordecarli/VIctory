@@ -26,14 +26,29 @@
 //! - a block only some lanes run holds no group barrier, and a scalar
 //!   written there (other than a lane mask) is read only past its write:
 //!   not through a phi at a join, nor where every lane runs. A half that
-//!   skipped the block keeps an older copy, which it then never reads.
+//!   skipped the block keeps an older copy, which it then never reads;
+//! - in a group of two host waves, `v_readfirstlane` is not read where
+//!   EXEC was narrowed without a branch (its first lane is not lane 0).
+//!
+//! A block in a loop each lane leaves on its own is not one every lane
+//! runs, the loop's closing block included: the halves could go round a
+//! different number of times.
+//!
+//! Where a block only some lanes run is what keeps a program at 64 lanes,
+//! the lane branch around it can be taken as the console takes it, one
+//! decision for the whole wave ([`widened`]): each half asks its lanes, the
+//! halves exchange the answer ([`Lower::wave_wide`]) and go the same way,
+//! and EXEC stays a guard on the vector instructions inside
+//! ([`crate::structure::structure_wide`]). Every lane then runs the branch's
+//! blocks. Only forward branches at blocks every lane runs are taken so,
+//! never a loop's.
 //!
 //! Every other console wave64 program keeps 64-lane waves.
 //!
 //! Ported from the fxceless line (`base/fxceless`, `emit/lower.rs`:
 //! `wave_base`, `console_thread`, `console_lane`, `exchange_pair`,
-//! `exchange_halves`, `branch_regions`, `all_lane_blocks`), restricted to
-//! the cases above.
+//! `exchange_halves`, `branch_regions`, `all_lane_blocks`, `wave_wide`, and
+//! `emit/mod.rs`: `widen`), restricted to the cases above.
 
 use super::super::wave::{Op as WaveOp, Shape};
 use super::*;
@@ -78,22 +93,91 @@ impl Halves {
 /// The counter and the exchange pair.
 const DWORDS: u32 = 3;
 
+/// `first`, the lowering of `x`, or where it keeps a console wave64 compute
+/// program at 64-lane waves on a host of 32-lane waves, the lowering with
+/// the lane branches [`to_widen`] names taken wave-wide
+/// ([`crate::structure::structure_wide`]), widening on until the program
+/// runs in halves. Where it never does, or a wider lowering fails, `first`.
+pub(super) fn widened(x: &Parts, first: Lowered) -> Lowered {
+    let StageIo::Cs(cs) = x.native.io else { return first };
+    if first.wave_size != Some(64) || x.host_lanes != 32 || !x.native.wave64 {
+        return first;
+    }
+    let group = cs.threads.iter().product::<u32>();
+    let lds_dwords = cs.lds_bytes() / 4;
+    let mut wide = HashSet::new();
+    let mut st = None;
+    // (each round takes at least one more branch wave-wide)
+    for _ in 0..x.p.blocks.len() {
+        let more = to_widen(x.p, st.as_ref().unwrap_or(x.st), group, lds_dwords);
+        if more.is_empty() {
+            break;
+        }
+        wide.extend(more);
+        let Ok(now) = crate::structure::structure_wide(x.p, &wide) else { break };
+        let Ok(res) = crate::resource::track(x.p, &x.native.layout, x.native.stage, Some(&now))
+        else {
+            break;
+        };
+        let parts = Parts {
+            native: x.native,
+            p: x.p,
+            st: &now,
+            io: x.io,
+            res: &res,
+            inputs: x.inputs.clone(),
+            outputs: x.outputs.clone(),
+            prims: x.prims.clone(),
+            mesh_stride: x.mesh_stride,
+            host_lanes: x.host_lanes,
+        };
+        match lower_once(&parts) {
+            Ok(l) if l.wave_size == Some(32) => return l,
+            Ok(_) => st = Some(now),
+            Err(_) => break,
+        }
+    }
+    first
+}
+
 /// Why the console wave64 compute program `p` (`group` threads, `lds_dwords`
 /// of LDS) keeps 64-lane waves on a host of 32-lane waves; None when it runs
 /// in halves.
 pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Option<Why> {
+    keeps_64_at(p, st, group, lds_dwords).map(|k| k.why)
+}
+
+/// What keeps a program at 64-lane waves.
+struct Keep {
+    why: Why,
+    /// The block, one not every lane runs, that holds it: a lane branch
+    /// around it taken wave-wide ([`to_widen`]) would have every lane run it.
+    at: Option<usize>,
+}
+
+impl Keep {
+    fn fixed(why: Why) -> Option<Keep> {
+        Some(Keep { why, at: None })
+    }
+
+    fn at(why: Why, b: usize) -> Option<Keep> {
+        Some(Keep { why, at: Some(b) })
+    }
+}
+
+/// [`keeps_64`], with where the reason lies.
+fn keeps_64_at(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Option<Keep> {
     let two = match group {
         0..=32 => false,
         64 => true,
-        _ => return Some("a thread group of other than one console wave"),
+        _ => return Keep::fixed("a thread group of other than one console wave"),
     };
-    let all = match all_lane_blocks(st) {
-        Some(all) => all,
-        None => return Some("an indirect exit"),
+    let Some(all) = all_lane_blocks(st) else {
+        return Keep::fixed("an indirect exit");
     };
     let every = |b: usize| all.get(b).copied().unwrap_or(false);
-    if let Some(why) = sections_keep_64(p, two, every) {
-        return Some(why);
+    if let Some(keep) = sections_keep_64(p, two, every) {
+        return Some(keep);
     }
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let written: HashMap<Value, usize> = p
@@ -106,16 +190,21 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
             insts.chain(block.phis.iter().map(move |phi| (phi.value, b)))
         })
         .collect();
-    // Scalars written where not every lane runs.
-    let mut lane_scalars = HashSet::new();
+    // Scalars written where not every lane runs, with their block.
+    let mut lane_scalars = HashMap::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        for inst in &block.insts {
+        for (i, inst) in block.insts.iter().enumerate() {
             let n = inst.name();
             if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                return Some("ds_(b)permute");
+                return Keep::fixed("ds_(b)permute");
             }
             if two && !every(b) && matches!(n, "v_readlane_b32" | "v_readfirstlane_b32") {
-                return Some("a lane read where not every lane runs");
+                return Keep::at("a lane read where not every lane runs", b);
+            }
+            // EXEC narrowed without a branch: the first active lane is not lane 0.
+            let guarded = st.guards.get(b).and_then(|g| g.get(i)).is_some_and(Option::is_some);
+            if two && n == "v_readfirstlane_b32" && guarded {
+                return Keep::fixed("a first-lane read where EXEC is not every lane");
             }
             if two && reads_mask_as_data(st, inst) {
                 // The ballot is taken where the mask is written (`mask_dword`).
@@ -124,18 +213,20 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
                     // (program inputs, EXEC on entry, are the entry block's)
                     written.get(&low).copied().unwrap_or(0)
                 });
-                if mask_blocks.any(|m| !every(m)) {
-                    return Some("a lane mask read as a number, written where not every lane runs");
+                if let Some(m) = mask_blocks.find(|&m| !every(m)) {
+                    const WHY: Why =
+                        "a lane mask read as a number, written where not every lane runs";
+                    return Keep::at(WHY, m);
                 }
             }
             if every(b) {
                 continue;
             }
             if two && lds_dwords > 0 && lds_access(inst) {
-                return Some("LDS accessed where not every lane runs");
+                return Keep::at("LDS accessed where not every lane runs", b);
             }
             if n == "s_barrier" {
-                return Some("a group barrier where not every lane runs");
+                return Keep::at("a group barrier where not every lane runs", b);
             }
             let mask_op = inst.writes.iter().any(|&(r, w)| match r {
                 Reg::S(c) => c == EXEC || c == EXEC + 1 || is_mask(w),
@@ -150,14 +241,24 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
                     Reg::V(_) => false,
                 };
                 if scalar {
-                    lane_scalars.insert(w);
+                    lane_scalars.insert(w, b);
                 }
             }
         }
     }
-    // Read past the write only (dominated by it, as SSA has every read but a phi's), the
-    // copy of a half that skipped the block is never read. Through a phi at a join, or where
-    // every lane runs, it would be, where the console's wave has the new value.
+    lane_scalar_read_past(p, &lane_scalars, every)
+}
+
+/// A scalar of `lane_scalars` (written where not every lane runs, in the
+/// block given) read past its write. Read past the write only (dominated by
+/// it, as SSA has every read but a phi's), the copy of a half that skipped
+/// the block is never read. Through a phi at a join, or where every lane
+/// runs, it would be, where the console's wave has the new value.
+fn lane_scalar_read_past(
+    p: &Program,
+    lane_scalars: &HashMap<Value, usize>,
+    every: impl Fn(usize) -> bool,
+) -> Option<Keep> {
     let phi_reads = p.blocks.iter().flat_map(|block| &block.phis).flat_map(|phi| &phi.args);
     let all_lane_reads = p
         .blocks
@@ -166,30 +267,47 @@ pub(super) fn keeps_64(p: &Program, st: &Structured, group: u32, lds_dwords: u32
         .filter(|&(b, _)| every(b))
         .flat_map(|(_, block)| &block.insts)
         .flat_map(|i| i.reads.iter().map(|&(_, v)| v));
-    if phi_reads.copied().chain(all_lane_reads).any(|v| lane_scalars.contains(&v)) {
-        return Some("a scalar written where not every lane runs, read past it");
-    }
-    None
+    let written = phi_reads.copied().chain(all_lane_reads).find_map(|v| lane_scalars.get(&v));
+    written.and_then(|&b| Keep::at("a scalar written where not every lane runs, read past it", b))
+}
+
+/// The lane branches to take wave-wide next so that `p` could run in
+/// halves: those around the block holding the reason [`keeps_64`] gives,
+/// at blocks every lane runs, and not in a loop of their own (a loop each
+/// lane leaves on its own stays per lane). Empty when there is none.
+pub(super) fn to_widen(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Vec<usize> {
+    let Some(Keep { at: Some(at), .. }) = keeps_64_at(p, st, group, lds_dwords) else {
+        return Vec::new();
+    };
+    let Some(regions) = lane_regions(st) else {
+        return Vec::new();
+    };
+    let inside = |b: usize| regions.iter().any(|r| r.blocks.get(b).copied().unwrap_or(false));
+    regions
+        .iter()
+        .filter(|r| !r.cycle && !inside(r.branch) && r.blocks.get(at).copied().unwrap_or(false))
+        .map(|r| r.branch)
+        .collect()
 }
 
 /// Why the whole-wave sections of `p` keep 64-lane waves. In a group of two
 /// host waves each section lies where every lane runs, so that both halves
 /// reach the exchange of their results ([`Lower::whole_wave`]), and sums no
 /// floats: the console adds them in its own order.
-fn sections_keep_64(p: &Program, two: bool, every: impl Fn(usize) -> bool) -> Option<Why> {
+fn sections_keep_64(p: &Program, two: bool, every: impl Fn(usize) -> bool) -> Option<Keep> {
     if !two {
         return None;
     }
     for b in 0..p.blocks.len() {
         for section in super::super::wave::sections(p, b).values() {
             if !every(b) {
-                return Some("a whole-wave section where not every lane runs");
+                return Keep::at("a whole-wave section where not every lane runs", b);
             }
             let float_sum = section.shapes.values().any(|s| {
                 matches!(s, Shape::Active(WaveOp::AddF, ..) | Shape::Prefix(WaveOp::AddF, ..))
             });
             if float_sum {
-                return Some(FLOAT_SUM);
+                return Keep::fixed(FLOAT_SUM);
             }
         }
     }
@@ -221,9 +339,34 @@ fn mask_operands(inst: &Inst) -> impl Iterator<Item = Value> + '_ {
 
 /// Per IR block: every lane of the wave that started the program runs it,
 /// as no per-lane branch separates it from the entry (it lies in no lane
-/// branch's region: the blocks reachable from the branch that do not
-/// post-dominate it). None with an indirect exit, which is not followed.
+/// branch's region, [`lane_regions`]). A branch the wave takes together
+/// ([`Structured::wide`]) separates no lanes. None with an indirect exit,
+/// which is not followed.
 pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+    let mut all = vec![true; st.exits.len()];
+    for r in lane_regions(st)? {
+        for (a, inside) in all.iter_mut().zip(r.blocks) {
+            *a &= !inside;
+        }
+    }
+    Some(all)
+}
+
+/// The blocks some lanes of a wave may run and others not, past a per-lane
+/// branch.
+struct Region {
+    /// The block the branch closes.
+    branch: usize,
+    /// Per IR block: reachable from the branch without post-dominating it,
+    /// and in a loop the branch's own block.
+    blocks: Vec<bool>,
+    /// The branch can be reached again from its region: a loop.
+    cycle: bool,
+}
+
+/// The region of every per-lane branch that is not wide. None with an
+/// indirect exit, which is not followed.
+fn lane_regions(st: &Structured) -> Option<Vec<Region>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -235,25 +378,31 @@ pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
         }
     }
     let pdom = post_dominators(&succ);
-    let mut all = vec![true; n];
+    let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
-            continue; // a scalar test: every lane goes the same way
+        if st.wide.contains(&d)
+            || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+        {
+            continue; // every lane goes the same way
         }
-        // The blocks reachable from the branch that do not post-dominate it.
-        let mut seen = vec![false; n];
+        let mut blocks = vec![false; n];
+        let mut cycle = false;
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b] {
+            cycle |= b == d;
+            if blocks[b] || pdom[d][b] {
                 continue;
             }
-            seen[b] = true;
-            all[b] = false;
+            blocks[b] = true;
             stack.extend(&succ[b]);
         }
+        // In a loop each lane leaves on its own, the branch's block too runs
+        // as often as each lane goes round (it post-dominates itself).
+        blocks[d] |= cycle;
+        regions.push(Region { branch: d, blocks, cycle });
     }
-    Some(all)
+    Some(regions)
 }
 
 /// `pdom[b][c]`: block c post-dominates block b (every path from b to the
@@ -443,6 +592,36 @@ impl Lower<'_> {
             WaveOp::MinU => 40,
         };
         Ok(self.s.op(c, "binary.i32", Attr::ReadNone, i32t, code, &[lo, hi]))
+    }
+
+    /// The condition of the branch closing IR block `b`, which the console
+    /// wave takes as one ([`Structured::wide`]): taken when some lane's
+    /// `when` holds, or only when every lane's does
+    /// ([`Structured::wave_any`]). Each half asks its lanes and the halves
+    /// exchange the answer, so both go the same way. `b` is a block every
+    /// lane runs ([`to_widen`]).
+    pub(super) fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
+        let any =
+            self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar")?;
+        let c = self.cur;
+        let mine = self.boolean(when, c)?;
+        // What a half tells is whether some lane of it speaks against the
+        // other way: for `any`, some lane's `when` holds; else some lane's
+        // does not.
+        let against = if any {
+            mine
+        } else {
+            let t = self.s.m.bool(true);
+            self.s.m.bin(c, Bin::Xor, mine, t)
+        };
+        let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+        let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[against]);
+        self.s.flags |= flags::WAVE_OPS;
+        let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
+        let (lo, hi) = self.exchange(c, some);
+        let either = self.s.m.bin(c, Bin::Or, lo, hi);
+        let zero = self.s.m.i32(0);
+        Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, either, zero))
     }
 
     /// A group barrier with an LDS fence.
