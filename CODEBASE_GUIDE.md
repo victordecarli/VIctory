@@ -18,7 +18,7 @@ O executável do jogo roda como código x86-64 nativo dentro do processo do VIct
 | `victory-gpu` | Objetos D3D12.X, descritores, listas de comandos, rastreamento de memória/recursos, criação de pipelines e execução no D3D12 do host. Chama a tradução de shaders, mas não implementa sua semântica. |
 | `victory-hle` | Exports das APIs do console, agrupados em `modules`; objetos de runtime e política de passagem para APIs do host. Encaminha GPU para `victory-gpu` e decodificação para `victory-formats`. |
 | `apps/victory` | Apenas a interface de linha de comando: inspect, census, shader-info, translate, run e config. |
-| `xtask` | Verificações da política de assets e de citações, além da configuração de hooks. |
+| `xtask` | Verificações da política de assets e de citações, clippy do alvo Windows (`wincheck`), métricas (`audit-metrics`), o bloco de progresso de shaders do README (`progress`) e os hooks. |
 
 A direção das dependências deve seguir dos componentes de nível mais alto para os mais básicos: app → HLE; HLE → GPU/loader/PE/formats; GPU → shader/pipeline/formats; loader → core/PE; pipeline → core. Crates puros devem continuar portáveis e sem dependências de I/O, processos ou APIs do host. Para compartilhar uma função, não crie uma dependência no sentido inverso: coloque a lógica no crate inferior responsável por ela.
 
@@ -46,7 +46,7 @@ A memória do jogo é memória do processo; não é uma cópia isolada em um san
 
 Fluxo de tradução verificado: container do console → `victory_shader::ir::build` (decodificação nativa para SSA) → `structure` (conversão do fluxo de controle EXEC/lanes) → `resource` (proveniência de descritores e endereços) → `emit::translate` (DXIL e metadados do host). Os módulos centrais são `gfx10`, `native`, `ir`, `structure`, `resource` e `emit`.
 
-Em runtime, `victory-gpu/src/shader_cache.rs` chama `emit::translate` durante a criação do pipeline. A chave de entrada do cache inclui uma impressão digital do executável/configurações do VIctory e os bytes do container; `HostShader` é serializado no formato `VSH1`. Ao ampliar `HostShader`, atualize tanto `encode` quanto `decode`. `victory-pipeline::Converter` exige `id` estável, incremento de `version` quando a semântica do resultado mudar e conversão determinística. Falhas de tradução podem impedir a criação do pipeline ou descartar draws; a cobertura incompleta de shaders é uma limitação conhecida da renderização.
+Em runtime, `victory-gpu/src/shader_cache.rs` chama `emit::translate` durante a criação do pipeline. A chave de entrada do cache inclui uma impressão digital do executável/configurações do VIctory e os bytes do container; `HostShader` é gravado e lido por `HostShader::to_bytes`/`from_bytes` (`crates/victory-shader/src/emit/persist.rs`, formato `VSH2`); um campo novo não compila até ser tratado lá. `victory-pipeline::Converter` exige `id` estável, incremento de `version` quando a semântica do resultado mudar e conversão determinística. Falhas de tradução podem impedir a criação do pipeline ou descartar draws; a cobertura incompleta de shaders é uma limitação conhecida da renderização.
 
 ### Integração D3D12
 

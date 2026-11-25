@@ -44,7 +44,7 @@ show what it cannot handle; it does not fill the cache.
 | `victory-pipeline` | converter trait, content-addressed cache (used for translated shaders) |
 | `victory-game` | Grand Theft Auto VI-specific formats (SGD5 shader files), build identities |
 | `apps/victory` | command-line front end |
-| `xtask` | asset-policy check, `AGENTS.md` citation check, Windows-target clippy from any host (`wincheck`), per-crate code metrics as JSON (`audit-metrics`), git hooks |
+| `xtask` | asset-policy check, `AGENTS.md` citation check, Windows-target clippy from any host (`wincheck`), per-crate code metrics as JSON (`audit-metrics`), the README's shader progress block (`progress`), git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
 
 Everything except `victory-game` is platform-level and can be tested with
