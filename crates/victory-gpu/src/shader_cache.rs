@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
+use victory_shader::ShaderError;
 use victory_shader::emit::HostShader;
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -76,14 +77,32 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// Why a shader has no translation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TranslateError {
+    /// The translator refused the shader.
+    Shader(ShaderError),
+    /// The shader cache failed: not the shader's doing.
+    Cache(String),
+}
+
+impl std::fmt::Display for TranslateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TranslateError::Shader(e) => e.fmt(f),
+            TranslateError::Cache(e) => write!(f, "shader cache: {e}"),
+        }
+    }
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, TranslateError> {
     let lanes = host_lanes();
-    let translate = |c: &[u8]| victory_shader::emit::translate(c, lanes).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| victory_shader::emit::translate(c, lanes);
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
-        None => translate(container),
+        None => translate(container).map_err(TranslateError::Shader),
     }
 }
 
@@ -94,7 +113,7 @@ struct Translate<F> {
     ran: AtomicBool,
 }
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl<F: Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
@@ -104,7 +123,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        // Typed, so `cached` can tell the translator's refusal from the
+        // cache's own failure.
+        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::new)?;
         Ok(shader.to_bytes())
     }
 }
@@ -113,12 +134,18 @@ fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
-    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> Result<HostShader, String> {
+    translate: impl Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync,
+) -> Result<HostShader, TranslateError> {
     let input = [&build[..], container].concat();
     let converter = Translate { translate, ran: AtomicBool::new(false) };
     for _ in 0..2 {
-        let path = cache.get_or_convert(&converter, &input).map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => match e.downcast::<ShaderError>() {
+                Ok(refused) => return Err(TranslateError::Shader(refused)),
+                Err(e) => return Err(TranslateError::Cache(format!("{e:#}"))),
+            },
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| HostShader::from_bytes(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -135,7 +162,7 @@ fn cached(
         }
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    (converter.translate)(container).map_err(TranslateError::Shader)
 }
 
 #[cfg(test)]
@@ -187,7 +214,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        let fail = |_: &[u8]| Err::<HostShader, _>(ShaderError::NotDxbc);
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }
 
@@ -201,6 +228,18 @@ mod tests {
             }
         }
         files
+    }
+
+    /// A translation the translator refuses comes back through the cache
+    /// with the translator's own error, not as text.
+    #[test]
+    fn a_refused_translation_keeps_its_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let unsupported = || ShaderError::Unsupported { offset: 0x40, what: "v_example" };
+        let refuse = |_: &[u8]| Err::<HostShader, _>(unsupported());
+        let refused = cached(&cache, &[7; 32], b"a container", refuse);
+        assert_eq!(refused, Err(TranslateError::Shader(unsupported())));
     }
 
     /// A host of other wave lanes translates differently: its entries are

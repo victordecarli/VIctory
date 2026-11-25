@@ -21,6 +21,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(windows)]
 use victory_shader::emit::HostShader;
 
+#[cfg(windows)]
+use crate::shader_cache::TranslateError;
+
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 use hash::ShaderHash;
@@ -60,7 +63,7 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     /// Shared, so a host pipeline's stages can hold it (see `host::Stage`).
     #[cfg(windows)]
-    translated: OnceLock<Option<Arc<HostShader>>>,
+    translated: OnceLock<Result<Arc<HostShader>, TranslateError>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -114,9 +117,10 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
-                done.ok().map(Arc::new)
+                done.map(Arc::new)
             })
             .as_ref()
+            .ok()
     }
 }
 

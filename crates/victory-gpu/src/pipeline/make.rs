@@ -77,7 +77,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
             let failed: Vec<String> = p
                 .shaders
                 .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
+                .filter(|s| matches!(s.translated.get(), Some(Err(_))))
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
