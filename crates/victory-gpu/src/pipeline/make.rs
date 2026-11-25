@@ -45,7 +45,7 @@ impl Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
+            key.update(&s.hash.hex());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {

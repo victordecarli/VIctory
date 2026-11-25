@@ -23,6 +23,7 @@ use victory_shader::emit::HostShader;
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+use hash::ShaderHash;
 
 const PIPELINE_IIDS: [Iid; 4] = [
     guid(0x765a30f3, 0xf624, 0x4c6f, [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45]),
@@ -54,8 +55,8 @@ pub(crate) struct ComputeHead {
 /// same bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
-    /// The first 8 bytes of its BLAKE3, as logged.
-    pub(crate) hash: String,
+    /// Its name in logs.
+    pub(crate) hash: ShaderHash,
     container: Vec<u8>,
     /// Shared, so a host pipeline's stages can hold it (see `host::Stage`).
     #[cfg(windows)]
@@ -81,7 +82,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                hash: ShaderHash::of(&full),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
@@ -196,25 +197,24 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+fn parse_skip_hashes(value: &str) -> Vec<ShaderHash> {
     value
         .split(',')
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
-            if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                Some(hash.to_ascii_lowercase())
-            } else {
+            let parsed = ShaderHash::parse(hash);
+            if parsed.is_none() {
                 tracing::warn!(hash, "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes");
-                None
             }
+            parsed
         })
         .collect()
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+fn skipped_shader(p: &Pipeline) -> Option<ShaderHash> {
+    static HASHES: OnceLock<Vec<ShaderHash>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
@@ -222,7 +222,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders.iter().find(|shader| hashes.contains(&shader.hash)).map(|shader| shader.hash.as_str())
+    p.shaders.iter().map(|shader| shader.hash).find(|hash| hashes.contains(hash))
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -527,6 +527,7 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+mod hash;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -553,10 +554,10 @@ mod tests {
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
-        assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
-            ["0123456789abcdef", "0011223344556677"]
-        );
+        let parsed =
+            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,");
+        let written: Vec<String> = parsed.iter().map(ToString::to_string).collect();
+        assert_eq!(written, ["0123456789abcdef", "0011223344556677"]);
     }
 
     use super::*;
