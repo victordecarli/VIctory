@@ -272,20 +272,24 @@ impl State {
             let Some(texture) = found else {
                 continue;
             };
+            let Some(rtv) = host.rtv(texture, record.desc().as_ref()) else {
+                continue;
+            };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs.push(rtv);
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             // SAFETY: a resource this crate created, which the title keeps alive
             // while it is in use.
             let texture = unsafe { crate::resource::host_resource(record.resource) }?;
+            let dsv = host.dsv(texture, record.depth_desc().as_ref())?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some(dsv)
         });
         // SAFETY: an open list; the views were just made.
         unsafe {

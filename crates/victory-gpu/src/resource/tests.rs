@@ -192,6 +192,25 @@ fn full_screen_targets_get_a_host_texture() {
     assert!(wrong.is_empty(), "(format, flags asked, host flags) {wrong:?}");
 }
 
+/// A host copy that went without its render target use gets no render
+/// target view (the host removes the device for one); a full one does.
+#[cfg(windows)]
+#[test]
+fn a_target_without_its_render_target_use_gets_no_view() {
+    let Some(host) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    const RENDER_TARGET: u32 = 1;
+    let target = |format: u32| {
+        let desc = ResourceDesc { flags: RENDER_TARGET, ..texture(64, 64, format, 1) };
+        let clear: [u32; 5] = [format, 0, 0, 0, 0];
+        // SAFETY: a whole clear value.
+        unsafe { host_texture(&desc, 0, clear.as_ptr().cast()) }.unwrap()
+    };
+    assert!(host.rtv(&target(115), None).is_none(), "B4G4R4A4_UNORM has no render target use");
+    assert!(host.rtv(&target(28), None).is_some(), "R8G8B8A8_UNORM keeps it");
+}
+
 /// A 4x4 texture filled from a title buffer through our list and queue,
 /// then read back from the host GPU.
 #[cfg(windows)]
