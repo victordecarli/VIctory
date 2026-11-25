@@ -92,9 +92,13 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// What a diagnostics build names, by switch: the debug layer reports
+/// invalid calls; a hang or page fault stops where DRED's breadcrumbs say.
+const SWITCHES_HINT: &str = "; a diagnostics build names the command: VICTORY_D3D12_DEBUG=1 \
+     for invalid calls, VICTORY_D3D12_DRED=1 for hangs and page faults";
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
-/// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
-/// diagnostics build names the command).
+/// the debug layer's first error, if any (else [`SWITCHES_HINT`]).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
     if let Some(host) = host() {
@@ -104,9 +108,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => {
-                text.push_str("; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command")
-            }
+            None if host.messages.is_none() => text.push_str(SWITCHES_HINT),
             None => {}
         }
     }
@@ -266,6 +268,26 @@ mod tests {
         eprintln!("EnumWarpAdapter: vendor={:#x}, flags={:#x}", desc.VendorId, desc.Flags);
         assert_eq!(warp_adapter().is_ok(), desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,);
     }
+
+    /// A device removed with DRED off: the breadcrumbs query fails with
+    /// DXGI_ERROR_UNSUPPORTED, which must not read as "this host lacks it".
+    #[test]
+    fn missing_breadcrumbs_with_dred_off_name_the_switch() {
+        let unsupported = windows::core::Error::from_hresult(DXGI_ERROR_UNSUPPORTED);
+        let off = no_breadcrumbs(false, &unsupported);
+        assert!(off.contains("VICTORY_D3D12_DRED=1"), "{off}");
+        assert!(!off.contains("0x887A0004"), "{off}");
+        // With DRED on, the report is the one it always was.
+        let on = no_breadcrumbs(true, &unsupported);
+        assert_eq!(on, format!("; no breadcrumbs ({unsupported})"));
+    }
+
+    /// The debug layer names invalid calls; hangs and page faults need DRED.
+    #[test]
+    fn the_failure_hint_names_both_switches() {
+        assert!(SWITCHES_HINT.contains("VICTORY_D3D12_DEBUG=1"), "{SWITCHES_HINT}");
+        assert!(SWITCHES_HINT.contains("VICTORY_D3D12_DRED=1"), "{SWITCHES_HINT}");
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -319,6 +341,19 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
+}
+
+/// The report when DRED has no breadcrumbs. With DRED off the query fails
+/// because nothing recorded them, not because the host lacks DRED: say
+/// which switch records them instead of the query's error.
+fn no_breadcrumbs(dred: bool, e: &windows::core::Error) -> String {
+    if dred {
+        format!("; no breadcrumbs ({e})")
+    } else {
+        "; DRED is off (VICTORY_D3D12_DRED=1 in a diagnostics build names the stopped list \
+         and command)"
+            .to_owned()
+    }
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -647,7 +682,7 @@ impl Host {
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&no_breadcrumbs(dred_on(), &e));
                     return text;
                 }
             };
