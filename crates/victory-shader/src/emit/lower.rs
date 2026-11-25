@@ -47,6 +47,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Group barriers emitted.
+    #[cfg(test)]
+    pub barriers: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -937,6 +940,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            barriers: self.s.barriers,
             wave_size: self.s.wave_size,
             dxil: self.s.finish().map_err(Stop::Fail)?,
             user_data,
@@ -2193,6 +2198,10 @@ impl<'a> Lower<'a> {
         let reserved = self.halves.as_ref().map_or(0, halves::Halves::dwords);
         if self.s.lds_dwords == reserved {
             return Err("LDS the program does not allocate");
+        }
+        if self.halves.as_ref().is_some_and(halves::Halves::orders_lds) {
+            // The console wave's LDS order across its two host waves.
+            self.group_sync(self.cur);
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
