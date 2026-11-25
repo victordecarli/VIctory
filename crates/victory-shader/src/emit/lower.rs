@@ -20,6 +20,8 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod halves;
+
 type Why = &'static str;
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +39,8 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// The lanes per wave the program declares it needs (`WaveSize`).
+    pub wave_size: Option<u32>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -56,6 +60,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The most lanes a host wave has (see [`super::translate`]).
+    pub host_lanes: u32,
 }
 
 enum Stop {
@@ -222,6 +228,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// A console wave64 program run as two host waves of 32 ([`halves`]).
+    halves: Option<halves::Halves>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -365,6 +373,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut split = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -407,6 +416,16 @@ impl<'a> Lower<'a> {
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            // A host of 32-lane waves refuses `WaveSize(64)`: two host waves
+            // of 32 where that is exact.
+            let group = cs.threads.iter().product::<u32>();
+            if s.wave_size == Some(64)
+                && x.host_lanes == 32
+                && halves::keeps_64(p, x.st, group, s.lds_dwords).is_none()
+            {
+                s.wave_size = Some(32);
+                split = Some(halves::Halves::new(&mut s.lds_dwords, group));
             }
         }
         let mut no_barrier = HashSet::new();
@@ -520,6 +539,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            halves: split,
         }
     }
 
@@ -917,6 +937,7 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            wave_size: self.s.wave_size,
             dxil: self.s.finish().map_err(Stop::Fail)?,
             user_data,
             samplers: self.samplers,
@@ -1219,7 +1240,11 @@ impl<'a> Lower<'a> {
                     .s
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                if self.halves.is_some() {
+                    // Each half's 32 lanes: the console mask's low and high dwords.
+                    xy = self.exchange(at, xy.0);
+                }
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -1650,14 +1675,18 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        let lane = self.s.op(
-            at,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        );
+        let lane = if self.halves.is_some() {
+            self.console_lane()
+        } else {
+            self.s.op(
+                at,
+                "waveGetLaneIndex",
+                Attr::ReadOnly,
+                self.s.t.i32,
+                111,
+                &[],
+            )
+        };
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -1895,6 +1924,19 @@ impl<'a> Lower<'a> {
             return Val::Missing("console lanes outside a compute shader");
         };
         let e = self.s.entry;
+        if self.halves.is_some() {
+            let f = self.console_thread();
+            self.s.flags |= flags::WAVE_OPS;
+            let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
+            return Val::I32(match c {
+                0 => self.s.m.bin(e, Bin::URem, f, xk),
+                1 => {
+                    let t = self.s.m.bin(e, Bin::UDiv, f, xk);
+                    self.s.m.bin(e, Bin::URem, t, yk)
+                }
+                _ => self.s.m.bin(e, Bin::UDiv, f, xy),
+            });
+        }
         let i32t = self.s.t.i32;
         let flat = self.s.op(
             e,
@@ -2003,6 +2045,9 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
+        if self.halves.is_some() {
+            return self.console_lane();
+        }
         self.s.op(
             self.cur,
             "waveGetLaneIndex",
@@ -2038,6 +2083,14 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        // In halves, console lane `lane` is host lane `lane & 31` of the half
+        // holding it; DPP and `ds_swizzle` stay in the reading lane's half.
+        let lane = if self.halves.is_some() {
+            let k31 = self.s.m.i32(31);
+            self.s.m.bin(self.cur, Bin::And, lane, k31)
+        } else {
+            lane
+        };
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -2136,7 +2189,9 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
+        // The halves' own dwords are not the program's.
+        let reserved = self.halves.as_ref().map_or(0, halves::Halves::dwords);
+        if self.s.lds_dwords == reserved {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
@@ -4216,7 +4271,11 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
-                let r = self.read_lane(a, lane);
+                let r = if self.halves.is_some() {
+                    self.console_read_lane(a, lane)
+                } else {
+                    self.read_lane(a, lane)
+                };
                 int(self, r)
             }
             "v_writelane_b32" => {
@@ -4244,6 +4303,11 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32" if self.halves.is_some() => {
+                let a = s(self, 0)?;
+                let r = self.console_first_lane(a);
+                int(self, r)
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
@@ -7003,6 +7067,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_lanes: crate::emit::CONSOLE_WAVE,
         })
         .map(|_| ())
     }
@@ -7053,6 +7118,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_lanes: crate::emit::CONSOLE_WAVE,
         })
     }
 
@@ -7156,6 +7222,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_lanes: crate::emit::CONSOLE_WAVE,
         }).unwrap();
 
         let container =

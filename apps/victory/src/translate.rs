@@ -34,6 +34,8 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
     /// Validator failures seen so far by first error line, for the dumps.
     dumped: HashMap<String, usize>,
+    /// The most lanes a host wave has, translated for (`--host-lanes`).
+    host_lanes: u32,
 }
 
 impl Checks {
@@ -45,6 +47,7 @@ impl Checks {
         validate: bool,
         pipelines: bool,
         keep: Option<Kept>,
+        host_lanes: u32,
     ) -> Result<Self> {
         let validator = validate
             .then(|| Validator::load(dll))
@@ -59,6 +62,7 @@ impl Checks {
             validator,
             host,
             dumped: HashMap::new(),
+            host_lanes,
         })
     }
 }
@@ -69,6 +73,7 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    host_lanes: u32,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -86,7 +91,7 @@ pub fn run(
     let mut checks = (0..threads)
         .map(|_| {
             let keep = (!pairs.is_empty()).then(|| kept.clone());
-            Checks::new(dll.as_deref(), validate, pipelines, keep)
+            Checks::new(dll.as_deref(), validate, pipelines, keep, host_lanes)
         })
         .collect::<Result<Vec<_>>>()?;
     if validate {
@@ -95,6 +100,9 @@ pub fn run(
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
+    }
+    if host_lanes != emit::CONSOLE_WAVE {
+        println!("host lanes   {host_lanes}");
     }
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::new(list));
@@ -166,8 +174,9 @@ pub fn run(
         t.emitted, t.emit_programs, t.validated, t.pipelines
     );
     println!(
-        "             {} emitted of {} compute programs; {} validated, {} pipelines",
-        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
+        "             {} emitted of {} compute programs; {} validated, {} pipelines; \
+         {} need 64-lane waves (a 32-lane host refuses them)",
+        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines, t.cs_wave64
     );
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
@@ -316,9 +325,12 @@ fn program(
             if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                 let label = || format!("{} {:?}", example(), p.stage);
                 *counters(t, p.stage)[0] += 1;
-                match emit::emit(container, p, &program, &s, &i, &r) {
+                match emit::emit(container, p, &program, &s, &i, &r, checks.host_lanes) {
                     Ok(shader) => {
                         *counters(t, p.stage)[1] += 1;
+                        if shader.stage == HwStage::Cs && shader.wave_size == Some(64) {
+                            t.cs_wave64 += 1;
+                        }
                         check(shader, t, checks, label);
                     }
                     Err(ShaderError::Unsupported { offset, what }) => t

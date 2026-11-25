@@ -94,6 +94,8 @@ mod valu_tests;
 #[cfg(windows)]
 mod waterfall_tests;
 mod wave;
+#[cfg(test)]
+mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -157,6 +159,11 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// The lanes per wave the shader requires (`WaveSize`), if any: a
+    /// console wave64 compute program that reads other lanes, or one wave
+    /// sharing LDS, needs the console's. A host whose waves have fewer lanes
+    /// refuses its pipeline.
+    pub wave_size: Option<u32>,
 }
 
 impl HostShader {
@@ -181,9 +188,16 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// A host whose waves hold a console wave of 64 lanes: as the most lanes
+/// of a host wave ([`translate`]'s `host_lanes`), no program is split.
+pub const CONSOLE_WAVE: u32 = 64;
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
-pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+/// shader container for a host whose waves have at most `host_lanes` lanes
+/// (`WaveLaneCountMax`). With 32, a console wave64 compute program that
+/// needs its 64 lanes runs as two host waves of 32 where that is exact
+/// (`lower::halves`); with [`CONSOLE_WAVE`] or more it keeps its wave size.
+pub fn translate(container: &[u8], host_lanes: u32) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c.part(FourCC::DXIL).ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
@@ -200,7 +214,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit(&c, &native, &p, &st, &io, &res, host_lanes)
 }
 
 /// Every container part [`translate`] and [`emit`] read: the programs
@@ -211,7 +225,8 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 pub const INPUT_PARTS: [FourCC; 5] =
     [FourCC::DXIL, FourCC::ISG1, FourCC::OSG1, FourCC::PSG1, FourCC::PSV0];
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, for a host whose waves
+/// have at most `host_lanes` lanes (see [`translate`]).
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -219,6 +234,7 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    host_lanes: u32,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -283,6 +299,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        host_lanes,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -303,6 +320,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        wave_size: l.wave_size,
     })
 }
 
@@ -467,7 +485,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res, CONSOLE_WAVE).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -508,9 +526,42 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
+        if let Err(e) = emit(&c, &native, &p, &st, &io, &res, CONSOLE_WAVE) {
             assert!(e.to_string().contains("its own value"), "{e}");
         }
+    }
+
+    /// The lanes a compute program's waves must have travel with its
+    /// translation: a wave64 program that reads another lane needs the
+    /// console's 64 (a host whose waves have 32 refuses it); one whose lanes
+    /// read only their own needs none.
+    #[test]
+    fn a_compute_program_states_the_wave_size_it_needs() {
+        // One console wave of 64 threads, no LDS.
+        let emit_cs = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 2,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [64, 1, 1] }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let container = crate::dxbc::build(&[]);
+            let c = Container::parse(&container).unwrap();
+            emit(&c, &native, &p, &st, &io, &res, CONSOLE_WAVE).unwrap()
+        };
+        // v_readlane_b32 s2, v0, 3; s_endpgm
+        let other_lane = emit_cs(&[0xD760_0002, 0x0001_0700, 0xBF81_0000]);
+        assert_eq!(other_lane.wave_size, Some(64));
+        // v_mov_b32 v1, v0; s_endpgm
+        let own_lane = emit_cs(&[0x7E02_0300, 0xBF81_0000]);
+        assert_eq!(own_lane.wave_size, None);
     }
 
     /// A pixel shader writing a constant colour.
@@ -553,6 +604,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            wave_size: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -563,6 +615,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                wave_size: None,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -658,7 +711,7 @@ mod tests {
             let st = crate::structure::structure(&p).unwrap();
             let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
-            let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let out = super::emit(&c, &native, &p, &st, &io, &res, CONSOLE_WAVE).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
             #[cfg(windows)]
             if let Ok(mut v) = super::validator::Validator::load(
@@ -728,6 +781,6 @@ mod tests {
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
-        let _ = super::emit(&c, &native, &p, &st, &io, &res);
+        let _ = super::emit(&c, &native, &p, &st, &io, &res, CONSOLE_WAVE);
     }
 }

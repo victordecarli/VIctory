@@ -63,6 +63,9 @@ pub(super) struct Tally {
     pub(super) cs_emitted: usize,
     pub(super) cs_validated: usize,
     pub(super) cs_pipelines: usize,
+    /// Compute programs emitted that require 64-lane waves (`WaveSize(64)`):
+    /// a host whose waves have 32 lanes (NVIDIA) refuses their pipelines.
+    pub(super) cs_wave64: usize,
     /// The same for mesh programs.
     pub(super) ms_programs: usize,
     pub(super) ms_emitted: usize,
@@ -173,6 +176,7 @@ impl Tally {
             cs_emitted,
             cs_validated,
             cs_pipelines,
+            cs_wave64,
             ms_programs,
             ms_emitted,
             ms_validated,
@@ -222,6 +226,7 @@ impl Tally {
         self.cs_emitted += cs_emitted;
         self.cs_validated += cs_validated;
         self.cs_pipelines += cs_pipelines;
+        self.cs_wave64 += cs_wave64;
         self.ms_programs += ms_programs;
         self.ms_emitted += ms_emitted;
         self.ms_validated += ms_validated;

@@ -2,10 +2,14 @@
 //! integrated GPU on a machine that also has a discrete one, so the device
 //! goes on the first hardware adapter in DXGI's high-performance order
 //! (external, then discrete, then integrated GPUs) that makes a feature
-//! level 12_0 device, and the adapter is logged once at start-up.
+//! level 12_0 device, and the adapter and its wave lanes are logged once at
+//! start-up.
 
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1, D3D12CreateDevice,
+    ID3D12Device,
+};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::Interface;
 
@@ -118,6 +122,38 @@ fn log_adapter(device: &ID3D12Device) {
             );
         }
         Err(e) => tracing::warn!(error = %e, "the host device's adapter could not be described"),
+    }
+}
+
+/// The most lanes a wave of `device` has, logged with the least. A console
+/// wave64 program that needs its 64 lanes declares `WaveSize(64)`, which a
+/// host whose maximum is 32 (NVIDIA) refuses, so shaders are translated for
+/// it ([`victory_shader::emit::translate`]). If the query fails: 64, which
+/// translates as if the host's waves held the console's.
+pub(crate) fn wave_lanes(device: &ID3D12Device) -> u32 {
+    let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the query writes the structure of the given size.
+    let queried = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut o1).cast(),
+            size_of_val(&o1) as u32,
+        )
+    };
+    match queried {
+        Ok(()) => {
+            tracing::info!(
+                min = o1.WaveLaneCountMin,
+                max = o1.WaveLaneCountMax,
+                wave_ops = o1.WaveOps.as_bool(),
+                "host wave lanes"
+            );
+            o1.WaveLaneCountMax
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "the host's wave lanes could not be queried; taken as 64");
+            victory_shader::emit::CONSOLE_WAVE
+        }
     }
 }
 

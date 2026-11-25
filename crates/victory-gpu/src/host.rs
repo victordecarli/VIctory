@@ -53,6 +53,9 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// The most lanes a wave of the device has: shaders are translated for
+    /// it (`shader_cache`).
+    pub(crate) wave_lanes: u32,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -186,6 +189,7 @@ fn create() -> windows::core::Result<Host> {
             device = Some(crate::adapter::create_device()?);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let wave_lanes = crate::adapter::wave_lanes(&device);
         let messages = debug.then(|| device.cast::<ID3D12InfoQueue>().ok()).flatten();
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -222,6 +226,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            wave_lanes,
         })
     }
 }
