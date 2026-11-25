@@ -144,7 +144,23 @@ target\release\victory.exe run --execute
 ```
 
 Without a path, `run` starts the only `.exe` at the top of the configured
-`game_dir`; give the executable's path to run another.
+`game_dir`; give the executable's path to run another. Run it from the
+repository root, where `victory.toml` is.
+
+For tests, `scripts\run.ps1` does all of that. It builds the diag build
+(see [Debugging](#debugging); `-Release` for the one above), runs the title
+from the repository root with only the switches it is given (`-Warp`,
+`-GpuDebug`, `-Gbv`, `-Log <filter>`, `-Keys <keys>`, `-Env @{ NAME =
+'value' }`), leaving the session's `VICTORY_*` switches out of the run
+unless `-KeepEnv`, and when the title ends shows the run log's summary:
+the last frame report, the costliest dropped draws and a crash.
+`scripts\run-summary.ps1` shows the newest run again;
+`Get-Help scripts\run.ps1 -Full` lists every option.
+
+```powershell
+scripts\run.ps1 -Warp                       # software adapter: enters the world without a GPU hang
+scripts\run.ps1 -GpuDebug -Log 'victory_gpu=debug,info'
+```
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
