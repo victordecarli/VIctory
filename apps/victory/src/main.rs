@@ -17,9 +17,9 @@ mod shader;
 mod translate;
 mod walk;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -101,7 +101,9 @@ enum Command {
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
-        exe: PathBuf,
+        /// The title's executable. Default: the only `.exe` at the top of
+        /// the configured game_dir.
+        exe: Option<PathBuf>,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -162,7 +164,7 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, jobs, host_lanes, json)
         }
         Command::Run { exe, unimplemented, strict, execute, console, title_args: _ } => {
-            run::run(&exe, unimplemented, strict, execute, console)
+            run::run(&title_exe(exe)?, unimplemented, strict, execute, console)
         }
         Command::Config => show_config(),
     }
@@ -222,9 +224,72 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(all)
 }
 
+/// `exe`, or the configured game's: the only `.exe` at the top of
+/// `game_dir`.
+fn title_exe(exe: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(exe) = exe {
+        return Ok(exe);
+    }
+    let cfg = victory_core::Config::load()?;
+    let dir = cfg
+        .game_dir
+        .context("no executable given and no game_dir configured (see victory.example.toml)")?;
+    only_exe(&dir)
+}
+
+/// The only `.exe` file directly in `dir`.
+fn only_exe(dir: &Path) -> Result<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) && path.is_file() {
+            found.push(path);
+        }
+    }
+    found.sort();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!("no .exe in {}; give the title's executable", dir.display()),
+        several => {
+            let names: Vec<String> = several.iter().map(|p| p.display().to_string()).collect();
+            anyhow::bail!(
+                "several executables in {}: {}; give the one to run",
+                dir.display(),
+                names.join(", ")
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_takes_the_executable_or_nothing() {
+        assert!(Cli::try_parse_from(["victory", "run", "--execute"]).is_ok());
+        assert!(Cli::try_parse_from(["victory", "run", "title.exe", "--execute"]).is_ok());
+    }
+
+    #[test]
+    fn the_only_exe_of_a_folder_is_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("title.exe"), b"").unwrap();
+        std::fs::write(dir.path().join("library.dll"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("tools.exe")).unwrap();
+        assert_eq!(only_exe(dir.path()).unwrap(), dir.path().join("title.exe"));
+    }
+
+    #[test]
+    fn a_folder_with_no_exe_or_several_names_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = only_exe(dir.path()).unwrap_err().to_string();
+        assert!(none.contains("no .exe"), "{none}");
+        std::fs::write(dir.path().join("a.exe"), b"").unwrap();
+        std::fs::write(dir.path().join("b.EXE"), b"").unwrap();
+        let several = only_exe(dir.path()).unwrap_err().to_string();
+        assert!(several.contains("a.exe") && several.contains("b.EXE"), "{several}");
+    }
 
     #[test]
     fn translate_json_needs_validate() {

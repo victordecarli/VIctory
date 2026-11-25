@@ -140,8 +140,11 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+target\release\victory.exe run --execute
 ```
+
+Without a path, `run` starts the only `.exe` at the top of the configured
+`game_dir`; give the executable's path to run another.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
@@ -168,7 +171,7 @@ victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N] [--host-lanes N]
                   [--json <file>]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+victory run [exe] [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
