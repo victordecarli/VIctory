@@ -1,5 +1,9 @@
 //! Host D3D12 checks for emitted shaders: pipeline creation and, for
 //! tests, drawing a full-screen triangle and reading the target back.
+//!
+//! Root signatures come from [`HostRootLayout`] through one translation
+//! (`root`), so the pipelines made here have the root signature the layout
+//! decides and the tests read the parameter indices from it.
 
 use std::ffi::CString;
 
@@ -9,12 +13,38 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
-use super::HostShader;
 use super::container::SigElement;
+use super::{GraphicsStage, HostRootLayout, HostShader};
 use crate::dxbc::{Container, FourCC};
+
+mod root;
+
+pub use root::root_signature;
 
 pub struct Host {
     pub device: ID3D12Device,
+}
+
+/// A host pipeline: its root signature, the state object, and the layout
+/// the root signature was made from (where each stage's bindings are).
+pub struct Pipeline {
+    pub root: ID3D12RootSignature,
+    pub pso: ID3D12PipelineState,
+    pub layout: HostRootLayout,
+}
+
+#[cfg(test)]
+impl Pipeline {
+    /// The root argument for the user data of stage `stage`, resolved by
+    /// `resolve`; none when the stage reads none.
+    pub fn user_data(
+        &self,
+        stage: usize,
+        resolve: impl FnMut(&super::UserData) -> u32,
+    ) -> Option<(u32, Root)> {
+        let c = self.layout.stages().get(stage)?.user_data(resolve)?;
+        Some((c.param, Root::Constants(c.values)))
+    }
 }
 
 /// What the stage declares that a pipeline must match.
@@ -98,124 +128,13 @@ impl Host {
         }
     }
 
-    /// The root signature translated shaders expect: user data per stage
-    /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
-    /// indexed.
-    pub fn root_signature(
-        &self,
-        vs: &HostShader,
-        ps: &HostShader,
-    ) -> Result<ID3D12RootSignature, String> {
-        self.root_signature_for(&[
-            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
-            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
-        ])
-    }
-
-    /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow.
-    pub fn root_signature_for(
-        &self,
-        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
-    ) -> Result<ID3D12RootSignature, String> {
-        let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
-            .iter()
-            .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                    Constants: D3D12_ROOT_CONSTANTS {
-                        ShaderRegister: 0,
-                        RegisterSpace: super::USER_DATA_SPACE,
-                        Num32BitValues: s.user_data_dwords().max(1),
-                    },
-                },
-                ShaderVisibility: vis,
-            })
-            .collect();
-        let mut views: Vec<(u8, bool)> = stages
-            .iter()
-            .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
-            })
-            .collect();
-        views.sort_unstable();
-        views.dedup();
-        for (slot, srv) in views {
-            params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
-                },
-                Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                        ShaderRegister: u32::from(slot),
-                        RegisterSpace: super::ROOT_CBV_SPACE,
-                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
-                    },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            });
-        }
-        let mut samplers = Vec::new();
-        for &(s, vis) in stages {
-            for (n, d) in s.static_samplers.iter().enumerate() {
-                let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
-                samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter as i32),
-                    AddressU: u,
-                    AddressV: v,
-                    AddressW: w,
-                    MipLODBias: d.mip_lod_bias,
-                    MaxAnisotropy: d.max_anisotropy,
-                    ComparisonFunc: D3D12_COMPARISON_FUNC(d.comparison as i32),
-                    BorderColor: D3D12_STATIC_BORDER_COLOR(d.border as i32),
-                    MinLOD: d.min_lod,
-                    MaxLOD: d.max_lod,
-                    ShaderRegister: n as u32,
-                    RegisterSpace: super::SAMPLER_SPACE,
-                    ShaderVisibility: vis,
-                });
-            }
-        }
-        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
-            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
-            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
-                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                    NumParameters: params.len() as u32,
-                    pParameters: params.as_ptr(),
-                    NumStaticSamplers: samplers.len() as u32,
-                    pStaticSamplers: samplers.as_ptr(),
-                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-                        | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
-                },
-            },
-        };
-        // SAFETY: the description points at live arrays.
-        unsafe {
-            let mut blob = None;
-            let mut error = None;
-            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
-            let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
-            let bytes = std::slice::from_raw_parts(
-                blob.GetBufferPointer().cast::<u8>(),
-                blob.GetBufferSize(),
-            );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
-        }
-    }
-
-    /// A compute pipeline; user data is root parameter 0.
-    pub fn compute_pipeline(
-        &self,
-        cs: &HostShader,
-    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-        let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
+    /// A compute pipeline under the root signature of
+    /// [`HostRootLayout::compute`].
+    pub fn compute_pipeline(&self, cs: &HostShader) -> Result<Pipeline, String> {
+        let layout = HostRootLayout::compute(cs);
+        let (root, _) = root::root_signature(&self.device, &layout)?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
-        Ok((root, pso))
+        Ok(Pipeline { root, pso, layout })
     }
 
     pub fn compute_pipeline_with(
@@ -238,14 +157,12 @@ impl Host {
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
     /// integer 32-bit targets as the pixel shader writes them.
-    pub fn pipeline(
-        &self,
-        vs: &HostShader,
-        ps: &HostShader,
-    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-        let root = self.root_signature(vs, ps)?;
+    pub fn pipeline(&self, vs: &HostShader, ps: &HostShader) -> Result<Pipeline, String> {
+        let layout =
+            HostRootLayout::graphics(&[(vs, GraphicsStage::Vertex), (ps, GraphicsStage::Pixel)]);
+        let (root, _) = root::root_signature(&self.device, &layout)?;
         let pso = self.pipeline_with(&root, &vs.dxil, &ps.dxil)?;
-        Ok((root, pso))
+        Ok(Pipeline { root, pso, layout })
     }
 
     /// A graphics pipeline with the given root signature; vertex inputs
@@ -331,19 +248,13 @@ impl Host {
         pso.map_err(err)
     }
 
-    /// A mesh pipeline from a mesh and a pixel shader (user data of the mesh
-    /// stage is root parameter 0, the pixel stage's 1).
-    pub fn mesh_pipeline(
-        &self,
-        ms: &HostShader,
-        ps: &HostShader,
-    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-        let root = self.root_signature_for(&[
-            (ms, D3D12_SHADER_VISIBILITY_MESH),
-            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
-        ])?;
+    /// A mesh pipeline from a mesh and a pixel shader.
+    pub fn mesh_pipeline(&self, ms: &HostShader, ps: &HostShader) -> Result<Pipeline, String> {
+        let layout =
+            HostRootLayout::graphics(&[(ms, GraphicsStage::Mesh), (ps, GraphicsStage::Pixel)]);
+        let (root, _) = root::root_signature(&self.device, &layout)?;
         let pso = self.mesh_pipeline_with(&root, &ms.dxil, &ps.dxil)?;
-        Ok((root, pso))
+        Ok(Pipeline { root, pso, layout })
     }
 
     /// A mesh pipeline with the given root signature: the pipeline-state

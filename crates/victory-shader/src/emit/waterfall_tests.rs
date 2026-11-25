@@ -5,7 +5,7 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::host::{Dispatch, Host, Root, Stride, View};
+use super::host::{Dispatch, Host, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -113,22 +113,21 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = match host.compute_pipeline(shader) {
+        let pipe = match host.compute_pipeline(shader) {
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
         };
         // Both tables start at heap index 0.
-        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
+        let ud = pipe.user_data(0, |u| {
             assert_eq!(u.root, RootType::Table, "{u:?}");
-            ud[u.index as usize] = 0;
-        }
+            0
+        });
         let words = host
             .dispatch(
-                &root,
-                &pso,
+                &pipe.root,
+                &pipe.pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots: ud.into_iter().collect(),
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],
