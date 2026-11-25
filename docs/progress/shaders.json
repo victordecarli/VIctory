@@ -4,17 +4,17 @@
   "host_lanes": 32,
   "vertex_pixel": {
     "found": 14649,
-    "emitted": 12243
+    "validated": 12167
   },
   "compute": {
     "found": 2734,
-    "emitted": 1441
+    "validated": 1417
   },
-  "compute_wave64": 294,
+  "compute_wave64": 240,
   "mesh": {
     "found": 8765,
-    "emitted": 8214
+    "validated": 8152
   },
-  "commit": "a63023112b",
+  "commit": "6f3f34454b",
   "commit_date": "2026-11-25"
 }
