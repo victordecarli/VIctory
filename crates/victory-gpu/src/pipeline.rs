@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use victory_shader::emit::HostShader;
 
 #[cfg(windows)]
-use crate::shader_cache::TranslateError;
+use victory_shader::ShaderError;
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -63,7 +63,7 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     /// Shared, so a host pipeline's stages can hold it (see `host::Stage`).
     #[cfg(windows)]
-    translated: OnceLock<Result<Arc<HostShader>, TranslateError>>,
+    translated: OnceLock<Result<Arc<HostShader>, ShaderError>>,
 }
 
 impl std::fmt::Debug for Shader {
