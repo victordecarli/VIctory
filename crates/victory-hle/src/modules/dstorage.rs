@@ -18,10 +18,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`DStorageGetFactory`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -51,8 +47,12 @@ type Out = *mut *mut c_void;
 
 static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
 
-pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
-    // SAFETY: the title passes a GUID (null tolerated).
+/// # Safety
+///
+/// `iid` is null or valid for a read of a `Guid`, and `out` is null or
+/// valid for a write of a pointer.
+pub unsafe extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
+    // SAFETY: `iid` is null or readable, per this function's contract.
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
             put(out, std::ptr::from_ref(&FACTORY_OBJECT).cast_mut().cast())
@@ -79,12 +79,19 @@ impl<T> Instance<T> {
     }
 }
 
-extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
-    // SAFETY: an instance we created and the title still holds.
+/// # Safety
+///
+/// `this` is an instance this module created and has not yet freed.
+unsafe extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
+    // SAFETY: a live instance, per this function's contract.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+/// # Safety
+///
+/// `this` is an instance this module created, holding the reference the
+/// caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
@@ -94,8 +101,11 @@ extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
     left
 }
 
-fn iid_text(iid: *const Guid) -> String {
-    // SAFETY: the title passes a GUID (null tolerated).
+/// # Safety
+///
+/// `iid` is null or valid for a read of a `Guid`.
+unsafe fn iid_text(iid: *const Guid) -> String {
+    // SAFETY: `iid` is null or readable, per this function's contract.
     unsafe { iid.as_ref() }.map_or_else(|| "null".into(), Guid::to_string)
 }
 
@@ -109,7 +119,18 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
 type Factory = *const Object;
 
 /// Opens `path` for reading; the file object owns the handle.
-extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
+///
+/// # Safety
+///
+/// `path` is null or points to a NUL-terminated UTF-16 path, `iid` is null
+/// or valid for a read of a `Guid`, and `out` is null or valid for a write
+/// of a pointer.
+unsafe extern "system" fn open_file(
+    _: Factory,
+    path: *const u16,
+    iid: *const Guid,
+    out: Out,
+) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
@@ -130,7 +151,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
             std::ptr::null_mut(),
         )
     };
-    // SAFETY: the title passes a NUL-terminated path.
+    // SAFETY: non-null, and NUL-terminated, per this function's contract.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
@@ -140,7 +161,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    // SAFETY: as this function's contract gives them.
+    tracing::info!(path = name, iid = unsafe { iid_text(iid) }, "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
@@ -148,14 +170,22 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
 }
 
 /// `(capacity, name, iid, out)`.
-extern "system" fn create_status_array(
+///
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated string, `iid` is null or
+/// valid for a read of a `Guid`, and `out` is null or valid for a write of
+/// a pointer.
+unsafe extern "system" fn create_status_array(
     _: Factory,
     capacity: u32,
     name: *const c_char,
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
-    tracing::info!(capacity, name = text(name), iid = iid_text(iid), "dstorage: status array");
+    // SAFETY: `name` and `iid` as this function's contract gives them.
+    let (name, iid) = unsafe { (text(name), iid_text(iid)) };
+    tracing::info!(capacity, name, iid, "dstorage: status array");
     let entries = (0..capacity).map(|_| AtomicI32::new(S_OK)).collect();
     let array = Instance::create(
         Object::new("dstorage status array", &STATUS_VTABLE),
@@ -175,24 +205,31 @@ struct QueueDesc {
     unknown: u64,
 }
 
-extern "system" fn create_queue(
+/// # Safety
+///
+/// `desc` is null or valid for a read of a `QueueDesc` whose `name` is null
+/// or a NUL-terminated string, `iid` is null or valid for a read of a
+/// `Guid`, and `out` is null or valid for a write of a pointer.
+unsafe extern "system" fn create_queue(
     _: Factory,
     desc: *const QueueDesc,
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
-    // SAFETY: the title passes its description (null tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let name = text(desc.name);
+    // SAFETY: as this function's contract gives them.
+    let name = unsafe { text(desc.name) };
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
         priority = desc.priority,
         name,
         unknown = desc.unknown,
-        iid = iid_text(iid),
+        // SAFETY: as this function's contract gives them.
+        iid = unsafe { iid_text(iid) },
         "dstorage: queue"
     );
     let Some(scheduler) = scheduler() else {
@@ -216,11 +253,14 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     S_OK
 }
 
-fn text(name: *const c_char) -> String {
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated string.
+unsafe fn text(name: *const c_char) -> String {
     if name.is_null() {
         return String::new();
     }
-    // SAFETY: a NUL-terminated name from the title.
+    // SAFETY: non-null, and NUL-terminated, per this function's contract.
     unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned()
 }
 
@@ -270,16 +310,26 @@ type Array = *mut Instance<StatusArray>;
 
 /// The result of the requests before entry `index`: pending, the first
 /// failure, or success.
-extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
-    // SAFETY: an array we created and the title still holds.
+///
+/// # Safety
+///
+/// `this` is a status array this module created and the title still holds.
+unsafe extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+    // SAFETY: a live array, per this function's contract.
     let entries = &unsafe { &*this }.state.entries;
     entries.get(index as usize).map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
 
 /// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
-extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    status_result(this, index) != E_PENDING
+///
+/// # Safety
+///
+/// `this` is a status array this module created and the title still holds.
+unsafe extern "system" fn is_complete(this: Array, index: u32) -> bool {
+    // SAFETY: `this` as this function's contract gives it.
+    let result = unsafe { status_result(this, index) };
+    result != E_PENDING
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -669,7 +719,9 @@ struct Status {
 
 impl Drop for Status {
     fn drop(&mut self) {
-        release(self.array);
+        // SAFETY: `array` is the status array this `Status` took a reference
+        // on when it was made; this releases that reference once.
+        unsafe { release(self.array) };
     }
 }
 
@@ -680,16 +732,28 @@ impl Status {
     }
 }
 
-extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
-    // SAFETY: the title passes its request (null tolerated).
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds.
+/// `request` is null or valid for a read of a `Request`, and the memory it
+/// names (`source`, `destination`, `page_numbers`, and the file) stays
+/// valid and unaliased until the request completes, as the real API
+/// requires.
+unsafe extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
+    // SAFETY: `request` is null or readable, per this function's contract.
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    // SAFETY: as this function's contract gives them.
+    unsafe { queue(this, Command::Read(request)) };
 }
 
-extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
-    // SAFETY: the title passes an array we created (null tolerated).
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds. `array`
+/// is null or a status array this module created and the title still holds.
+unsafe extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
+    // SAFETY: `array` is null or a live array, per this function's contract.
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
     };
@@ -698,14 +762,20 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
         return;
     };
     entry.store(E_PENDING, Ordering::Release);
-    add_ref_instance(array);
-    queue(this, Command::Status(Status { array, index }));
+    // SAFETY: as this function's contract gives them.
+    unsafe { add_ref_instance(array) };
+    // SAFETY: as this function's contract gives them.
+    unsafe { queue(this, Command::Status(Status { array, index })) };
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
 /// submits on its own once half of it is enqueued, as the console does.
-fn queue(this: QueueRef, command: Command) {
-    // SAFETY: a queue we created and the title still holds.
+///
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds.
+unsafe fn queue(this: QueueRef, command: Command) {
+    // SAFETY: a live queue, per this function's contract.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
         return;
@@ -731,7 +801,10 @@ fn queue(this: QueueRef, command: Command) {
     }
 }
 
-extern "system" fn submit(this: QueueRef) {
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds.
+unsafe extern "system" fn submit(this: QueueRef) {
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
@@ -747,7 +820,11 @@ extern "system" fn submit(this: QueueRef) {
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
 /// finished. Grand Theft Auto VI calls this, not `Release`.
-extern "system" fn close(this: QueueRef) {
+///
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds.
+unsafe extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }
@@ -763,7 +840,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             destination_size = request.destination_size,
             intermediate_size = request.intermediate_size,
             tag = request.tag,
-            name = text(request.name),
+            // SAFETY: as this function's contract gives them.
+            name = unsafe { text(request.name) },
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -867,7 +945,8 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `size` bytes until completion.
+        // SAFETY: the request's source holds `size` bytes until completion,
+        // per `enqueue_request`'s contract.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
     }
@@ -882,13 +961,15 @@ static READING: AtomicU64 = AtomicU64::new(0);
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `out.len()` bytes until completion.
+        // SAFETY: the request's source holds `out.len()` bytes until
+        // completion, per `enqueue_request`'s contract.
         out.copy_from_slice(unsafe {
             std::slice::from_raw_parts(request.source.cast(), out.len())
         });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // SAFETY: a file object we created; the title keeps it open until the
+    // request completes, per `enqueue_request`'s contract.
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state.file;
     let started = std::time::Instant::now();
     let mut done = 0;
@@ -920,14 +1001,15 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
         victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
+        // SAFETY: the request's destination holds `destination_size` bytes, at
+        // least `len`, and nothing else writes it until completion, per
+        // `enqueue_request`'s contract.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
+    // SAFETY: a page number per 64 KiB of destination, which holds at least
+    // `len` bytes from `offset`, per `enqueue_request`'s contract.
     let pages = unsafe {
         std::slice::from_raw_parts(
             request.destination.cast::<usize>(),

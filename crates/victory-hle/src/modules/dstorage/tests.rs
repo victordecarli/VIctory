@@ -12,7 +12,8 @@ fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
 
 fn factory() -> *mut c_void {
     let mut factory = std::ptr::null_mut();
-    assert_eq!(DStorageGetFactory(&FACTORY, &mut factory), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { DStorageGetFactory(&FACTORY, &mut factory) }, S_OK);
     crate::test_support::valid_mut(factory)
 }
 
@@ -294,7 +295,8 @@ fn a_status_waits_for_every_earlier_read() {
     l.lanes.insert(0, Lane::new(0, 64));
     let array = status_array(2).cast::<Instance<StatusArray>>();
     let status = |index| {
-        add_ref_instance(array);
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { add_ref_instance(array) };
         Command::Status(Status { array, index })
     };
     read(&mut l, 0, 0, 16);
