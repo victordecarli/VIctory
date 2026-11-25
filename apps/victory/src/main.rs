@@ -92,8 +92,9 @@ enum Command {
         #[arg(long, default_value_t = victory_shader::emit::CONSOLE_WAVE)]
         host_lanes: u32,
         /// Also write the counts per kind of program as JSON to this file
-        /// (read by `cargo xtask progress --record`).
-        #[arg(long)]
+        /// (read by `cargo xtask progress --record`). Needs --validate: a
+        /// shader counts as translated once the validator accepts it.
+        #[arg(long, requires = "validate")]
         json: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
@@ -194,4 +195,17 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_json_needs_validate() {
+        assert!(Cli::try_parse_from(["victory", "translate", "--json", "s.json"]).is_err());
+        assert!(
+            Cli::try_parse_from(["victory", "translate", "--validate", "--json", "s.json"]).is_ok()
+        );
+    }
 }

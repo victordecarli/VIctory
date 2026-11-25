@@ -94,8 +94,8 @@ level. The JSON format is documented in `xtask/src/audit.rs`.
 `cargo xtask progress` writes the shader progress block of `README.md`
 from `docs/progress/shaders.json`; never edit the block by hand. To
 measure again, on Windows with your game files, run
-`victory translate --host-lanes 32 --json <file>` (the block is measured
-for a 32-lane GPU) and then
+`victory translate --validate --host-lanes 32 --json <file>` (the block
+is measured for a 32-lane GPU) and then
 `cargo xtask progress --record <file>`. The
 `readme_progress_matches_the_measurement` test, part of `cargo test`,
 fails when the block and the file disagree.

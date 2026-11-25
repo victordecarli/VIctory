@@ -21,13 +21,13 @@ pub(super) struct Summary {
     /// failure (a file not read, a panic) every count is a lower bound.
     pub(super) complete: bool,
     /// `--host-lanes`: the widest wave the host was assumed to run. Below
-    /// 64, console wave64 programs that cannot run as two waves are not
-    /// emitted, so the shares depend on it.
+    /// 64, console wave64 compute that cannot run as two waves keeps its
+    /// 64-lane waves, which such a host refuses.
     pub(super) host_lanes: u32,
     /// Vertex, pixel and the other graphics stages.
     pub(super) vertex_pixel: Kind,
     pub(super) compute: Kind,
-    /// Of `compute.emitted`, the programs emitted for 64-lane waves: a host
+    /// Of `compute.validated`, the programs that need 64-lane waves: a host
     /// with fewer lanes refuses them.
     pub(super) compute_wave64: usize,
     pub(super) mesh: Kind,
@@ -37,8 +37,9 @@ pub(super) struct Summary {
 pub(super) struct Kind {
     /// Programs of this kind found, duplicates skipped.
     pub(super) found: usize,
-    /// Of those, the ones emitted as DXIL.
-    pub(super) emitted: usize,
+    /// Of those, the ones emitted as DXIL that the validator accepted:
+    /// the project counts a shader as translated only then.
+    pub(super) validated: usize,
 }
 
 impl Summary {
@@ -47,10 +48,10 @@ impl Summary {
             schema: SCHEMA,
             complete: t.infra.is_empty(),
             host_lanes,
-            vertex_pixel: Kind { found: t.found, emitted: t.emitted },
-            compute: Kind { found: t.cs_found, emitted: t.cs_emitted },
-            compute_wave64: t.cs_wave64,
-            mesh: Kind { found: t.ms_found, emitted: t.ms_emitted },
+            vertex_pixel: Kind { found: t.found, validated: t.validated },
+            compute: Kind { found: t.cs_found, validated: t.cs_validated },
+            compute_wave64: t.cs_validated_wave64,
+            mesh: Kind { found: t.ms_found, validated: t.ms_validated },
         }
     }
 }
@@ -67,14 +68,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_kind_counts_found_and_emitted() {
+    fn each_kind_counts_what_the_validator_accepted() {
         let t = Tally {
             found: 10,
-            emitted: 7,
+            validated: 6,
             cs_found: 5,
-            cs_emitted: 4,
-            cs_wave64: 1,
+            cs_validated: 3,
+            cs_validated_wave64: 1,
             ms_found: 3,
+            ms_validated: 2,
+            // Emitted but refused by the validator: not translated.
+            emitted: 7,
+            cs_emitted: 4,
+            cs_wave64: 2,
             ms_emitted: 3,
             // Stage-internal counts are not part of the summary.
             emit_programs: 8,
@@ -86,10 +92,10 @@ mod tests {
                 schema: SCHEMA,
                 complete: true,
                 host_lanes: 32,
-                vertex_pixel: Kind { found: 10, emitted: 7 },
-                compute: Kind { found: 5, emitted: 4 },
+                vertex_pixel: Kind { found: 10, validated: 6 },
+                compute: Kind { found: 5, validated: 3 },
                 compute_wave64: 1,
-                mesh: Kind { found: 3, emitted: 3 },
+                mesh: Kind { found: 3, validated: 2 },
             }
         );
     }
@@ -103,7 +109,7 @@ mod tests {
 
     #[test]
     fn the_file_holds_counts_and_no_examples() {
-        let mut t = Tally { found: 2, emitted: 1, ..Tally::default() };
+        let mut t = Tally { found: 2, validated: 1, ..Tally::default() };
         t.fail("emit: x".into(), || "shaders.pak@0x10 Ps".into());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.json");

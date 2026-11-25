@@ -406,6 +406,9 @@ fn check(
     match v.validate(&mut shader.dxil) {
         Ok(()) => {
             *counters(t, shader.stage)[2] += 1;
+            if shader.stage == HwStage::Cs && shader.wave_size == Some(64) {
+                t.cs_validated_wave64 += 1;
+            }
             if t.list {
                 t.lines.push(format!("{}  validated", label()));
             }
