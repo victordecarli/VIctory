@@ -18,6 +18,9 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(windows)]
+use victory_shader::emit::HostShader;
+
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
@@ -56,7 +59,7 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     /// Shared, so a host pipeline's stages can hold it (see `host::Stage`).
     #[cfg(windows)]
-    translated: OnceLock<Option<Arc<Translated>>>,
+    translated: OnceLock<Option<Arc<HostShader>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -87,27 +90,20 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
-/// A translated shader and the console resources its code reads.
-#[cfg(windows)]
-pub(crate) struct Translated {
-    pub(crate) host: victory_shader::emit::HostShader,
-    pub(crate) used: Vec<victory_shader::UsedResource>,
-}
-
 #[cfg(windows)]
 impl Shader {
-    /// The translation, made on first use; a shader that does not
-    /// translate is logged once.
-    pub(crate) fn translated(&self) -> Option<&Arc<Translated>> {
+    /// The translation, made on first use (from the shader cache when it
+    /// has it); a shader that does not translate is logged once.
+    pub(crate) fn translated(&self) -> Option<&Arc<HostShader>> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = crate::shader_cache::host_shader(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
+                        user_data = t.user_data.len(),
+                        samplers = t.samplers.len(),
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(
@@ -121,23 +117,6 @@ impl Shader {
             })
             .as_ref()
     }
-}
-
-#[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
-    let host = crate::shader_cache::host_shader(container)?;
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs))
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    Ok(Translated { host, used })
 }
 
 #[repr(C)]

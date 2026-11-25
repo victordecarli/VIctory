@@ -11,12 +11,12 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use victory_shader::emit::host::root_signature;
-use victory_shader::emit::{GraphicsStage, HostRootLayout, HostRootStage};
+use victory_shader::emit::{GraphicsStage, HostRootLayout, HostRootStage, HostShader};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
-use super::{Shader, Translated};
+use super::Shader;
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -252,7 +252,7 @@ pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The shader's translation, held from construction (private: a stage
     /// exists only through [`Stage::new`], so it always has one).
-    translated: Arc<Translated>,
+    translated: Arc<HostShader>,
     /// Where its user data and root views are in the root signature.
     root: HostRootStage,
 }
@@ -273,7 +273,7 @@ impl Stage {
         &self.root
     }
 
-    pub(crate) fn translated(&self) -> &Translated {
+    pub(crate) fn translated(&self) -> &HostShader {
         &self.translated
     }
 }
@@ -348,11 +348,11 @@ impl HostPipeline {
 
         // The root signature the translated shaders' bindings define.
         let layout = match compute {
-            Some(cs) => HostRootLayout::compute(&cs.translated()?.host),
+            Some(cs) => HostRootLayout::compute(cs.translated()?),
             None => {
                 let typed = graphics
                     .iter()
-                    .map(|&(s, kind)| s.translated().map(|t| (&t.host, kind)))
+                    .map(|&(s, kind)| s.translated().map(|t| (t.as_ref(), kind)))
                     .collect::<Option<Vec<_>>>()?;
                 HostRootLayout::graphics(&typed)
             }
@@ -373,8 +373,8 @@ impl HostPipeline {
             stages.get(i).and_then(|s| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
+                    pShaderBytecode: t.dxil.as_ptr().cast(),
+                    BytecodeLength: t.dxil.len(),
                 },
             )
         };

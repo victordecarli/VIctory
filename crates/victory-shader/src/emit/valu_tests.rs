@@ -146,6 +146,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        used: Vec::new(),
         wave_size: lowered.wave_size,
     };
 

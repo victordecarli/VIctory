@@ -153,6 +153,7 @@ mod tests {
             static_samplers: vec![StaticSampler::from_words([0x400, 0xc0_0000, 0x18f0_0000, 0])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            used: Vec::new(),
             wave_size: Some(64),
         }
     }

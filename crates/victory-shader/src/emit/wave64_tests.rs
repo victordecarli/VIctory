@@ -157,6 +157,15 @@ fn encodings_decode_as_named() {
     assert_eq!(names(&LDS_READ_MIRROR), ["v_sub_nc_u32", "v_lshlrev_b32", "ds_read_b32"]);
 }
 
+/// The translation carries the used-resource list of the program it translated, which
+/// the host binds descriptor tables from.
+#[test]
+fn a_translation_carries_its_programs_used_resources() {
+    let cs = wave(&[]);
+    assert!(!cs.used.is_empty());
+    assert_eq!(translate(&cs, 64).unwrap().used, cs.used);
+}
+
 /// A program that reads other lanes runs in halves on a 32-lane host, and keeps its
 /// console wave size on a host whose waves hold 64 lanes.
 #[test]

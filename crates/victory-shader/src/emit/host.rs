@@ -445,6 +445,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> Result<HostShader, String> {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        used: Vec::new(),
         wave_size: None,
     })
 }

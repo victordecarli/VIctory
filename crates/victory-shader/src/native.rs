@@ -410,6 +410,32 @@ pub enum ResourceType {
     Other(u8),
 }
 
+impl ResourceType {
+    pub(crate) fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => ResourceType::Srv,
+            1 => ResourceType::Sampler,
+            2 => ResourceType::Cbv,
+            3 => ResourceType::Uav,
+            n => ResourceType::Other(n),
+        }
+    }
+
+    /// The console's number for the kind, which [`ResourceType::from_raw`]
+    /// reads back. `Other` carries a number no named kind has when it comes
+    /// from a container; one built with a named kind's number reads back as
+    /// that kind.
+    pub(crate) fn to_raw(self) -> u8 {
+        match self {
+            ResourceType::Srv => 0,
+            ResourceType::Sampler => 1,
+            ResourceType::Cbv => 2,
+            ResourceType::Uav => 3,
+            ResourceType::Other(n) => n,
+        }
+    }
+}
+
 /// A descriptor range the program reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsedResource {
@@ -524,13 +550,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             .0
             .iter()
             .map(|e| UsedResource {
-                kind: match e[0] {
-                    0 => ResourceType::Srv,
-                    1 => ResourceType::Sampler,
-                    2 => ResourceType::Cbv,
-                    3 => ResourceType::Uav,
-                    n => ResourceType::Other(n),
-                },
+                kind: ResourceType::from_raw(e[0]),
                 root: RootType::from_raw(e[1].into()),
                 table_offset_dwords: le32(e, 4),
                 lower_bound: le32(e, 8),
