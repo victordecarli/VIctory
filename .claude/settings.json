@@ -24,9 +24,5 @@
         ]
       }
     ]
-  },
-  "enabledPlugins": {
-    "nvidia-skills@anthropic-plugin-directory": false,
-    "coderabbit@anthropic-plugin-directory": true
   }
 }
