@@ -6,17 +6,15 @@
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
-//! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! The entry is the bytes of [`HostShader::to_bytes`], whose format
+//! `victory-shader` owns.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
-use victory_shader::{HwStage, RootType};
+use victory_shader::emit::HostShader;
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -107,7 +105,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        Ok(shader.to_bytes())
     }
 }
 
@@ -121,7 +119,7 @@ fn cached(
     let converter = Translate { translate, ran: AtomicBool::new(false) };
     for _ in 0..2 {
         let path = cache.get_or_convert(&converter, &input).map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| HostShader::from_bytes(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -132,168 +130,19 @@ fn cached(
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
-        let _ = std::fs::remove_file(&path);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = %path.display(), error = %e, "cannot remove an unreadable shader cache entry");
+        }
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
-const STAGES: [HwStage; 8] = [
-    HwStage::Ls,
-    HwStage::Hs,
-    HwStage::Es,
-    HwStage::Gs,
-    HwStage::Vs,
-    HwStage::Ps,
-    HwStage::Ms,
-    HwStage::Cs,
-];
-
-fn root_code(r: RootType) -> u32 {
-    match r {
-        RootType::Constants => 0,
-        RootType::Descriptor => 1,
-        RootType::Table => 2,
-        RootType::ImmediateSampler => 3,
-        RootType::ResourceHeap => 4,
-        RootType::SamplerHeap => 5,
-        RootType::Other(x) => 6 + x,
-    }
-}
-
-fn root_type(code: u32) -> RootType {
-    match code {
-        0 => RootType::Constants,
-        1 => RootType::Descriptor,
-        2 => RootType::Table,
-        3 => RootType::ImmediateSampler,
-        4 => RootType::ResourceHeap,
-        5 => RootType::SamplerHeap,
-        x => RootType::Other(x - 6),
-    }
-}
-
-/// Little-endian words and length-prefixed lists.
-fn encode(s: &HostShader) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
-    let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
-    let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
-    word(&mut out, stage);
-    word(&mut out, s.dxil.len() as u32);
-    out.extend(&s.dxil);
-    word(&mut out, s.user_data.len() as u32);
-    for u in &s.user_data {
-        for v in [u.index, u32::from(u.slot), root_code(u.root), u.dword] {
-            word(&mut out, v);
-        }
-    }
-    word(&mut out, s.samplers.len() as u32);
-    for sampler in &s.samplers {
-        for &v in sampler {
-            word(&mut out, v);
-        }
-    }
-    word(&mut out, s.static_samplers.len() as u32);
-    for t in &s.static_samplers {
-        let [u, v, w] = t.address;
-        let words = [
-            t.filter,
-            u,
-            v,
-            w,
-            t.mip_lod_bias.to_bits(),
-            t.max_anisotropy,
-            t.comparison,
-            t.border,
-            t.min_lod.to_bits(),
-            t.max_lod.to_bits(),
-        ];
-        for v in words {
-            word(&mut out, v);
-        }
-    }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
-        word(&mut out, slots.len() as u32);
-        out.extend(slots);
-    }
-    // 0: no wave size required (`WaveSize` is never 0).
-    word(&mut out, s.wave_size.unwrap_or(0));
-    out
-}
-
-fn decode(bytes: &[u8]) -> Option<HostShader> {
-    struct Reader<'a>(&'a [u8]);
-    impl<'a> Reader<'a> {
-        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-            let (head, rest) = self.0.split_at_checked(n)?;
-            self.0 = rest;
-            Some(head)
-        }
-        fn word(&mut self) -> Option<u32> {
-            Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-        }
-        fn list(&mut self) -> Option<Vec<u8>> {
-            let n = self.word()? as usize;
-            Some(self.take(n)?.to_vec())
-        }
-    }
-    let mut r = Reader(bytes);
-    if r.take(4)? != MAGIC {
-        return None;
-    }
-    let stage = *STAGES.get(r.word()? as usize)?;
-    let dxil = r.list()?;
-    let n = r.word()? as usize;
-    let mut user_data = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        user_data.push(UserData {
-            index: r.word()?,
-            slot: u8::try_from(r.word()?).ok()?,
-            root: root_type(r.word()?),
-            dword: r.word()?,
-        });
-    }
-    let n = r.word()? as usize;
-    let mut samplers = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        samplers.push([r.word()?, r.word()?, r.word()?, r.word()?]);
-    }
-    let n = r.word()? as usize;
-    let mut static_samplers = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        static_samplers.push(StaticSampler {
-            filter: r.word()?,
-            address: [r.word()?, r.word()?, r.word()?],
-            mip_lod_bias: f32::from_bits(r.word()?),
-            max_anisotropy: r.word()?,
-            comparison: r.word()?,
-            border: r.word()?,
-            min_lod: f32::from_bits(r.word()?),
-            max_lod: f32::from_bits(r.word()?),
-        });
-    }
-    let root_cbvs = r.list()?;
-    let root_srvs = r.list()?;
-    let wave_size = match r.word()? {
-        0 => None,
-        n => Some(n),
-    };
-    r.0.is_empty().then_some(HostShader {
-        stage,
-        dxil,
-        user_data,
-        samplers,
-        static_samplers,
-        root_cbvs,
-        root_srvs,
-        wave_size,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use victory_shader::emit::{StaticSampler, UserData};
+    use victory_shader::{HwStage, RootType};
 
     fn shader() -> HostShader {
         HostShader {
@@ -353,15 +202,6 @@ mod tests {
         files
     }
 
-    #[test]
-    fn entries_round_trip_and_reject_damage() {
-        let bytes = encode(&shader());
-        assert_eq!(decode(&bytes), Some(shader()));
-        assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
-        assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
-        assert_eq!(decode(b"VSH0"), None);
-    }
-
     /// A host of other wave lanes translates differently: its entries are
     /// apart, as another build's are.
     #[test]
@@ -370,16 +210,5 @@ mod tests {
         assert_ne!(fingerprint(exe, 1 << 20, 32), fingerprint(exe, 1 << 20, 64));
         assert_eq!(fingerprint(exe, 1 << 20, 32), fingerprint(exe, 1 << 20, 32));
         assert_ne!(fingerprint(exe, 1 << 20, 32), fingerprint(exe, 1 << 19, 32));
-    }
-
-    /// The wave size a shader requires comes back from the cache, absent or
-    /// not; an entry written before it was stored reads as damaged (a miss).
-    #[test]
-    fn entries_keep_the_wave_size() {
-        let none = HostShader { wave_size: None, ..shader() };
-        assert_eq!(decode(&encode(&none)), Some(none));
-        let bytes = encode(&shader());
-        let before_the_field = &bytes[..bytes.len() - 4];
-        assert_eq!(decode(before_the_field), None);
     }
 }
