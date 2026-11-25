@@ -72,8 +72,10 @@ impl Cache {
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        if published.is_err()
+            && let Err(e) = std::fs::remove_file(&tmp)
+        {
+            tracing::warn!(path = %tmp.display(), error = %e, "cache: a temporary file was left behind");
         }
         published?;
         Ok(path)
