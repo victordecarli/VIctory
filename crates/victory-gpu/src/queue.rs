@@ -141,7 +141,10 @@ unsafe extern "system" fn execute(_: This, count: u32, lists: *const This) {
         // SAFETY: non-null, and `count` pointers, per this function's
         // contract.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists.iter().filter_map(|&l| crate::list::host_list(l)).collect();
+        // SAFETY: each list is a live one this crate created, per this
+        // function's contract.
+        let host_lists: Vec<_> =
+            lists.iter().filter_map(|&l| unsafe { crate::list::host_list(l) }).collect();
         host.execute(&host_lists);
         return;
     }
@@ -337,14 +340,20 @@ unsafe extern "system" fn present(
         // SAFETY: non-null, and `count` pointers, per this function's
         // contract.
         && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        && let Some(texture) = unsafe { crate::resource::host_resource(resource) }
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        let state = unsafe { crate::resource::host_transition(resource, COPY_SOURCE) }
             .map_or(COPY_SOURCE, |(_, before)| before);
         let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        unsafe { crate::resource::host_transition(resource, state) };
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

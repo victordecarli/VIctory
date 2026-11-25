@@ -113,7 +113,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
+    // SAFETY: `resource` is one this crate created, which the title keeps
+    // alive.
+    unsafe { crate::list::ensure_state(list, resource, COPY_DEST) };
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
@@ -275,7 +277,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }
-    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let (memory, desc) = unsafe { crate::resource::texture_memory(resource) }?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
         once!(?desc, "texture contents without a console layout not uploaded");

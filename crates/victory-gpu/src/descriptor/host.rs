@@ -433,13 +433,18 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => {
-            (crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64, desc)
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::buffer_bytes(*r as crate::object::This) }?.0 as u64, desc)
         }
         View::Placed(false, resource, desc) if resource[0] == 1 => {
             (u64::from(desc[10]) | u64::from(desc[11]) << 32, desc[..10].try_into().ok()?)
         }
         View::Unordered(r, _, Some(desc)) => {
-            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            let base =
+                unsafe { crate::resource::buffer_bytes(*r as crate::object::This) }?.0 as u64;
             return unordered_range(base, desc);
         }
         View::Placed(true, resource, desc) if resource[0] == 1 => {
@@ -615,7 +620,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            if let Some(texture) = unsafe { crate::resource::host_resource(resource) } {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -630,7 +637,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
-                (crate::resource::buffer_bytes(resource), desc)
+                // SAFETY: a resource this crate created, which the title keeps alive
+                // while it is in use.
+                (unsafe { crate::resource::buffer_bytes(resource) }, desc)
             {
                 buffer_srv(data as u64, len, srv_desc(desc), at)
             } else {
@@ -639,8 +648,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(resource) else {
-                return match (crate::resource::buffer_bytes(resource), desc) {
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            let found = unsafe { crate::resource::host_resource(resource) };
+            let Some(texture) = found else {
+                // SAFETY: a resource this crate created, which the title keeps alive
+                // while it is in use.
+                return match (unsafe { crate::resource::buffer_bytes(resource) }, desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
                     }
@@ -712,7 +726,9 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let texture = unsafe { crate::resource::texture_at(address, resource) }?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
@@ -721,7 +737,10 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
-    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let is_buffer =
+        |r: &usize| unsafe { crate::resource::buffer_bytes(*r as crate::object::This) }.is_some();
     // Unordered views: whether a buffer, and the title's view dimension.
     let (buffer, dimension) = match view {
         View::Unordered(r, _, desc) => {

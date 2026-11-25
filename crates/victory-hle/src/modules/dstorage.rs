@@ -18,10 +18,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`DStorageGetFactory`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -51,8 +47,12 @@ type Out = *mut *mut c_void;
 
 static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
 
-pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
-    // SAFETY: the title passes a GUID (null tolerated).
+/// # Safety
+///
+/// `iid` is null or valid for a read of a `Guid`, and `out` is null or
+/// valid for a write of a pointer.
+pub unsafe extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
+    // SAFETY: `iid` is null or readable, per this function's contract.
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
             put(out, std::ptr::from_ref(&FACTORY_OBJECT).cast_mut().cast())
@@ -79,12 +79,19 @@ impl<T> Instance<T> {
     }
 }
 
-extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
-    // SAFETY: an instance we created and the title still holds.
+/// # Safety
+///
+/// `this` is an instance this module created and has not yet freed.
+unsafe extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
+    // SAFETY: a live instance, per this function's contract.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+/// # Safety
+///
+/// `this` is an instance this module created, holding the reference the
+/// caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
@@ -94,8 +101,11 @@ extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
     left
 }
 
-fn iid_text(iid: *const Guid) -> String {
-    // SAFETY: the title passes a GUID (null tolerated).
+/// # Safety
+///
+/// `iid` is null or valid for a read of a `Guid`.
+unsafe fn iid_text(iid: *const Guid) -> String {
+    // SAFETY: `iid` is null or readable, per this function's contract.
     unsafe { iid.as_ref() }.map_or_else(|| "null".into(), Guid::to_string)
 }
 
@@ -109,7 +119,18 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
 type Factory = *const Object;
 
 /// Opens `path` for reading; the file object owns the handle.
-extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
+///
+/// # Safety
+///
+/// `path` is null or points to a NUL-terminated UTF-16 path, `iid` is null
+/// or valid for a read of a `Guid`, and `out` is null or valid for a write
+/// of a pointer.
+unsafe extern "system" fn open_file(
+    _: Factory,
+    path: *const u16,
+    iid: *const Guid,
+    out: Out,
+) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
@@ -130,7 +151,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
             std::ptr::null_mut(),
         )
     };
-    // SAFETY: the title passes a NUL-terminated path.
+    // SAFETY: non-null, and NUL-terminated, per this function's contract.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
@@ -140,7 +161,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    // SAFETY: as this function's contract gives them.
+    tracing::info!(path = name, iid = unsafe { iid_text(iid) }, "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
@@ -148,14 +170,22 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
 }
 
 /// `(capacity, name, iid, out)`.
-extern "system" fn create_status_array(
+///
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated string, `iid` is null or
+/// valid for a read of a `Guid`, and `out` is null or valid for a write of
+/// a pointer.
+unsafe extern "system" fn create_status_array(
     _: Factory,
     capacity: u32,
     name: *const c_char,
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
-    tracing::info!(capacity, name = text(name), iid = iid_text(iid), "dstorage: status array");
+    // SAFETY: `name` and `iid` as this function's contract gives them.
+    let (name, iid) = unsafe { (text(name), iid_text(iid)) };
+    tracing::info!(capacity, name, iid, "dstorage: status array");
     let entries = (0..capacity).map(|_| AtomicI32::new(S_OK)).collect();
     let array = Instance::create(
         Object::new("dstorage status array", &STATUS_VTABLE),
@@ -175,24 +205,31 @@ struct QueueDesc {
     unknown: u64,
 }
 
-extern "system" fn create_queue(
+/// # Safety
+///
+/// `desc` is null or valid for a read of a `QueueDesc` whose `name` is null
+/// or a NUL-terminated string, `iid` is null or valid for a read of a
+/// `Guid`, and `out` is null or valid for a write of a pointer.
+unsafe extern "system" fn create_queue(
     _: Factory,
     desc: *const QueueDesc,
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
-    // SAFETY: the title passes its description (null tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let name = text(desc.name);
+    // SAFETY: as this function's contract gives them.
+    let name = unsafe { text(desc.name) };
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
         priority = desc.priority,
         name,
         unknown = desc.unknown,
-        iid = iid_text(iid),
+        // SAFETY: as this function's contract gives them.
+        iid = unsafe { iid_text(iid) },
         "dstorage: queue"
     );
     let Some(scheduler) = scheduler() else {
@@ -216,11 +253,14 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     S_OK
 }
 
-fn text(name: *const c_char) -> String {
+/// # Safety
+///
+/// `name` is null or points to a NUL-terminated string.
+unsafe fn text(name: *const c_char) -> String {
     if name.is_null() {
         return String::new();
     }
-    // SAFETY: a NUL-terminated name from the title.
+    // SAFETY: non-null, and NUL-terminated, per this function's contract.
     unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned()
 }
 
@@ -270,16 +310,26 @@ type Array = *mut Instance<StatusArray>;
 
 /// The result of the requests before entry `index`: pending, the first
 /// failure, or success.
-extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
-    // SAFETY: an array we created and the title still holds.
+///
+/// # Safety
+///
+/// `this` is a status array this module created and the title still holds.
+unsafe extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+    // SAFETY: a live array, per this function's contract.
     let entries = &unsafe { &*this }.state.entries;
     entries.get(index as usize).map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
 
 /// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
-extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    status_result(this, index) != E_PENDING
+///
+/// # Safety
+///
+/// `this` is a status array this module created and the title still holds.
+unsafe extern "system" fn is_complete(this: Array, index: u32) -> bool {
+    // SAFETY: `this` as this function's contract gives it.
+    let result = unsafe { status_result(this, index) };
+    result != E_PENDING
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -669,7 +719,9 @@ struct Status {
 
 impl Drop for Status {
     fn drop(&mut self) {
-        release(self.array);
+        // SAFETY: `array` is the status array this `Status` took a reference
+        // on when it was made; this releases that reference once.
+        unsafe { release(self.array) };
     }
 }
 
@@ -680,16 +732,28 @@ impl Status {
     }
 }
 
-extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
-    // SAFETY: the title passes its request (null tolerated).
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds.
+/// `request` is null or valid for a read of a `Request`, and the memory it
+/// names (`source`, `destination`, `page_numbers`, and the file) stays
+/// valid and unaliased until the request completes, as the real API
+/// requires.
+unsafe extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
+    // SAFETY: `request` is null or readable, per this function's contract.
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    // SAFETY: as this function's contract gives them.
+    unsafe { queue(this, Command::Read(request)) };
 }
 
-extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
-    // SAFETY: the title passes an array we created (null tolerated).
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds. `array`
+/// is null or a status array this module created and the title still holds.
+unsafe extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
+    // SAFETY: `array` is null or a live array, per this function's contract.
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
     };
@@ -698,14 +762,20 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
         return;
     };
     entry.store(E_PENDING, Ordering::Release);
-    add_ref_instance(array);
-    queue(this, Command::Status(Status { array, index }));
+    // SAFETY: as this function's contract gives them.
+    unsafe { add_ref_instance(array) };
+    // SAFETY: as this function's contract gives them.
+    unsafe { queue(this, Command::Status(Status { array, index })) };
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
 /// submits on its own once half of it is enqueued, as the console does.
-fn queue(this: QueueRef, command: Command) {
-    // SAFETY: a queue we created and the title still holds.
+///
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds.
+unsafe fn queue(this: QueueRef, command: Command) {
+    // SAFETY: a live queue, per this function's contract.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
         return;
@@ -731,7 +801,10 @@ fn queue(this: QueueRef, command: Command) {
     }
 }
 
-extern "system" fn submit(this: QueueRef) {
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds.
+unsafe extern "system" fn submit(this: QueueRef) {
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
@@ -747,7 +820,11 @@ extern "system" fn submit(this: QueueRef) {
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
 /// finished. Grand Theft Auto VI calls this, not `Release`.
-extern "system" fn close(this: QueueRef) {
+///
+/// # Safety
+///
+/// `this` is a queue this module created and the title still holds.
+unsafe extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }
@@ -763,7 +840,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             destination_size = request.destination_size,
             intermediate_size = request.intermediate_size,
             tag = request.tag,
-            name = text(request.name),
+            // SAFETY: as this function's contract gives them.
+            name = unsafe { text(request.name) },
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -867,7 +945,8 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `size` bytes until completion.
+        // SAFETY: the request's source holds `size` bytes until completion,
+        // per `enqueue_request`'s contract.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
     }
@@ -882,13 +961,15 @@ static READING: AtomicU64 = AtomicU64::new(0);
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `out.len()` bytes until completion.
+        // SAFETY: the request's source holds `out.len()` bytes until
+        // completion, per `enqueue_request`'s contract.
         out.copy_from_slice(unsafe {
             std::slice::from_raw_parts(request.source.cast(), out.len())
         });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // SAFETY: a file object we created; the title keeps it open until the
+    // request completes, per `enqueue_request`'s contract.
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state.file;
     let started = std::time::Instant::now();
     let mut done = 0;
@@ -920,14 +1001,15 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
         victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
+        // SAFETY: the request's destination holds `destination_size` bytes, at
+        // least `len`, and nothing else writes it until completion, per
+        // `enqueue_request`'s contract.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
+    // SAFETY: a page number per 64 KiB of destination, which holds at least
+    // `len` bytes from `offset`, per `enqueue_request`'s contract.
     let pages = unsafe {
         std::slice::from_raw_parts(
             request.destination.cast::<usize>(),
@@ -970,528 +1052,4 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::os::windows::ffi::OsStrExt;
-    use std::time::{Duration, Instant};
-
-    use super::*;
-    use crate::modules::xgameruntime::method;
-
-    fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
-        let object = crate::test_support::valid_mut(object);
-        // SAFETY: every object here starts with the runtime header.
-        method(unsafe { &*object.cast::<Object>() }, slot)
-    }
-
-    fn factory() -> *mut c_void {
-        let mut factory = std::ptr::null_mut();
-        assert_eq!(DStorageGetFactory(&FACTORY, &mut factory), S_OK);
-        crate::test_support::valid_mut(factory)
-    }
-
-    fn open(path: &std::path::Path) -> *mut c_void {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x20);
-        let mut file = std::ptr::null_mut();
-        assert_eq!(open(factory(), wide.as_ptr(), std::ptr::null(), &mut file), S_OK);
-        file
-    }
-
-    fn status_array(capacity: u32) -> *mut c_void {
-        let create: extern "system" fn(
-            *mut c_void,
-            u32,
-            *const c_char,
-            *const Guid,
-            Out,
-        ) -> HRESULT = call(factory(), 0x28);
-        let mut array = std::ptr::null_mut();
-        let name = c"test".as_ptr();
-        assert_eq!(create(factory(), capacity, name, std::ptr::null(), &mut array), S_OK);
-        crate::test_support::valid_mut(array)
-    }
-
-    fn new_queue(source_type: u64) -> *mut c_void {
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type,
-            capacity: 0x80,
-            priority: 0,
-            name: c"test".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        crate::test_support::valid_mut(queue)
-    }
-
-    fn request(
-        options: u64,
-        destination: *mut c_void,
-        destination_size: usize,
-        source: *const c_void,
-        offset: u64,
-        source_size: usize,
-    ) -> Request {
-        Request {
-            options,
-            destination,
-            page_offset: 0,
-            destination_size: destination_size as u32,
-            source,
-            offset,
-            source_size: source_size as u32,
-            intermediate_size: 0,
-            tag: 0,
-            name: std::ptr::null(),
-        }
-    }
-
-    fn enqueue(queue: *mut c_void, request: &Request) {
-        let f: extern "system" fn(*mut c_void, *const Request) = call(queue, 0x18);
-        f(queue, request);
-    }
-
-    fn enqueue_status(queue: *mut c_void, array: *mut c_void, index: u32) {
-        let f: extern "system" fn(*mut c_void, *mut c_void, u32) = call(queue, 0x20);
-        f(queue, array, index);
-    }
-
-    fn void(object: *mut c_void, slot: usize) {
-        let f: extern "system" fn(*mut c_void) = call(object, slot);
-        f(object);
-    }
-
-    fn result(array: *mut c_void, index: u32) -> HRESULT {
-        let f: extern "system" fn(*mut c_void, u32) -> HRESULT = call(array, 0x20);
-        f(array, index)
-    }
-
-    /// Polls as the title does, then returns the entry's result.
-    fn wait(array: *mut c_void, index: u32) -> HRESULT {
-        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
-        let start = Instant::now();
-        while !done(array, index) {
-            assert!(start.elapsed() < Duration::from_secs(10), "never completed");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        result(array, index)
-    }
-
-    fn file_with(bytes: &[u8]) -> (tempfile::TempDir, *mut c_void) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.bin");
-        std::fs::write(&path, bytes).unwrap();
-        let file = open(&path);
-        (dir, file)
-    }
-
-    fn pattern(n: usize) -> Vec<u8> {
-        (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
-    }
-
-    #[test]
-    fn request_layout_is_the_titles() {
-        assert_eq!(size_of::<Request>(), 0x48);
-        assert_eq!(std::mem::offset_of!(Request, destination_size), 0x18);
-        assert_eq!(std::mem::offset_of!(Request, source), 0x20);
-        assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
-        assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
-    }
-
-    #[test]
-    fn raw_and_zlib_reads_from_a_file() {
-        let plain = pattern(300_000);
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
-        let mut contents = plain.clone();
-        contents.extend_from_slice(&packed);
-        let (_dir, file) = file_with(&contents);
-        let (queue, array) = (new_queue(0), status_array(1));
-
-        let mut raw = vec![0u8; 1000];
-        let mut inflated = vec![0u8; plain.len()];
-        let at = |b: &mut Vec<u8>| b.as_mut_ptr().cast();
-        enqueue(queue, &request(0, at(&mut raw), 1000, file, 5000, 1000));
-        let offset = plain.len() as u64;
-        let zlib = request(ZLIB, at(&mut inflated), plain.len(), file, offset, packed.len());
-        enqueue(queue, &zlib);
-        enqueue_status(queue, array, 0);
-        assert_eq!(result(array, 0), E_PENDING, "pending until done");
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(raw, plain[5000..6000]);
-        assert_eq!(inflated, plain);
-        void(queue, 0x40);
-    }
-
-    #[test]
-    fn memory_sources_inflate_too() {
-        let plain = pattern(70_000);
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
-        let (queue, array) = (new_queue(1), status_array(1));
-        let mut out = vec![0u8; plain.len()];
-        let options = ZLIB | MEMORY_SOURCE;
-        let r = request(
-            options,
-            out.as_mut_ptr().cast(),
-            out.len(),
-            packed.as_ptr().cast(),
-            0,
-            packed.len(),
-        );
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, plain);
-    }
-
-    #[test]
-    fn statuses_complete_in_order_with_the_first_failure() {
-        let contents = pattern(4096);
-        let (_dir, file) = file_with(&contents);
-        let (queue, array) = (new_queue(0), status_array(3));
-        // Requests in flight together run in any order, so none of them
-        // shares a destination (failed ones leave theirs undefined).
-        let mut buffers = [[0u8; 16]; 5];
-        let [failed, failed_too, out, other, bcpack] =
-            buffers.each_mut().map(|b| b.as_mut_ptr().cast());
-
-        // Segment 0: a read past the end, then a bad stream; the first wins.
-        enqueue(queue, &request(0, failed, 16, file, 4090, 16));
-        enqueue(queue, &request(ZLIB, failed_too, 16, file, 0, 16));
-        enqueue_status(queue, array, 0);
-        // Segment 1: two reads.
-        enqueue(queue, &request(0, other, 16, file, 0, 16));
-        enqueue(queue, &request(0, out, 16, file, 100, 16));
-        enqueue_status(queue, array, 1);
-        void(queue, 0x30);
-        // Segment 2: a BCPack request (BC7) whose stream is empty fails.
-        with_test_tables();
-        enqueue(queue, &request(7 << 1, bcpack, 16, file, 0, 0));
-        enqueue_status(queue, array, 2);
-        void(queue, 0x30);
-
-        assert_eq!(wait(array, 2), INVALID_DATA);
-        assert_eq!(result(array, 0), END_OF_FILE);
-        assert_eq!(result(array, 1), S_OK);
-        assert_eq!(buffers[2], contents[100..116]);
-        assert_eq!(buffers[3], contents[..16]);
-    }
-
-    #[test]
-    fn half_a_queue_submits_itself() {
-        let (_dir, file) = file_with(&pattern(64));
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type: 0,
-            capacity: 4,
-            priority: 1,
-            name: c"small".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        let array = status_array(1);
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, pattern(64)[8..24]);
-    }
-
-    /// Lanes without workers: what `start` picks, and when statuses land.
-    fn lanes(staging: u64) -> Lanes {
-        Lanes {
-            lanes: HashMap::new(),
-            next_id: 0,
-            next_seq: 0,
-            staged: 0,
-            staging,
-            starved: false,
-            clock: [0; 3],
-            now: 0,
-            lane_now: [0; 3],
-            done: Default::default(),
-            refused: 0,
-            bcpack: Default::default(),
-            since: None,
-        }
-    }
-
-    fn read(lanes: &mut Lanes, id: u64, options: u64, size: u32) {
-        let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
-        (r.destination_size, r.source_size) = (size, size);
-        let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
-    }
-
-    #[test]
-    fn priorities_share_by_bytes_about_tenfold() {
-        let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 4096));
-        l.lanes.insert(1, Lane::new(1, 4096));
-        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: as high
-        for _ in 0..400 {
-            for id in 0..3 {
-                read(&mut l, id, 0, 4096);
-            }
-        }
-        (0..3).for_each(|id| l.submit(id));
-        let mut started = [0u32; 3];
-        for _ in 0..330 {
-            let job = l.start().unwrap();
-            started[job.lane as usize] += 1;
-            l.finish(&job, Ok(()));
-        }
-        // Normal gets about a tenth of what high and real-time get together.
-        assert_eq!(started[1] + started[2], 300, "{started:?}");
-        assert_eq!(started[0], 30, "{started:?}");
-        assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
-    }
-
-    #[test]
-    fn staging_bounds_compressed_bytes_in_flight() {
-        let mut l = lanes(100);
-        l.lanes.insert(0, Lane::new(0, 64));
-        read(&mut l, 0, ZLIB, 60);
-        read(&mut l, 0, ZLIB, 60);
-        read(&mut l, 0, 0, 1000); // raw: straight to its destination
-        l.submit(0);
-        let first = l.start().unwrap();
-        assert!(l.start().is_none(), "60 + 60 > 100");
-        l.finish(&first, Ok(()));
-        let second = l.start().unwrap();
-        let raw = l.start().unwrap();
-        assert_eq!((second.staging, raw.staging), (60, 0));
-        // Alone, a request larger than the buffer still runs.
-        read(&mut l, 0, ZLIB, 500);
-        l.submit(0);
-        assert!(l.start().is_none());
-        l.finish(&second, Ok(()));
-        assert!(l.start().is_some());
-    }
-
-    #[test]
-    fn a_status_waits_for_every_earlier_read() {
-        let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
-        let array = status_array(2).cast::<Instance<StatusArray>>();
-        let status = |index| {
-            add_ref_instance(array);
-            Command::Status(Status { array, index })
-        };
-        read(&mut l, 0, 0, 16);
-        read(&mut l, 0, 0, 16);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(0));
-        read(&mut l, 0, 0, 16);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(1));
-        // SAFETY: an array we created.
-        for entry in unsafe { &(*array).state.entries }.iter() {
-            entry.store(E_PENDING, Ordering::Release);
-        }
-        l.submit(0);
-        let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
-        // The last read and the first finish; the second then fails.
-        l.finish(&jobs[2], Ok(()));
-        l.finish(&jobs[0], Ok(()));
-        let results = || (result(array.cast(), 0), result(array.cast(), 1));
-        assert_eq!(results(), (E_PENDING, E_PENDING));
-        l.finish(&jobs[1], Err(INVALID_DATA));
-        assert_eq!(results(), (INVALID_DATA, S_OK));
-    }
-
-    #[test]
-    fn zlib_then_bcpack() {
-        with_test_tables();
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&BC4_STREAM, 6);
-        let (_dir, file) = file_with(&packed);
-        let (queue, array) = (new_queue(0), status_array(1));
-        let mut out = [0u8; 16];
-        let options = ZLIB | 4 << 1;
-        let mut r = request(options, out.as_mut_ptr().cast(), 16, file, 0, packed.len());
-        r.intermediate_size = BC4_STREAM.len() as u32;
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, bc4_blocks());
-    }
-
-    /// BCPack tables we made (uniform models; BC4 index pairs: low 3 bits,
-    /// next 3 bits), in a folder kept for the test process.
-    fn with_test_tables() {
-        static DIR: OnceLock<()> = OnceLock::new();
-        DIR.get_or_init(|| {
-            let mut t = Vec::new();
-            for m in 0..128 {
-                let g = m / 16;
-                for b in 0..9 {
-                    let f: u16 = if b < g + 2 { 1 << (15 - g) } else { 0 };
-                    t.extend_from_slice(&f.to_le_bytes());
-                }
-            }
-            t.extend([0; 256 + 64 + 256]);
-            t.extend((0..64u8).map(|v| (v & 7) | (v >> 3) << 4));
-            t.resize(bcpack::TABLES_SIZE, 0);
-            let dir = tempfile::tempdir().unwrap().keep();
-            std::fs::write(dir.join("tables.bin"), t).unwrap();
-            use_bcpack_tables(dir);
-        });
-    }
-
-    /// Two BC4 blocks from the format's test encoder: endpoints 10, -3 with
-    /// indices p -> p & 7, then the same block plus 1 everywhere.
-    const BC4_STREAM: [u8; 88] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 5, 5, 5, 5, 4, 4, 4, 4, 1, 1, 1, 1, 0x10, 0x10, 0x10, 0x10, 2, 1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0x14, 5, 0x20, 0x68, 0xb0, 0xf8, 3, 3, 2, 2, 0x24, 0x24, 0x24,
-        0x24, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 0x10, 0x10, 0x10, 0x10, 0, 0, 0, 0,
-        0x20, 0x68, 0xb0, 0xf8, 0x24, 0x24, 0x24, 0x24, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
-
-    /// What `BC4_STREAM` unpacks to.
-    fn bc4_blocks() -> [u8; 16] {
-        let code = [0u64, 2, 3, 4, 5, 6, 7, 1];
-        let block = |e0: u64, e1: u64, add: usize| {
-            let bits = (0..16).fold(0, |a, p| a | code[(p + add) & 7] << (16 + 3 * p));
-            (e0 | e1 << 8 | bits).to_le_bytes()
-        };
-        let mut out = [0; 16];
-        out[..8].copy_from_slice(&block(138, 125, 0));
-        out[8..].copy_from_slice(&block(139, 126, 1));
-        out
-    }
-
-    #[test]
-    fn bcpack_requests_unpack_into_the_destination() {
-        with_test_tables();
-        let mut contents = pattern(100);
-        contents.extend_from_slice(&BC4_STREAM);
-        let (_dir, file) = file_with(&contents);
-        let (queue, array) = (new_queue(0), status_array(1));
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88));
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, bc4_blocks());
-    }
-
-    #[test]
-    fn a_closed_queue_completes_nothing() {
-        let (_dir, file) = file_with(&pattern(64));
-        let (queue, array) = (new_queue(0), status_array(1));
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
-        enqueue_status(queue, array, 0);
-        void(queue, 0x40);
-        void(queue, 0x30);
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(result(array, 0), E_PENDING);
-        assert_eq!(out, [0; 16]);
-    }
-
-    #[test]
-    fn physical_page_destinations() {
-        use crate::modules::xmem;
-        let mut pages = [0usize; 2];
-        let mut n = 2;
-        // SAFETY: the arguments are this test's locals, valid for the call.
-        assert_eq!(unsafe { xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()) }, 1);
-        // Where the title would see them: a reservation of 64 KiB pages.
-        // SAFETY: the arguments are this test's locals, valid for the call.
-        let mapped = unsafe {
-            xmem::XMemVirtualAlloc(
-                std::ptr::null_mut(),
-                2 * PAGE,
-                0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-                0,
-                0x04,
-            )
-        };
-        assert!(!mapped.is_null());
-        // SAFETY: the arguments are this test's locals, valid for the call.
-        assert_eq!(unsafe { xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()) }, mapped);
-
-        let plain = pattern(100);
-        let (queue, array) = (new_queue(1), status_array(1));
-        let mut r = request(
-            PAGE_DESTINATION | MEMORY_SOURCE,
-            pages.as_mut_ptr().cast(),
-            plain.len(),
-            plain.as_ptr().cast(),
-            0,
-            plain.len(),
-        );
-        r.page_offset = (PAGE - 40) as u64; // across the page boundary
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        // SAFETY: both pages are mapped read-write.
-        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
-        assert_eq!(seen, plain);
-    }
-    #[test]
-    fn zlib_into_pages_in_place_and_across_allocations() {
-        use crate::modules::xmem;
-        let allocate = |n: usize| {
-            let (mut pages, mut given) = (vec![0usize; n], n);
-            let (given_ptr, pages_ptr) = (&mut given, pages.as_mut_ptr());
-            // SAFETY: the arguments are this test's locals, valid for the call.
-            assert_eq!(unsafe { xmem::XMemAllocatePhysicalPages(0, given_ptr, pages_ptr) }, 1);
-            pages
-        };
-        let (a, b) = (allocate(3), allocate(1));
-        let plain = pattern(2 * PAGE + 100);
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
-        // One allocation's pages in order (one window), then pages of two
-        // (through a buffer), both from 50 bytes into the first.
-        let mut destinations = [a.clone(), vec![a[0], a[1], b[0]]];
-        let (queue, array) = (new_queue(1), status_array(1));
-        for pages in &mut destinations {
-            let mut r = request(
-                ZLIB | PAGE_DESTINATION | MEMORY_SOURCE,
-                pages.as_mut_ptr().cast(),
-                plain.len(),
-                packed.as_ptr().cast(),
-                0,
-                packed.len(),
-            );
-            r.page_offset = 50;
-            enqueue(queue, &r);
-        }
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        for pages in &destinations {
-            // SAFETY: the arguments are this test's locals, valid for the call.
-            let mapped = unsafe {
-                xmem::XMemVirtualAlloc(
-                    std::ptr::null_mut(),
-                    3 * PAGE,
-                    0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-                    0,
-                    0x04,
-                )
-            };
-            assert!(!mapped.is_null());
-            // SAFETY: the arguments are this test's locals, valid for the call.
-            assert_eq!(unsafe { xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()) }, mapped);
-            // SAFETY: all three pages are mapped read-write.
-            let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
-            assert!(seen[..50].iter().all(|&b| b == 0));
-            assert_eq!(seen[50..50 + plain.len()], plain);
-            // SAFETY: the arguments are this test's locals, valid for the call.
-            assert_eq!(unsafe { xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()) }, mapped);
-        }
-        // SAFETY: the arguments are this test's locals, valid for the call.
-        assert_eq!(unsafe { xmem::XMemFreePhysicalPages(3, a.as_ptr()) }, 1);
-        // SAFETY: the arguments are this test's locals, valid for the call.
-        assert_eq!(unsafe { xmem::XMemFreePhysicalPages(1, b.as_ptr()) }, 1);
-    }
-}
+mod tests;

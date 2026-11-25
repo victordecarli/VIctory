@@ -8,10 +8,6 @@
 //! Each list records onto a host command list as its methods are called;
 //! draw state lives in `crate::draw`. Methods not
 //! written yet log once with their caller, so a run lists what to do next.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::mem::offset_of;
 
@@ -84,24 +80,38 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
-    // SAFETY: the title passes one of our lists.
+/// # Safety
+///
+/// `this` is null or a live list this module created.
+unsafe fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    // SAFETY: `this` as this function's contract gives it.
+    let host = unsafe { host_list(this) };
+    let Some(list) = host else { return };
+    // SAFETY: `this` is a live list, per this function's contract.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
-pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+/// # Safety
+///
+/// `this` is null or a live list this module created, and it stays alive
+/// for `'a`.
+pub(crate) unsafe fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
-    // SAFETY: the title passes one of our lists.
+    // SAFETY: `this` is a live list, per this function's contract.
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
-pub(crate) extern "system" fn create_allocator(
+/// # Safety
+///
+/// `iid` is null or points to an interface id valid for reads, and `out` is
+/// null or valid for a write of an object pointer, for the duration of the
+/// call.
+pub(crate) unsafe extern "system" fn create_allocator(
     _: This,
     kind: u32,
     iid: *const Iid,
@@ -112,7 +122,13 @@ pub(crate) extern "system" fn create_allocator(
 }
 
 /// Lists start open, as in D3D12.
-pub(crate) extern "system" fn create_list(
+///
+/// # Safety
+///
+/// `allocator` is null or a live allocator this module created. `iid` is
+/// null or points to an interface id valid for reads, and `out` is null or
+/// valid for a write of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_list(
     _: This,
     _nodes: u32,
     kind: u32,
@@ -121,7 +137,8 @@ pub(crate) extern "system" fn create_list(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    new_list(kind, allocator, iid, out)
+    // SAFETY: as this function's contract gives them.
+    unsafe { new_list(kind, allocator, iid, out) }
 }
 
 /// The console's list creation: type, flags, node mask and barrier batch
@@ -135,7 +152,13 @@ pub(crate) struct ListDesc {
     barrier_batch: u32,
 }
 
-pub(crate) extern "system" fn create_list_x(
+/// # Safety
+///
+/// `desc` is null or valid for reads of a `ListDesc`, and `allocator` is
+/// null or a live allocator this module created. `iid` is null or points to
+/// an interface id valid for reads, and `out` is null or valid for a write
+/// of an object pointer, for the duration of the call.
+pub(crate) unsafe extern "system" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
@@ -143,15 +166,21 @@ pub(crate) extern "system" fn create_list_x(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
+    // SAFETY: `desc` is null or readable, per this function's contract.
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "console command list");
-    new_list(desc.kind, allocator, iid, out)
+    // SAFETY: as this function's contract gives them.
+    unsafe { new_list(desc.kind, allocator, iid, out) }
 }
 
-fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// # Safety
+///
+/// `allocator` is null or a live allocator this module created. `iid` is
+/// null or points to an interface id valid for reads, and `out` is null or
+/// valid for a write of an object pointer, for the duration of the call.
+unsafe fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -184,11 +213,20 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
 
-extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// # Safety
+///
+/// `this` is a live allocator this module created. `iid` is null or points
+/// to an interface id valid for reads, and `out` is null or valid for a
+/// write of an object pointer, for the duration of the call.
+unsafe extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ALLOCATOR_IIDS).then_some(this);
     object::answer(ALLOCATOR, iid, found, out)
 }
-extern "system" fn allocator_release(this: This) -> u32 {
+/// # Safety
+///
+/// `this` is a live allocator this module created, holding the reference
+/// the caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn allocator_release(this: This) -> u32 {
     object::release_boxed::<Allocator>(this)
 }
 /// Nothing is recorded, so there is nothing to free.
@@ -196,36 +234,60 @@ extern "system" fn allocator_reset(_: This) -> HRESULT {
     S_OK
 }
 
-extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// # Safety
+///
+/// `this` is a live list this module created. `iid` is null or points to an
+/// interface id valid for reads, and `out` is null or valid for a write of
+/// an object pointer, for the duration of the call.
+unsafe extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
-extern "system" fn list_release(this: This) -> u32 {
+/// # Safety
+///
+/// `this` is a live list this module created, holding the reference the
+/// caller gives up; it must not be used after the last one is released.
+unsafe extern "system" fn list_release(this: This) -> u32 {
     object::release_boxed::<List>(this)
 }
-extern "system" fn list_type(this: This) -> u32 {
-    // SAFETY: `this` is one of our lists.
+/// # Safety
+///
+/// `this` is a live list this module created.
+unsafe extern "system" fn list_type(this: This) -> u32 {
+    // SAFETY: `this` is a live list, per this function's contract.
     unsafe { (*this.cast::<List>()).kind }
 }
-extern "system" fn close(this: This) -> HRESULT {
+/// # Safety
+///
+/// `this` is null or a live list this module created.
+unsafe extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
+    // SAFETY: as this function's contract gives them.
+    if let Some(host) = unsafe { host_list(this) } {
         host.close();
     }
     S_OK
 }
-extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+/// # Safety
+///
+/// `this` is null or a live list this module created, `allocator` is null
+/// or a live allocator this module created, and `pipeline` is null or a
+/// live pipeline this crate created.
+unsafe extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
     // Every submission of the list has run (submissions are waited for).
-    // SAFETY: the title passes one of our lists.
+    // SAFETY: `this` is a live list, per this function's contract.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
+    // SAFETY: as this function's contract gives them.
+    unsafe {
+        with_state(this, |host, state| {
+            host.reset();
+            state.reset(pipeline);
+        })
+    };
     #[cfg(not(windows))]
     let _ = (this, pipeline);
     S_OK
@@ -249,7 +311,11 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    let host = |r: This| {
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        unsafe { crate::resource::host_resource(r) }.map(|h| h.as_raw().cast_const().cast())
+    };
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -287,19 +353,31 @@ const UAV_BARRIER: Barrier =
     Barrier { kind: 2, flags: 0, first: std::ptr::null(), second: 0, last: 0 };
 
 /// Returns the console's barrier "actions" (none).
-extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `barriers` is
+/// null or valid for reads of `count` `Barrier` entries, each naming
+/// resources this crate created.
+unsafe extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    // SAFETY: as this function's contract gives them.
+    if let Some(list) = unsafe { host_list(this) }
         && !barriers.is_null()
     {
-        // SAFETY: the title passes `count` barriers.
+        // SAFETY: non-null, and `count` barriers, per this function's
+        // contract.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> =
             barriers.iter().filter_map(|b| host_barrier(list, b)).collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            b.kind != 1
+                && !b.first.is_null()
+                && unsafe { crate::resource::buffer_bytes(b.first) }.is_some()
         }) {
             host.push(UAV_BARRIER);
         }
@@ -323,7 +401,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
-pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+/// # Safety
+///
+/// `resource` is null or a resource this crate created.
+pub(crate) unsafe fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
@@ -340,8 +421,14 @@ const COPY_SOURCE: u32 = 0x800;
 
 /// `len` bytes at `offset` of a title buffer, if they are inside it.
 #[cfg(windows)]
-fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
-    let (data, size) = crate::resource::buffer_bytes(buffer)?;
+/// # Safety
+///
+/// `buffer` is null or a buffer this crate created, which stays alive while
+/// the returned pointer is used.
+unsafe fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let (data, size) = unsafe { crate::resource::buffer_bytes(buffer) }?;
     let end = offset.checked_add(len)?;
     if end > size {
         tracing::warn!(offset, len, size, "copy outside its buffer");
@@ -352,7 +439,12 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
 }
 
 /// Buffer to buffer: both are host memory, copied at submission.
-extern "system" fn copy_buffer_region(
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `dst` and `src`
+/// are null or buffers this crate created.
+unsafe extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
     dst_offset: u64,
@@ -361,9 +453,12 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let Some(to) = buffer_range(dst, dst_offset, len)
-        && let Some(from) = buffer_range(src, src_offset, len)
+    // SAFETY: as this function's contract gives them.
+    if let Some(list) = unsafe { host_list(this) }
+        // SAFETY: as this function's contract gives them.
+        && let Some(to) = unsafe { buffer_range(dst, dst_offset, len) }
+        // SAFETY: as this function's contract gives them.
+        && let Some(from) = unsafe { buffer_range(src, src_offset, len) }
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -371,27 +466,43 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
-extern "system" fn copy_resource(this: This, dst: This, src: This) {
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `dst` and `src`
+/// are null or resources this crate created.
+unsafe extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        let Some(list) = host_list(this) else {
+        // SAFETY: `this` as this function's contract gives it.
+        let host = unsafe { host_list(this) };
+        let Some(list) = host else {
             return;
         };
         if let (Some(to), Some(from)) =
-            (crate::resource::host_resource(dst), crate::resource::host_resource(src))
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::host_resource(dst) }, unsafe {
+                    crate::resource::host_resource(src)
+                })
         {
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
-            ensure_state(list, dst, COPY_DEST);
-            ensure_state(list, src, COPY_SOURCE);
+            // SAFETY: as this function's contract gives them.
+            unsafe { ensure_state(list, dst, COPY_DEST) };
+            // SAFETY: as this function's contract gives them.
+            unsafe { ensure_state(list, src, COPY_SOURCE) };
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) =
-            (crate::resource::buffer_bytes(dst), crate::resource::buffer_bytes(src))
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::buffer_bytes(dst) }, unsafe {
+                    crate::resource::buffer_bytes(src)
+                })
         {
             list.defer_copy(to, from, a.min(b) as usize);
         }
@@ -400,8 +511,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     let _ = (this, dst, src);
 }
 
-extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
-    copy_resource(this, dst, src);
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `dst` and `src`
+/// are null or resources this crate created.
+unsafe extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    // SAFETY: as this function's contract gives them.
+    unsafe { copy_resource(this, dst, src) };
 }
 
 /// A copy location as titles pass it, laid out as the host's: a resource,
@@ -417,7 +533,13 @@ pub(crate) struct CopyLocation {
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
-extern "system" fn copy_texture_region(
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created, `dst` and `src` are
+/// null or valid for reads of a `CopyLocation` naming a resource this crate
+/// created, and `source_box` is null or valid for reads of six `u32`.
+unsafe extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
     x: u32,
@@ -431,13 +553,18 @@ extern "system" fn copy_texture_region(
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
-        // SAFETY: the title passes both locations (null is tolerated).
+        // SAFETY: `dst` and `src` are null or readable, per this function's
+        // contract.
         let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe { src.as_ref() })
+            // SAFETY: as this function's contract gives them.
+            (unsafe { host_list(this) }, unsafe { dst.as_ref() }, unsafe { src.as_ref() })
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        let found = unsafe { crate::resource::host_resource(dst.resource) };
+        let Some(to) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
@@ -450,7 +577,9 @@ extern "system" fn copy_texture_region(
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+            // SAFETY: `src.resource` as this function's contract gives it.
+            let range = unsafe { buffer_range(src.resource, src.footprint.offset, bytes) };
+            let Some(data) = range else {
                 return;
             };
             let Some((buffer, staging)) = list.upload(host, bytes) else {
@@ -468,16 +597,21 @@ extern "system" fn copy_texture_region(
             }
             _upload = buffer;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            let found = unsafe { crate::resource::host_resource(src.resource) };
+            let Some(texture) = found else {
                 return;
             };
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            // SAFETY: as this function's contract gives them.
+            unsafe { ensure_state(list, src.resource, COPY_SOURCE) };
             from.resource = texture.as_raw().cast_const().cast();
         }
-        ensure_state(list, dst.resource, COPY_DEST);
+        // SAFETY: as this function's contract gives them.
+        unsafe { ensure_state(list, dst.resource, COPY_DEST) };
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
@@ -527,7 +661,12 @@ extern "system" fn copy_texture_region(
     clippy::too_many_arguments,
     reason = "the method's own arguments, fixed by the D3D12.X table it sits in"
 )]
-extern "system" fn copy_texture_region_x(
+/// # Safety
+///
+/// `this` is null or a live list this module created, `dst` and `src` are
+/// null or valid for reads of a `CopyLocation` naming a resource this crate
+/// created, and `source_box` is null or valid for reads of six `u32`.
+unsafe extern "system" fn copy_texture_region_x(
     this: This,
     dst: *const CopyLocation,
     x: u32,
@@ -537,10 +676,15 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
-    copy_texture_region(this, dst, x, y, z, src, source_box);
+    // SAFETY: as this function's contract gives them.
+    unsafe { copy_texture_region(this, dst, x, y, z, src, source_box) };
 }
 
-extern "system" fn resolve(
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `dst` and `src`
+/// are null or resources this crate created.
+unsafe extern "system" fn resolve(
     this: This,
     dst: This,
     dst_sub: u32,
@@ -549,9 +693,14 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    // SAFETY: as this function's contract gives them.
+    if let Some(list) = unsafe { host_list(this) }
         && let (Some(to), Some(from)) =
-            (crate::resource::host_resource(dst), crate::resource::host_resource(src))
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::host_resource(dst) }, unsafe {
+                    crate::resource::host_resource(src)
+                })
     {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
@@ -561,8 +710,10 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        ensure_state(list, dst, RESOLVE_DEST);
-        ensure_state(list, src, RESOLVE_SOURCE);
+        // SAFETY: as this function's contract gives them.
+        unsafe { ensure_state(list, dst, RESOLVE_DEST) };
+        // SAFETY: as this function's contract gives them.
+        unsafe { ensure_state(list, src, RESOLVE_SOURCE) };
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
@@ -606,7 +757,12 @@ pub(crate) struct Rect {
     bottom: i32,
 }
 
-extern "system" fn clear_rtv(
+/// # Safety
+///
+/// `this` is null or a live list this module created, `color` is null or
+/// valid for reads of four `f32`, and `rects` is null or valid for reads of
+/// `count` `Rect` entries.
+unsafe extern "system" fn clear_rtv(
     this: This,
     handle: u64,
     color: *const [f32; 4],
@@ -615,21 +771,26 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
+        // SAFETY: as this function's contract gives them.
+        let (Some(list), Some(record)) =
+            (unsafe { host_list(this) }, crate::descriptor::rtv_record(handle))
         else {
             return;
         };
         let (Some(texture), Some(host)) =
-            (crate::resource::host_resource(record.resource), crate::host::host())
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::host_resource(record.resource) }, crate::host::host())
         else {
             return;
         };
-        // SAFETY: the title passes four floats (null is tolerated).
+        // SAFETY: `color` is null or readable, per this function's contract.
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
         };
         let rects = (count > 0 && !rects.is_null()).then(|| {
-            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            // SAFETY: non-null, and `count` rectangles laid out as the host's,
+            // per this function's contract.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
@@ -653,7 +814,12 @@ extern "system" fn clear_rtv(
 
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
 /// flags: 1 depth, 2 stencil.
-extern "system" fn clear_dsv(
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `rects` is null
+/// or valid for reads of `count` `Rect` entries.
+unsafe extern "system" fn clear_dsv(
     this: This,
     handle: u64,
     flags: u32,
@@ -665,21 +831,27 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
+        // SAFETY: as this function's contract gives them.
+        let (Some(list), Some(record)) =
+            (unsafe { host_list(this) }, crate::descriptor::dsv_record(handle))
         else {
             return;
         };
         let (Some(texture), Some(host)) =
-            (crate::resource::host_resource(record.resource), crate::host::host())
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            (unsafe { crate::resource::host_resource(record.resource) }, crate::host::host())
         else {
             return;
         };
         let rects = (count > 0 && !rects.is_null()).then(|| {
-            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            // SAFETY: non-null, and `count` rectangles laid out as the host's,
+            // per this function's contract.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
-        ensure_state(list, record.resource, DEPTH_WRITE);
+        // SAFETY: as this function's contract gives them.
+        unsafe { ensure_state(list, record.resource, DEPTH_WRITE) };
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
@@ -698,9 +870,15 @@ extern "system" fn clear_dsv(
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
-extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created; `dst` and `src` are
+/// addresses of the title's memory, readable and writable for `len` bytes.
+unsafe extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    // SAFETY: as this function's contract gives them.
+    if let Some(list) = unsafe { host_list(this) }
         && dst != 0
         && src != 0
     {
@@ -725,9 +903,16 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created.
+unsafe extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    // SAFETY: as this function's contract gives them.
+    unsafe {
+        state::dispatch(this, x, y, z)
+    };
     #[cfg(not(windows))]
     {
         let _ = (this, x, y, z);
@@ -746,7 +931,12 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// by a query.
 /// shortcut: no query runs on the host GPU; results are plausible values,
 /// not measured ones (time spans come out as the submission's length).
-extern "system" fn resolve_queries(
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `buffer` is null
+/// or a buffer this crate created.
+unsafe extern "system" fn resolve_queries(
     this: This,
     _heap: This,
     kind: u32,
@@ -759,7 +949,10 @@ extern "system" fn resolve_queries(
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
-    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let found = unsafe { crate::resource::buffer_bytes(buffer) };
+    let Some((data, size)) = found else {
         return;
     };
     let (what, bytes) = match kind {
@@ -778,7 +971,8 @@ extern "system" fn resolve_queries(
             // SAFETY: inside the buffer, checked above.
             let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
             let what = if piece == 0 { what } else { Written::Value(0) };
-            defer_write(this, at as u64, what, 8);
+            // SAFETY: as this function's contract gives them.
+            unsafe { defer_write(this, at as u64, what, 8) };
         }
     }
 }
@@ -794,12 +988,19 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-extern "system" fn set_pipeline(this: This, pipeline: This) {
-    // SAFETY: the title's pipeline (null is tolerated), which it keeps
-    // alive while the list uses it.
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `pipeline` is
+/// null or a live pipeline this crate created.
+unsafe extern "system" fn set_pipeline(this: This, pipeline: This) {
+    // SAFETY: `pipeline` is null or a live pipeline, per this function's
+    // contract.
     unsafe { crate::pipeline::bound(pipeline) };
     #[cfg(windows)]
-    with_state(this, |_, state| state.set_pipeline(pipeline));
+    // SAFETY: as this function's contract gives them.
+    unsafe {
+        with_state(this, |_, state| state.set_pipeline(pipeline))
+    };
     #[cfg(not(windows))]
     let _ = this;
 }
@@ -812,8 +1013,20 @@ extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _siz
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
-extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
-    reset(this, allocator, pipeline)
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created, `allocator` is null
+/// or a live allocator this module created, and `pipeline` is null or a
+/// live pipeline this crate created.
+unsafe extern "system" fn reset_x(
+    this: This,
+    allocator: This,
+    pipeline: This,
+    _flags: u32,
+) -> HRESULT {
+    // SAFETY: as this function's contract gives them.
+    unsafe { reset(this, allocator, pipeline) }
 }
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
@@ -821,7 +1034,11 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// same address; null on failure. Grand Theft Auto VI's BVH builder puts
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
-extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created.
+unsafe extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
         return std::ptr::null_mut();
@@ -833,7 +1050,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     let start = block.as_mut_ptr();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
-    // SAFETY: the title passes one of our lists.
+    // SAFETY: `this` is a live list, per this function's contract.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
@@ -848,188 +1065,7 @@ extern "system" fn ignored_state(_: This) {}
 /// The title's draw state, kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
-mod state {
-    use super::{This, host_list, with_state};
-    use crate::draw::{IndexView, VertexView};
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
-
-    /// `count` items at `items`, or none.
-    fn items<'a, T>(items: *const T, count: u32) -> &'a [T] {
-        if items.is_null() || count == 0 {
-            return &[];
-        }
-        // SAFETY: the title passes `count` items.
-        unsafe { std::slice::from_raw_parts(items, count as usize) }
-    }
-
-    pub(super) extern "system" fn topology(this: This, topology: u32) {
-        with_state(this, |list, s| s.set_topology(list, topology));
-    }
-    pub(super) extern "system" fn viewports(
-        this: This,
-        count: u32,
-        viewports: *const D3D12_VIEWPORT,
-    ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(list, items(viewports, count));
-        }
-    }
-    pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(list, items(rects, count));
-        }
-    }
-    pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
-            // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(list, unsafe { factor.as_ref() });
-        }
-    }
-    pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(list, reference);
-        }
-    }
-    pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
-        with_state(this, |_, s| s.set_heaps(items(heaps, count)));
-    }
-    pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(true, slot, handle));
-    }
-    pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(false, slot, handle));
-    }
-    pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
-        with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
-    }
-    pub(super) extern "system" fn graphics_constant(
-        this: This,
-        slot: u32,
-        value: u32,
-        offset: u32,
-    ) {
-        with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
-    }
-    pub(super) extern "system" fn compute_constants(
-        this: This,
-        slot: u32,
-        count: u32,
-        values: *const u32,
-        offset: u32,
-    ) {
-        with_state(this, |_, s| s.set_constants(true, slot, items(values, count), offset));
-    }
-    pub(super) extern "system" fn graphics_constants(
-        this: This,
-        slot: u32,
-        count: u32,
-        values: *const u32,
-        offset: u32,
-    ) {
-        with_state(this, |_, s| s.set_constants(false, slot, items(values, count), offset));
-    }
-    /// Root constant buffer, shader resource and unordered access views.
-    pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(true, slot, address));
-    }
-    pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(false, slot, address));
-    }
-    pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
-        // SAFETY: the title passes a view or null.
-        with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
-    }
-    pub(super) extern "system" fn vertex_buffers(
-        this: This,
-        start: u32,
-        count: u32,
-        views: *const VertexView,
-    ) {
-        with_state(this, |_, s| {
-            if views.is_null() {
-                s.clear_vertex_buffers(start, count);
-            } else {
-                s.set_vertex_buffers(start, items(views, count));
-            }
-        });
-    }
-    /// `(count, handles, one range, depth)`: with one range, the handles
-    /// follow the first at the render target view size (128 bytes).
-    pub(super) extern "system" fn targets(
-        this: This,
-        count: u32,
-        handles: *const u64,
-        one_range: i32,
-        depth: *const u64,
-    ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
-        // SAFETY: the title passes a handle or null.
-        let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
-    }
-    pub(super) extern "system" fn draw(
-        this: This,
-        vertices: u32,
-        instances: u32,
-        first: u32,
-        first_instance: u32,
-    ) {
-        super::count_draw();
-        with_state(this, |list, s| s.draw(list, vertices, instances, first, first_instance));
-    }
-    pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
-        super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
-    }
-    /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
-    /// programs take `x` groups only.
-    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
-        super::count_draw();
-        if y * z != 1 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
-        }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
-    }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
-    pub(super) extern "system" fn dispatch_mesh_x(
-        this: This,
-        x: u32,
-        _flags: u64,
-        indirect: u64,
-        _payload: u64,
-    ) {
-        super::count_draw();
-        if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
-            return;
-        }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
-    }
-    pub(super) extern "system" fn draw_indexed(
-        this: This,
-        indices: u32,
-        instances: u32,
-        first: u32,
-        base: i32,
-        first_instance: u32,
-    ) {
-        super::count_draw();
-        with_state(this, |list, s| {
-            s.draw_indexed(list, indices, instances, first, base, first_instance)
-        });
-    }
-}
+mod state;
 
 /// Without a host GPU every draw state call is ignored.
 #[cfg(not(windows))]
@@ -1079,7 +1115,12 @@ extern "system" fn draw(_: This) {
 /// through the host's indirect execution (`State::execute_indirect`).
 /// shortcut: signatures that change root arguments are dropped (logged
 /// once per signature).
-extern "system" fn execute_indirect(
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `signature`,
+/// `arguments` and `count` are null or objects this crate created.
+unsafe extern "system" fn execute_indirect(
     this: This,
     signature: This,
     max: u32,
@@ -1089,13 +1130,19 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
-    // SAFETY: `signature` is the title's `ExecuteIndirect` argument, a
-    // signature our device created and the title still holds for the call.
+    // SAFETY: `signature` is a signature our device created and the title
+    // still holds for the call, per this function's contract.
     let Some((stride, args)) = (unsafe { crate::signature::layout(signature) }) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let address =
+        unsafe { crate::resource::buffer_bytes(arguments) }.map(|(p, _)| p as u64 + offset);
+    // SAFETY: a resource this crate created, which the title keeps alive
+    // while it is in use.
+    let counter =
+        unsafe { crate::resource::buffer_bytes(count) }.map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1104,9 +1151,12 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-        });
+        // SAFETY: as this function's contract gives them.
+        unsafe {
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            })
+        };
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
@@ -1166,10 +1216,16 @@ extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _referen
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created, and `_groups` is not
+/// read.
+unsafe extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(windows)]
     if count > 0
-        && let Some(list) = host_list(this)
+        // SAFETY: as this function's contract gives them.
+        && let Some(list) = unsafe { host_list(this) }
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
@@ -1185,10 +1241,20 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
-extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
-    defer_write(this, address, Written::Value(u64::from(value)), 4);
+///
+/// # Safety
+///
+/// `this` is null or a live list this module created; `address` is title
+/// memory writable for 4 bytes, or a GPU address the host list can write.
+unsafe extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    // SAFETY: as this function's contract gives them.
+    unsafe { defer_write(this, address, Written::Value(u64::from(value)), 4) };
 }
-extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+/// # Safety
+///
+/// `this` is null or a live list this module created; `address` is title
+/// memory writable for 8 bytes, or a GPU address the host list can write.
+unsafe extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -1196,22 +1262,30 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
         SYSTEM_TIMESTAMP => Written::SystemTimestamp,
         _ => Written::Value(value),
     };
-    defer_write(this, address, what, 8);
+    // SAFETY: as this function's contract gives them.
+    unsafe { defer_write(this, address, what, 8) };
 }
 
-fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
+/// # Safety
+///
+/// `this` is null or a live list this module created; `address` is title
+/// memory writable for `bytes` bytes (4 or 8), and it stays so until the
+/// list is submitted.
+unsafe fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     if address == 0 {
         return;
     }
     #[cfg(windows)]
-    if let Some(list) = host_list(this) {
+    // SAFETY: as this function's contract gives them.
+    if let Some(list) = unsafe { host_list(this) } {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
     let _ = this;
     // Without a host GPU nothing runs later: write now.
-    // SAFETY: the title names writable GPU memory; its GPU addresses are CPU
-    // addresses (unified memory), and `bytes` is the width of the query.
+    // SAFETY: `address` is writable, per this function's contract (GPU
+    // addresses are CPU addresses, unified memory), and `bytes` is the width
+    // of the query.
     unsafe { what.write(address as *mut u8, bytes) };
 }
 
@@ -1333,46 +1407,4 @@ static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::object::slot;
-
-    #[test]
-    fn every_inline_command_falls_back_to_the_table() {
-        let null = std::ptr::null();
-        let mut allocator = null;
-        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
-        let allocator = crate::test_support::valid(allocator);
-        let mut list = null;
-        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
-        assert_eq!(hr, S_OK);
-        let list = crate::test_support::valid(list);
-        // What the title's inline draw checks: put < draw limit.
-        // SAFETY: the list is 0x560 bytes.
-        let (put, draw_limit, api_limit) = unsafe {
-            let at = |o: usize| list.cast::<u8>().add(o).cast::<u64>().read();
-            (at(0x18), at(0x28), at(0x30))
-        };
-        assert!(put >= draw_limit && put >= api_limit);
-        // The console's ID3D12GraphicsCommandList6, as Grand Theft Auto VI asks.
-        let mut same = null;
-        assert_eq!(list_query(list, &LIST_IIDS[7], &mut same), S_OK);
-        assert_eq!(same, list);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(list, 0x10)(list), 1);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(list, 0x40)(list), 0);
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        // List-owned upload memory: aligned, writable, gone at reset.
-        let p = allocate_upload(list, 40, 0x100);
-        assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
-        let p = crate::test_support::valid_mut(p);
-        // SAFETY: 40 bytes were handed out.
-        unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
-        assert_eq!(reset(list, allocator, null), S_OK);
-        // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        assert_eq!(release(list), 0);
-        assert_eq!(release(allocator), 0);
-    }
-}
+mod tests;

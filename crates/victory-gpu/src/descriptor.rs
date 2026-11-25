@@ -218,7 +218,9 @@ impl RtvRecord {
         let mut words = if self.described != 0 {
             self.desc
         } else {
-            [crate::resource::view_format(self.resource)?, dimension, 0, 0, 0, 0]
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            [unsafe { crate::resource::view_format(self.resource) }?, dimension, 0, 0, 0, 0]
         };
         words[0] = crate::resource::pc_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
@@ -306,7 +308,9 @@ impl View {
         match self {
             View::Constant(..) | View::Placed(..) => true,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
-                crate::resource::buffer_bytes(*r as This).is_some()
+                // SAFETY: a resource this crate created, which the title keeps alive
+                // while it is in use.
+                unsafe { crate::resource::buffer_bytes(*r as This) }.is_some()
             }
             View::Sampler(_) | View::ConsoleSampler(_) => false,
         }

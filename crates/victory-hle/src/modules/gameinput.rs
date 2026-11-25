@@ -7,10 +7,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`GameInputCreate`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -245,7 +241,8 @@ impl Ref {
 
     /// Another reference, for the title.
     fn share(&self) -> *const Reading {
-        reading_add_ref(self.0.as_ptr());
+        // SAFETY: `self.0` is a live reading this `Ref` holds a reference on.
+        unsafe { reading_add_ref(self.0.as_ptr()) };
         self.0.as_ptr()
     }
 }
@@ -260,7 +257,9 @@ impl Deref for Ref {
 
 impl Drop for Ref {
     fn drop(&mut self) {
-        reading_release(self.0.as_ptr());
+        // SAFETY: `self.0` is a live reading and this `Ref` holds one
+        // reference on it, which this releases once.
+        unsafe { reading_release(self.0.as_ptr()) };
     }
 }
 
@@ -515,46 +514,68 @@ type This = *const Object;
 type Out = *mut *const c_void;
 
 /// The DLL's only export (ordinal 1): the input object, static and shared.
-pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+pub unsafe extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
     tracing::info!("GameInputCreate");
     if out.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: checked non-null; the title passes room for a pointer.
+    // SAFETY: checked non-null; writable, per this function's contract.
     unsafe { out.write(&HUB.object) };
     S_OK
 }
 
-fn hub(this: This) -> &'static Hub {
-    // SAFETY: `this` is a hub's object; hubs are never freed.
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out. Hubs are never
+/// freed.
+unsafe fn hub(this: This) -> &'static Hub {
+    // SAFETY: `this` is a hub's object, per this function's contract; hubs
+    // are never freed.
     unsafe { &*(*this).hub }
 }
 
 /// Clears a COM out pointer and returns `hr`.
-fn fail(out: Out, hr: HRESULT) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+unsafe fn fail(out: Out, hr: HRESULT) -> HRESULT {
     if !out.is_null() {
-        // SAFETY: checked non-null; the title passes room for a pointer.
+        // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { out.write(std::ptr::null()) };
     }
     hr
 }
 
 /// Gives the title a reference to `reading`, or fails as with none.
-fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+unsafe fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     match reading {
         _ if out.is_null() => E_INVALIDARG,
         Some(reading) => {
-            // SAFETY: checked non-null; the title passes room for a pointer.
+            // SAFETY: checked non-null; writable, per this function's contract.
             unsafe { out.write(reading.share().cast()) };
             S_OK
         }
-        None => fail(out, READING_NOT_FOUND),
+        // SAFETY: as this function's contract gives them.
+        None => unsafe { fail(out, READING_NOT_FOUND) },
     }
 }
 
-extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+unsafe extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
     tracing::warn!("input QueryInterface not implemented");
-    fail(out, E_NOINTERFACE)
+    // SAFETY: as this function's contract gives them.
+    unsafe { fail(out, E_NOINTERFACE) }
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
@@ -565,13 +586,19 @@ extern "system" fn timestamp(_: This) -> u64 {
     now()
 }
 
-extern "system" fn current_reading(
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out. `device` is null
+/// or a device this module made. `out` is null or valid for a write of a
+/// pointer.
+unsafe extern "system" fn current_reading(
     this: This,
     kind: u32,
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    let hub = hub(this);
+    // SAFETY: as this function's contract gives them.
+    let hub = unsafe { hub(this) };
     let state = hub.state();
     let newest = |i: usize| state.slots[i].history.back().filter(|r| r.kind() & kind != 0);
     let found = if device.is_null() {
@@ -581,8 +608,12 @@ extern "system" fn current_reading(
             .max_by_key(|r| r.timestamp)
     } else {
         match hub.index(device) {
-            None => return fail(out, E_INVALIDARG),
-            Some(i) if !state.slots[i].connected => return fail(out, DEVICE_DISCONNECTED),
+            // SAFETY: as this function's contract gives them.
+            None => return unsafe { fail(out, E_INVALIDARG) },
+            Some(i) if !state.slots[i].connected => {
+                // SAFETY: `out` as this function's contract gives it.
+                return unsafe { fail(out, DEVICE_DISCONNECTED) };
+            }
             Some(i) => newest(i),
         }
     };
@@ -592,11 +623,18 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    // SAFETY: as this function's contract gives them.
+    unsafe { hand(out, found) }
 }
 
 /// The reading after (`forward`) or before `reference` on its device.
-fn relative(
+///
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out. `reference` is
+/// null or a reading this module made, `device` is null or a device this
+/// module made. `out` is null or valid for a write of a pointer.
+unsafe fn relative(
     this: This,
     reference: *const Reading,
     kind: u32,
@@ -605,24 +643,29 @@ fn relative(
     forward: bool,
 ) -> HRESULT {
     if reference.is_null() {
-        return fail(out, E_INVALIDARG);
+        // SAFETY: as this function's contract gives them.
+        return unsafe { fail(out, E_INVALIDARG) };
     }
-    let hub = hub(this);
-    // SAFETY: a reading we handed out and the title still holds.
+    // SAFETY: as this function's contract gives them.
+    let hub = unsafe { hub(this) };
+    // SAFETY: a reading we handed out, per this function's contract.
     let reference = unsafe { &*reference };
     // shortcut: with no device given only the reference's device is walked,
     // not every device's readings in time order; Grand Theft Auto VI walks
     // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
-        return fail(out, E_INVALIDARG);
+        // SAFETY: as this function's contract gives them.
+        return unsafe { fail(out, E_INVALIDARG) };
     };
     if !device.is_null() && !std::ptr::eq(device, reference.device) {
-        return fail(out, E_INVALIDARG);
+        // SAFETY: as this function's contract gives them.
+        return unsafe { fail(out, E_INVALIDARG) };
     }
     let state = hub.state();
     let history = &state.slots[index].history;
     if history.front().is_none_or(|oldest| reference.sequence < oldest.sequence) {
-        return fail(out, REFERENCE_TOO_OLD);
+        // SAFETY: as this function's contract gives them.
+        return unsafe { fail(out, REFERENCE_TOO_OLD) };
     }
     let wanted = |r: &&Ref| r.kind() & kind != 0;
     let found = if forward {
@@ -630,47 +673,72 @@ fn relative(
     } else {
         history.iter().rev().filter(|r| r.sequence < reference.sequence).find(wanted)
     };
-    hand(out, found)
+    // SAFETY: as this function's contract gives them.
+    unsafe { hand(out, found) }
 }
-extern "system" fn next_reading(
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out. `reference` is
+/// null or a reading this module made, and `device` is null or a device it
+/// made. `out` is null or valid for a write of a pointer.
+unsafe extern "system" fn next_reading(
     this: This,
     reference: *const Reading,
     kind: u32,
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    relative(this, reference, kind, device, out, true)
+    // SAFETY: as this function's contract gives them.
+    unsafe { relative(this, reference, kind, device, out, true) }
 }
-extern "system" fn previous_reading(
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out. `reference` is
+/// null or a reading this module made, and `device` is null or a device it
+/// made. `out` is null or valid for a write of a pointer.
+unsafe extern "system" fn previous_reading(
     this: This,
     reference: *const Reading,
     kind: u32,
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    relative(this, reference, kind, device, out, false)
+    // SAFETY: as this function's contract gives them.
+    unsafe { relative(this, reference, kind, device, out, false) }
 }
 /// The device's reading at `time`, among those still kept.
-extern "system" fn temporal_reading(
+///
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out. `device` is null
+/// or a device this module made. `out` is null or valid for a write of a
+/// pointer.
+unsafe extern "system" fn temporal_reading(
     this: This,
     time: u64,
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    let hub = hub(this);
+    // SAFETY: as this function's contract gives them.
+    let hub = unsafe { hub(this) };
     let Some(index) = hub.index(device) else {
-        return fail(out, E_INVALIDARG);
+        // SAFETY: as this function's contract gives them.
+        return unsafe { fail(out, E_INVALIDARG) };
     };
     let state = hub.state();
     let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    // SAFETY: as this function's contract gives them.
+    unsafe { hand(out, history.iter().rev().find(|r| r.timestamp <= time)) }
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-fn token(out: *mut u64) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`.
+unsafe fn token(out: *mut u64) -> HRESULT {
     if !out.is_null() {
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; valid, per this function's contract.
         unsafe { out.write(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)) };
     }
     S_OK
@@ -678,7 +746,11 @@ fn token(out: *mut u64) -> HRESULT {
 
 // shortcut: reading callbacks never run; Grand Theft Auto VI registers none
 // (it polls).
-extern "system" fn register_reading(
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`; `_context` and
+/// `_callback` are only stored, never called.
+unsafe extern "system" fn register_reading(
     _: This,
     _device: *const c_void,
     _kind: u32,
@@ -688,14 +760,23 @@ extern "system" fn register_reading(
     out: *mut u64,
 ) -> HRESULT {
     tracing::warn!("input reading callbacks are never called");
-    token(out)
+    // SAFETY: as this function's contract gives them.
+    unsafe { token(out) }
 }
 
 /// Device callbacks run on our poll thread when a device comes or goes.
 /// Enumeration reports the devices already there: blocking on the caller's
 /// thread before we return (the title registers holding a lock its callback
 /// takes again), asynchronous on the next poll.
-extern "system" fn register_device(
+///
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out. `device` is null
+/// or a device this module made. `callback`, when present, is a function
+/// the title wrote that is valid to call with `context` from the poll
+/// thread until it is unregistered, and `out` is null or valid for a write
+/// of a `u64`.
+unsafe extern "system" fn register_device(
     this: This,
     device: *const Device,
     kind: u32,
@@ -708,7 +789,8 @@ extern "system" fn register_device(
     let Some(callback) = callback else {
         return E_INVALIDARG;
     };
-    let hub = hub(this);
+    // SAFETY: as this function's contract gives them.
+    let hub = unsafe { hub(this) };
     let registration = Registration {
         token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
         device: device as usize,
@@ -739,37 +821,57 @@ extern "system" fn register_device(
         }
     }
     if !out.is_null() {
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; valid, per this function's contract.
         unsafe { out.write(registration.token) };
     }
     hub.deliver(found);
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
-extern "system" fn register_other(
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `u64`; `_context` and
+/// `_callback` are only stored, never called.
+unsafe extern "system" fn register_other(
     _: This,
     _device: *const c_void,
     _context: *mut c_void,
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    token(out)
+    // SAFETY: as this function's contract gives them.
+    unsafe { token(out) }
 }
 
-fn forget(this: This, token: u64) {
-    let mut state = hub(this).state();
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out.
+unsafe fn forget(this: This, token: u64) {
+    // SAFETY: as this function's contract gives them.
+    let mut state = unsafe { hub(this) }.state();
     state.callbacks.retain(|r| r.token != token);
     state.pending.retain(|e| e.registration.token != token);
 }
-extern "system" fn stop_callback(this: This, token: u64) {
-    forget(this, token);
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out.
+unsafe extern "system" fn stop_callback(this: This, token: u64) {
+    // SAFETY: as this function's contract gives them.
+    unsafe { forget(this, token) };
 }
 /// Stops the callback, then waits up to `timeout` µs for a call of it that
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
-extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
-    forget(this, token);
-    let hub = hub(this);
+///
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out.
+unsafe extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
+    // SAFETY: as this function's contract gives them.
+    unsafe { forget(this, token) };
+    // SAFETY: as this function's contract gives them.
+    let hub = unsafe { hub(this) };
     let me = std::thread::current().id();
     let deadline = Instant::now().checked_add(Duration::from_micros(timeout));
     let mut state = hub.state();
@@ -795,33 +897,56 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
 }
 
 /// Dispatcher and aggregate device: no title of ours asks for them.
-extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+unsafe extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
     tracing::warn!("input dispatcher not implemented");
-    fail(out, E_NOTIMPL)
+    // SAFETY: as this function's contract gives them.
+    unsafe { fail(out, E_NOTIMPL) }
 }
-extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+unsafe extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
     tracing::warn!("aggregate input device not implemented");
-    fail(out, E_NOTIMPL)
+    // SAFETY: as this function's contract gives them.
+    unsafe { fail(out, E_NOTIMPL) }
 }
-extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRESULT {
+/// # Safety
+///
+/// `this` is the input object `GameInputCreate` hands out. `id` is null or
+/// valid for reads of 32 bytes. `out` is null or valid for a write of a
+/// pointer.
+unsafe extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRESULT {
     if id.is_null() || out.is_null() {
-        return fail(out, E_INVALIDARG);
+        // SAFETY: as this function's contract gives them.
+        return unsafe { fail(out, E_INVALIDARG) };
     }
-    // SAFETY: checked non-null; the title passes a device id.
+    // SAFETY: checked non-null; 32 readable bytes, per this function's
+    // contract.
     let id = unsafe { &*id };
-    match hub(this).devices.iter().find(|d| d.info.id == *id) {
+    // SAFETY: as this function's contract gives them.
+    match unsafe { hub(this) }.devices.iter().find(|d| d.info.id == *id) {
         Some(device) => {
-            // SAFETY: checked non-null.
+            // SAFETY: checked non-null; valid, per this function's contract.
             unsafe { out.write((device as *const Device).cast()) };
             S_OK
         }
-        None => fail(out, DEVICE_NOT_FOUND),
+        // SAFETY: as this function's contract gives them.
+        None => unsafe { fail(out, DEVICE_NOT_FOUND) },
     }
 }
 /// Lookup by object, platform handle or platform string: our devices have
 /// none of these.
-extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
-    fail(out, DEVICE_NOT_FOUND)
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a pointer.
+unsafe extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
+    // SAFETY: as this function's contract gives them.
+    unsafe { fail(out, DEVICE_NOT_FOUND) }
 }
 extern "system" fn enable_oem_device(
     _: This,
@@ -859,12 +984,18 @@ static INPUT: Table<22> = Table([
     set_focus_policy as *const (),    // 0xa8
 ]);
 
-extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
-    // SAFETY: one of our devices.
+/// # Safety
+///
+/// `this` is a device this module made; devices are never freed.
+unsafe extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
+    // SAFETY: one of our devices, per this function's contract.
     unsafe { &(*this).info }
 }
-extern "system" fn device_status(this: *const Device) -> u32 {
-    // SAFETY: one of our devices.
+/// # Safety
+///
+/// `this` is a device this module made; devices are never freed.
+unsafe extern "system" fn device_status(this: *const Device) -> u32 {
+    // SAFETY: one of our devices, per this function's contract.
     let device = unsafe { &*this };
     if device.hub().state().slots[device.index].connected { STATUS_CONNECTED } else { 0 }
 }
@@ -872,8 +1003,12 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
 // diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
-extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
-    // SAFETY: one of our devices.
+/// # Safety
+///
+/// `this` is a device this module made, and `params` is null or valid for
+/// reads of four `f32`.
+unsafe extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
+    // SAFETY: one of our devices, per this function's contract.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
@@ -881,7 +1016,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     let [low, high, ..] = if params.is_null() {
         [0.0; 4]
     } else {
-        // SAFETY: checked non-null; four motor levels.
+        // SAFETY: checked non-null; four `f32`, per this function's contract.
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
@@ -916,59 +1051,104 @@ static DEVICE: Table<21> = Table([
     unsupported::<0xa0> as *const (), //
 ]);
 
-fn reading<'a>(this: *const Reading) -> &'a Reading {
-    // SAFETY: a reading we handed out and the title still holds.
+/// # Safety
+///
+/// `this` is a reading this module made and a reference on it is held for
+/// `'a`.
+unsafe fn reading<'a>(this: *const Reading) -> &'a Reading {
+    // SAFETY: a reading we handed out, per this function's contract.
     unsafe { &*this }
 }
-extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
-    reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
+/// # Safety
+///
+/// `this` is a reading this module made.
+unsafe extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
+    // SAFETY: as this function's contract gives them.
+    unsafe { reading(this) }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
-extern "system" fn reading_release(this: *const Reading) -> u32 {
-    let left = reading(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+/// # Safety
+///
+/// `this` is a reading this module made, holding the reference the caller
+/// gives up; it must not be used after the last one is released.
+unsafe extern "system" fn reading_release(this: *const Reading) -> u32 {
+    // SAFETY: as this function's contract gives them.
+    let left = unsafe { reading(this) }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
         // SAFETY: the last reference is gone; `Ref::new` boxed it.
         drop(unsafe { Box::from_raw(this.cast_mut()) });
     }
     left
 }
-extern "system" fn input_kind(this: *const Reading) -> u32 {
-    reading(this).kind()
+/// # Safety
+///
+/// `this` is a reading this module made.
+unsafe extern "system" fn input_kind(this: *const Reading) -> u32 {
+    // SAFETY: as this function's contract gives them.
+    unsafe { reading(this) }.kind()
 }
-extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
-    let reading = reading(this);
+/// # Safety
+///
+/// `this` is a reading this module made.
+unsafe extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
+    // SAFETY: as this function's contract gives them.
+    let reading = unsafe { reading(this) };
     if reading.kind() & kind != 0 { reading.sequence } else { 0 }
 }
-extern "system" fn reading_timestamp(this: *const Reading) -> u64 {
-    reading(this).timestamp
+/// # Safety
+///
+/// `this` is a reading this module made.
+unsafe extern "system" fn reading_timestamp(this: *const Reading) -> u64 {
+    // SAFETY: as this function's contract gives them.
+    unsafe { reading(this) }.timestamp
 }
-extern "system" fn reading_device(this: *const Reading, out: *mut *const Device) {
+/// # Safety
+///
+/// `this` is a reading this module made, and `out` is null or valid for a
+/// write of a pointer.
+unsafe extern "system" fn reading_device(this: *const Reading, out: *mut *const Device) {
     if !out.is_null() {
-        // SAFETY: checked non-null; devices need no reference.
+        // SAFETY: checked non-null; a device of ours, per this function's
+        // contract; devices need no reference.
         unsafe { out.write(reading(this).device) };
     }
 }
-extern "system" fn key_count(this: *const Reading) -> u32 {
-    match &reading(this).value {
+/// # Safety
+///
+/// `this` is a reading this module made.
+unsafe extern "system" fn key_count(this: *const Reading) -> u32 {
+    // SAFETY: as this function's contract gives them.
+    match &unsafe { reading(this) }.value {
         Value::Keys(keys) => keys.len() as u32,
         Value::Pad(_) => 0,
     }
 }
-extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
-    let Value::Keys(keys) = &reading(this).value else {
+/// # Safety
+///
+/// `this` is a reading this module made, and `out` is null or valid for
+/// writes of `count` `KeyState` entries.
+unsafe extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
+    // SAFETY: as this function's contract gives them.
+    let Value::Keys(keys) = &unsafe { reading(this) }.value else {
         return 0;
     };
     if out.is_null() {
         return 0;
     }
     let n = keys.len().min(count as usize);
-    // SAFETY: the title passes room for `count` keys.
+    // SAFETY: non-null, and room for `count` keys, per this function's
+    // contract.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
     n as u32
 }
-extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
+/// # Safety
+///
+/// `this` is a reading this module made, and `out` is null or valid for a
+/// write of a `PadState`.
+unsafe extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
+    // SAFETY: as this function's contract gives them.
+    match &unsafe { reading(this) }.value {
         Value::Pad(state) if !out.is_null() => {
-            // SAFETY: checked non-null.
+            // SAFETY: checked non-null; valid, per this function's contract.
             unsafe { out.write(*state) };
             true
         }
@@ -1196,358 +1376,4 @@ mod host {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-    use crate::HleResolver;
-    use crate::HostPolicy;
-    use victory_loader::Provenance;
-    use victory_pe::ImportSymbol;
-
-    #[derive(Default)]
-    struct FakeHost {
-        pads: [Option<PadState>; PADS],
-        keys: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
-    }
-
-    struct Fake(Arc<Mutex<FakeHost>>);
-
-    impl Source for Fake {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
-            self.0.lock().unwrap().pads[slot]
-        }
-        fn keys(&mut self) -> Vec<KeyState> {
-            self.0.lock().unwrap().keys.clone()
-        }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
-        }
-    }
-
-    fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
-        let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
-        hub.poll();
-        (hub, host)
-    }
-
-    fn key(virtual_key: u8) -> KeyState {
-        KeyState { scan_code: u32::from(virtual_key) + 0x100, virtual_key, ..Default::default() }
-    }
-
-    fn slot<F: Copy, T>(object: *const T, offset: usize) -> F {
-        // SAFETY: our objects start with their table, which has the slot.
-        let f = unsafe { *(*(object as *const *const *const ())).add(offset / 8) };
-        // SAFETY: the caller names the slot's signature.
-        unsafe { std::mem::transmute_copy(&f) }
-    }
-
-    /// Device callbacks seen: device index, current and previous status.
-    type Log = Mutex<Vec<(usize, u32, u32)>>;
-
-    extern "system" fn record(
-        _token: u64,
-        context: *mut c_void,
-        device: *const Device,
-        _timestamp: u64,
-        current: u32,
-        previous: u32,
-    ) {
-        // SAFETY: the test passes its log and one of the hub's devices.
-        let (log, index) = unsafe { (&*(context as *const Log), (*device).index) };
-        log.lock().unwrap().push((index, current, previous));
-    }
-
-    fn register(hub: &Hub, kind: u32, enumeration: u32, log: &Log) -> u64 {
-        type Register = extern "system" fn(
-            This,
-            *const Device,
-            u32,
-            u32,
-            u32,
-            *mut c_void,
-            Option<DeviceCallback>,
-            *mut u64,
-        ) -> HRESULT;
-        let mut token = 0;
-        let context = log as *const Log as *mut c_void;
-        let register = slot::<Register, _>(&hub.object, 0x48);
-        let hr = register(
-            &hub.object,
-            std::ptr::null(),
-            kind,
-            1,
-            enumeration,
-            context,
-            Some(record),
-            &mut token,
-        );
-        assert_eq!(hr, S_OK);
-        assert_ne!(token, 0);
-        token
-    }
-
-    fn result(hr: HRESULT, out: *const c_void) -> Result<*const Reading, HRESULT> {
-        if hr == S_OK {
-            Ok(crate::test_support::valid(out).cast())
-        } else {
-            assert!(out.is_null());
-            Err(hr)
-        }
-    }
-
-    fn current(hub: &Hub, kind: u32, device: usize) -> Result<*const Reading, HRESULT> {
-        type Current = extern "system" fn(This, u32, *const Device, Out) -> HRESULT;
-        let mut out = std::ptr::null();
-        let hr = slot::<Current, _>(&hub.object, 0x20)(
-            &hub.object,
-            kind,
-            &hub.devices[device],
-            &mut out,
-        );
-        result(hr, out)
-    }
-
-    fn walk(hub: &Hub, offset: usize, from: *const Reading) -> Result<*const Reading, HRESULT> {
-        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
-        let mut out = std::ptr::null();
-        let device = reading(from).device;
-        let hr =
-            slot::<Walk, _>(&hub.object, offset)(&hub.object, from, GAMEPAD_KIND, device, &mut out);
-        result(hr, out)
-    }
-
-    fn pad(reading: *const Reading) -> PadState {
-        let mut state = PadState::default();
-        let get =
-            slot::<extern "system" fn(*const Reading, *mut PadState) -> bool, _>(reading, 0xb0);
-        assert!(get(reading, &mut state));
-        state
-    }
-
-    fn stamp(reading: *const Reading) -> (u64, u64) {
-        let time = slot::<extern "system" fn(*const Reading) -> u64, _>(reading, 0x28);
-        let sequence = slot::<extern "system" fn(*const Reading, u32) -> u64, _>(reading, 0x20);
-        (time(reading), sequence(reading, GAMEPAD_KIND))
-    }
-
-    fn release(reading: *const Reading) {
-        slot::<extern "system" fn(*const Reading) -> u32, _>(reading, 0x10)(reading);
-    }
-
-    #[test]
-    fn ordinal_one_resolves_to_create() {
-        let r = HleResolver::new(HostPolicy::none());
-        assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(1)), Some(Provenance::Hle));
-        assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(2)), None);
-    }
-
-    #[test]
-    fn pads_connect_report_and_disconnect() {
-        let (hub, host) = fake();
-        let log = Log::default();
-        register(hub, GAMEPAD_KIND, 2, &log);
-        // Blocking enumeration ran before registration returned: with no
-        // host pad the keyboard's stand-in is the only one.
-        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
-
-        host.lock().unwrap().pads[1] =
-            Some(PadState { buttons: A, left_x: 0.5, ..Default::default() });
-        hub.poll();
-        assert_eq!(
-            log.lock().unwrap()[1..],
-            [(1, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
-        );
-
-        let first = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(pad(first).buttons, A);
-        assert_eq!(pad(first).left_x, 0.5);
-        // No change, no new reading.
-        hub.poll();
-        let again = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(again, first);
-        release(again);
-
-        std::thread::sleep(Duration::from_millis(2));
-        host.lock().unwrap().pads[1].as_mut().unwrap().buttons = B;
-        hub.poll();
-        let second = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(pad(second).buttons, B);
-        let (t1, s1) = stamp(first);
-        let (t2, s2) = stamp(second);
-        assert!(t2 > t1 && s2 == s1 + 1);
-        assert!(t2 <= now());
-
-        // The title's edge check: previous of current, and back again.
-        assert_eq!(walk(hub, 0x30, second), Ok(first));
-        assert_eq!(walk(hub, 0x28, first), Ok(second));
-        assert_eq!(walk(hub, 0x28, second), Err(READING_NOT_FOUND));
-        assert_eq!(walk(hub, 0x30, first), Err(READING_NOT_FOUND));
-        for r in [first, first, second, second] {
-            release(r);
-        }
-
-        host.lock().unwrap().pads[1] = None;
-        hub.poll();
-        assert_eq!(
-            log.lock().unwrap()[3..],
-            [(1, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
-        );
-        assert_eq!(current(hub, GAMEPAD_KIND, 1), Err(DEVICE_DISCONNECTED));
-        // The stand-in is back, at rest.
-        let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
-        assert_eq!(pad(rest), PadState::default());
-        release(rest);
-    }
-
-    #[test]
-    fn keys_feed_the_keyboard_and_the_stand_in_pad() {
-        let (hub, host) = fake();
-        let log = Log::default();
-        register(hub, KEYBOARD_KIND, 2, &log);
-        assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
-
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
-        host.lock().unwrap().keys = keys.clone();
-        hub.poll();
-        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
-        let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
-        let state =
-            slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
-        assert_eq!(count(r), 4);
-        let mut got = [KeyState::default(); 8];
-        assert_eq!(state(r, 8, got.as_mut_ptr()), 4);
-        assert_eq!(got[..4], keys[..]);
-        release(r);
-
-        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
-        assert_eq!(
-            pad(r),
-            PadState {
-                buttons: A,
-                left_y: 1.0,
-                right_x: 1.0,
-                right_trigger: 1.0,
-                ..Default::default()
-            }
-        );
-        release(r);
-        // A keyboard reading is no gamepad reading.
-        assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
-    }
-
-    #[test]
-    fn async_enumeration_waits_for_the_poll_and_unregistering_stops_callbacks() {
-        let (hub, host) = fake();
-        let log = Log::default();
-        let token = register(hub, GAMEPAD_KIND, ASYNC_ENUMERATION, &log);
-        assert!(log.lock().unwrap().is_empty());
-        hub.poll();
-        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
-
-        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(unregister(&hub.object, token, 5000));
-        host.lock().unwrap().pads[0] = Some(PadState::default());
-        hub.poll();
-        assert_eq!(log.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn unregistering_waits_for_a_running_callback() {
-        use std::sync::atomic::AtomicBool;
-        static INSIDE: AtomicBool = AtomicBool::new(false);
-        static LEAVE: AtomicBool = AtomicBool::new(false);
-        static FROM_INSIDE: AtomicU32 = AtomicU32::new(0);
-        extern "system" fn slow(
-            token: u64,
-            context: *mut c_void,
-            _: *const Device,
-            _: u64,
-            _: u32,
-            _: u32,
-        ) {
-            // From inside its own callback, unregistering fails at once.
-            let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(context, 0x68);
-            if !unregister(context.cast(), token, 0) {
-                FROM_INSIDE.fetch_add(1, Ordering::SeqCst);
-            }
-            INSIDE.store(true, Ordering::SeqCst);
-            while !LEAVE.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        let (hub, host) = fake();
-        type Register = extern "system" fn(
-            This,
-            *const Device,
-            u32,
-            u32,
-            u32,
-            *mut c_void,
-            Option<DeviceCallback>,
-            *mut u64,
-        ) -> HRESULT;
-        let register = slot::<Register, _>(&hub.object, 0x48);
-        let mut token = 0;
-        let context = (&raw const hub.object).cast_mut().cast();
-        assert_eq!(
-            register(
-                &hub.object,
-                std::ptr::null(),
-                GAMEPAD_KIND,
-                1,
-                0,
-                context,
-                Some(slow),
-                &mut token
-            ),
-            S_OK
-        );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
-        let poller = std::thread::spawn(|| hub.poll());
-        while !INSIDE.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
-        let leave = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(50));
-            LEAVE.store(true, Ordering::SeqCst);
-        });
-        let start = Instant::now();
-        assert!(unregister(&hub.object, token, u64::MAX), "waits for it");
-        assert!(start.elapsed() >= Duration::from_millis(40));
-        assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
-        poller.join().unwrap();
-        leave.join().unwrap();
-    }
-
-    #[test]
-    fn devices_are_found_by_id_and_rumble_reaches_the_host() {
-        let (hub, host) = fake();
-        host.lock().unwrap().pads[2] = Some(PadState::default());
-        hub.poll();
-        let device = &hub.devices[2] as *const Device;
-        let info = slot::<extern "system" fn(*const Device) -> *const u8, _>(device, 0x18);
-        // SAFETY: the info has the id at +0x20.
-        let id = unsafe { *(info(device).add(0x20) as *const [u8; 32]) };
-        assert_ne!(id, [0; 32]);
-
-        type Find = extern "system" fn(This, *const [u8; 32], Out) -> HRESULT;
-        let find = slot::<Find, _>(&hub.object, 0x80);
-        let mut out = std::ptr::null();
-        assert_eq!(find(&hub.object, &id, &mut out), S_OK);
-        assert_eq!(out, device.cast());
-        assert_eq!(find(&hub.object, &[1; 32], &mut out), DEVICE_NOT_FOUND);
-        assert!(out.is_null());
-
-        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
-        let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
-        rumble(&hub.devices[FALLBACK], &[1.0; 4]);
-        rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
-    }
-}
+mod tests;

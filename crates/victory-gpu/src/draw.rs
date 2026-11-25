@@ -260,7 +260,10 @@ impl State {
                 once!(handle = format_args!("{h:#x}"), "render target without a recorded view");
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            let found = unsafe { crate::resource::host_resource(record.resource) };
+            let Some(texture) = found else {
                 continue;
             };
             self.targets.push(record.resource as usize);
@@ -270,7 +273,9 @@ impl State {
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            let texture = unsafe { crate::resource::host_resource(record.resource) }?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
@@ -394,10 +399,12 @@ impl State {
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
+            unsafe { crate::list::ensure_state(list, t as This, RENDER_TARGET) };
         }
         if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
+            unsafe { crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE) };
         }
         true
     }
@@ -779,7 +786,9 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            .filter_map(|&t| unsafe { crate::resource::host_resource(t as This) })
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -1129,14 +1138,19 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            if let Some(t) = crate::resource::host_resource(*resource as This)
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            if let Some(t) = unsafe { crate::resource::host_resource(*resource as This) }
                 && crate::texture::title_written(t)
             {
                 crate::texture::upload(list, *resource as This, t);
             }
-            crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
+            unsafe { crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE) };
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            // SAFETY: a resource this crate created, which the title keeps alive
+            // while it is in use.
+            if let Some(t) = unsafe { crate::resource::host_resource(*resource as This) } {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
@@ -1151,7 +1165,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
-            crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
+            unsafe { crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS) };
         }
         _ => {}
     }
@@ -1161,7 +1176,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
     let texture = |r: This| {
-        crate::resource::host_resource(r).map(|t| {
+        // SAFETY: a resource this crate created, which the title keeps alive
+        // while it is in use.
+        unsafe { crate::resource::host_resource(r) }.map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
             format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
