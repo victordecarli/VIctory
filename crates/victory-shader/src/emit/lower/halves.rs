@@ -27,8 +27,6 @@
 //!   written there (other than a lane mask) is read only past its write:
 //!   not through a phi at a join, nor where every lane runs. A half that
 //!   skipped the block keeps an older copy, which it then never reads;
-//! - in a group of two host waves, `v_readfirstlane` is not read where
-//!   EXEC was narrowed without a branch (its first lane is not lane 0).
 //!
 //! A block in a loop each lane leaves on its own is not one every lane
 //! runs, the loop's closing block included: the halves could go round a
@@ -193,18 +191,13 @@ fn keeps_64_at(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Opt
     // Scalars written where not every lane runs, with their block.
     let mut lane_scalars = HashMap::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        for (i, inst) in block.insts.iter().enumerate() {
+        for inst in &block.insts {
             let n = inst.name();
             if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
                 return Keep::fixed("ds_(b)permute");
             }
             if two && !every(b) && matches!(n, "v_readlane_b32" | "v_readfirstlane_b32") {
                 return Keep::at("a lane read where not every lane runs", b);
-            }
-            // EXEC narrowed without a branch: the first active lane is not lane 0.
-            let guarded = st.guards.get(b).and_then(|g| g.get(i)).is_some_and(Option::is_some);
-            if two && n == "v_readfirstlane_b32" && guarded {
-                return Keep::fixed("a first-lane read where EXEC is not every lane");
             }
             if two && reads_mask_as_data(st, inst) {
                 // The ballot is taken where the mask is written (`mask_dword`).
@@ -527,15 +520,36 @@ impl Lower<'_> {
         self.s.m.select(c, lower, lo, hi)
     }
 
-    /// `v_readfirstlane`: where every lane runs (as [`keeps_64`] requires of
-    /// a group of two host waves), the console wave's first active lane is
-    /// lane 0, in the lower half.
-    pub(super) fn console_first_lane(&mut self, x: V) -> V {
+    /// `v_readfirstlane`: the console wave's first lane in EXEC. Where every
+    /// lane runs (as [`keeps_64`] requires of a group of two host waves),
+    /// that is lane 0, in the lower half, unless EXEC is narrowed there to
+    /// `guard` (without a branch, or inside a branch taken wave-wide). Then
+    /// each half finds its first lane in EXEC, the halves exchange whether
+    /// they have one and its value, and the lower half's is taken if it has
+    /// one. With no lane in EXEC, lane 0's, as the ISA reads then.
+    pub(super) fn console_first_lane(&mut self, x: V, guard: Option<V>) -> V {
         let c = self.cur;
         let i32t = self.s.t.i32;
-        let mine = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
         self.s.flags |= flags::WAVE_OPS;
-        self.exchange(c, mine).0
+        let Some(on) = guard else {
+            let mine = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+            return self.exchange(c, mine).0;
+        };
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        let ballot = self.s.m.extract(c, ballot, 0);
+        // DXIL's FirstbitLo: -1 for none.
+        let first = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[ballot]);
+        let zero = self.s.m.i32(0);
+        let none = self.s.m.cmp(c, pred::EQ, ballot, zero);
+        let lane = self.s.m.select(c, none, zero, first);
+        let mine = self.read_lane(x, lane);
+        let (lower_lanes, upper_lanes) = self.exchange(c, ballot);
+        let (lower, upper) = self.exchange(c, mine);
+        let lower_has = self.s.m.cmp(c, pred::NE, lower_lanes, zero);
+        let upper_has = self.s.m.cmp(c, pred::NE, upper_lanes, zero);
+        let other = self.s.m.select(c, upper_has, upper, lower);
+        self.s.m.select(c, lower_has, lower, other)
     }
 
     /// The console wave's `op` over its lanes' terms `x` (integers), or with

@@ -4322,7 +4322,7 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" if self.halves.is_some() => {
                 let a = s(self, 0)?;
-                let r = self.console_first_lane(a);
+                let r = self.console_first_lane(a, guard);
                 int(self, r)
             }
             "v_readfirstlane_b32" => {

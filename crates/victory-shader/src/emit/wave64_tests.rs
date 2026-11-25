@@ -511,14 +511,10 @@ fn sum_in_a_branch() -> NativeProgram {
 }
 
 /// What taking a branch wave-wide cannot make exact keeps 64-lane waves: a lane read in a
-/// loop each lane leaves on its own (a back edge, which is never taken wave-wide), and the
-/// first lane read where EXEC was narrowed without a branch (not lane 0).
+/// loop each lane leaves on its own (a back edge, which is never taken wave-wide).
 #[test]
-fn lane_loops_and_first_lanes_of_a_narrowed_exec_keep_64_lane_waves() {
+fn lane_loops_keep_64_lane_waves() {
     assert_eq!(translate(&wave(&LANE_LOOP), 32).unwrap().wave_size, Some(64));
-    // (`v_mbcnt` asks for the console's lanes, which `v_readfirstlane` alone does not)
-    let first = [&MBCNT[..], &[VCC_FROM_40, IF_VCC[0], READFIRSTLANE_V0_S14, END_IF, V1_S14]];
-    assert_eq!(translate(&wave(&first.concat()), 32).unwrap().wave_size, Some(64));
 }
 
 /// The console adds floats in its own tree, which the halves' wave sums do not follow: a
@@ -582,6 +578,15 @@ mod card {
     fn lane_read_in_a_branch() -> NativeProgram {
         let body = [READLANE_10[0], READLANE_10[1], V1_S14];
         wave(&[&[V1_V0, VCC_FROM_40, IF_VCC[0], 0xBF88_0003], &body[..], &[END_IF]].concat())
+    }
+
+    /// v1 = v_readfirstlane(v0) where EXEC was narrowed, without a branch, to the lanes
+    /// from `from` on (`v_mbcnt` asks for the console's lanes, which `v_readfirstlane`
+    /// alone does not).
+    fn first_lane_from(from: u32) -> NativeProgram {
+        // v_cmp_le_u32 vcc, from, v0
+        let cmp = VCC_FROM_40 & !0xFF | (128 + from);
+        wave(&[&MBCNT[..], &[cmp, IF_VCC[0], READFIRSTLANE_V0_S14, END_IF, V1_S14]].concat())
     }
 
     /// [`run`] for a whole program of one console wave.
@@ -705,6 +710,15 @@ mod card {
         let Some(out) = run_program(&lane_read_in_a_branch()) else { return };
         let want: Vec<u32> = (0..64).map(|t| if t < 40 { t } else { 10 }).collect();
         assert_eq!(out, want);
+    }
+
+    /// The first lane of a narrowed EXEC, in either half.
+    #[test]
+    fn the_first_lane_of_a_narrowed_exec_is_the_console_waves() {
+        for from in [10, 40] {
+            let Some(out) = run_program(&first_lane_from(from)) else { return };
+            assert_eq!(out, vec![from; 64], "EXEC from lane {from}");
+        }
     }
 
     /// The console's wave takes the branch, so its one s14 is 5 in every lane.
