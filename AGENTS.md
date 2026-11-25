@@ -45,6 +45,28 @@ Dependency direction (enforced by review, keep it acyclic and downward):
   portable item must never call a `cfg(windows)` one (that is how
   `victory-gpu` stopped building on Linux; see Pitfalls).
 
+## Run logs: where to look first
+
+To debug a run, read its log before reading code. Each `victory run`
+process writes `run-<UTC time>-<pid>.jsonl` into `log_dir` (the newest 20
+are kept): one JSON object per line, the event's fields beside
+`timestamp`, `level`, `target`, `threadId` and `threadName`.
+
+- Find `log_dir` with `victory config` (its `log_dir` line), or read
+  `[paths].log_dir` in the git-ignored `victory.toml`. It is resolved as
+  `VICTORY_LOG_DIR`, then that key, then `%LOCALAPPDATA%\victory\logs`
+  (`crates/victory-core/src/config.rs`). The maintainer's setup keeps
+  logs in a folder beside the clone, D:\Dev\VIctory-logs.
+- It is always outside the repository: a run log holds names and hashes
+  from the title, so it is game-derived data (hard rule 1). With a
+  `log_dir` inside the tree `victory run` writes no log file, only the
+  console, and `victory config` prints a policy violation.
+- Start with the lines whose `target` is `victory::summary`: run start
+  and switches, host adapter, frame reports, the costliest dropped draws,
+  a crash. `scripts/run-summary.ps1` prints them for the newest run;
+  `scripts/run.ps1` builds, runs the title and prints them at the end.
+  The README's Logging section lists every summary event.
+
 ## Verify
 
 Linux (what the `portable` CI job runs; `victory-hle` and `apps/victory`

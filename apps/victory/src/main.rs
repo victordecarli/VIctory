@@ -170,17 +170,17 @@ fn main() -> Result<()> {
     }
 }
 
-/// Logs to the console and to a run log file in the data directory's
-/// `logs`; to the console only if there is no data directory (the command
-/// then fails on it too, and says why).
+/// Logs to the console and to a run log file in the log directory; to the
+/// console only if there is no usable log directory (the command then
+/// fails on the configuration too, and says why).
 fn start_run_log() {
-    match victory_core::Config::load().and_then(|cfg| cfg.data_subdir("logs")) {
+    match victory_core::Config::load().and_then(|cfg| cfg.prepared_log_dir()) {
         Ok(dir) => {
             victory_core::logging::init_run("info", &dir);
         }
         Err(e) => {
             victory_core::logging::init("info");
-            tracing::warn!(error = format!("{e:#}"), "no run log file: no data directory");
+            tracing::warn!(error = format!("{e:#}"), "no run log file: no log directory");
         }
     }
 }
@@ -199,10 +199,12 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!("log_dir     : {}", cfg.log_dir.display());
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
-    for p in cfg.game_dir.iter().chain(&cfg.test_titles).chain([&cfg.cache_dir, &cfg.data_dir]) {
+    let derived = [&cfg.cache_dir, &cfg.data_dir, &cfg.log_dir];
+    for p in cfg.game_dir.iter().chain(&cfg.test_titles).chain(derived) {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
         }
