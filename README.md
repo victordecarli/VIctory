@@ -95,6 +95,10 @@ GPUs with 32-lane waves ([#47](https://github.com/victordecarli/VIctory/issues/4
   wave, so both waves go the same way; `v_readfirstlane` reads the
   console wave's first lane in EXEC (`e9fac6b`, `08af544`, `9a7e803`,
   `f10c1f0`, [#78](https://github.com/victordecarli/VIctory/pull/78)).
+  In a thread group of several console waves, such a branch without an
+  `else` or a loop is taken by the whole group, as is a scalar branch the
+  waves may take apart, so every wave meets the others at the same group
+  barriers, and each console wave's own decision guards its work inside.
   The [Shader translation](#shader-translation) block is measured for a
   32-lane GPU.
 

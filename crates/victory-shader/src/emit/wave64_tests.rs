@@ -386,12 +386,31 @@ fn a_scalar_read_only_where_it_is_written_splits() {
     assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
 }
 
-/// This first step splits one console wave per thread group, without LDS of the program's
-/// own: other shapes keep 64-lane waves.
+/// A thread group of whole console waves splits, one wave or several; a group with part of
+/// a wave keeps 64-lane waves.
 #[test]
-fn other_group_shapes_keep_64_lane_waves() {
+fn groups_of_whole_console_waves_split() {
     let body = [&MBCNT[..], &STORE_V1[..]].concat();
-    assert_eq!(translate(&native(&body, true, 128, false), 32).unwrap().wave_size, Some(64));
+    assert_eq!(translate(&native(&body, true, 128, false), 32).unwrap().wave_size, Some(32));
+    assert_eq!(translate(&native(&body, true, 96, false), 32).unwrap().wave_size, Some(64));
+}
+
+/// Two console waves of 64 in one group running `body`, then storing v1 to their thread's
+/// dword.
+fn two_waves(body: &[u32]) -> NativeProgram {
+    native(&[body, &STORE_V1[..]].concat(), true, 128, false)
+}
+
+/// In a group of several console waves, what the group cannot take as one keeps 64-lane
+/// waves: a lane loop the waves may leave apart, and a scalar written in a lane branch the
+/// group takes and read past it (a wave that would have skipped the branch ran its scalar
+/// instructions too).
+#[test]
+fn what_the_waves_of_a_group_take_apart_keeps_64_lane_waves() {
+    assert_eq!(translate(&two_waves(&LANE_LOOP), 32).unwrap().wave_size, Some(64));
+    // s14 = 0; s14 = 5 for the lanes from 40 on (in both waves); v1 = s14 after the branch.
+    let scalar_after = [&MBCNT[..], &[S14_0, VCC_FROM_40], &IF_VCC[..], &[S14_5, END_IF, V1_S14]];
+    assert_eq!(translate(&two_waves(&scalar_after.concat()), 32).unwrap().wave_size, Some(64));
 }
 
 /// LDS shared within one console wave: the console runs its accesses in program order, the
@@ -712,6 +731,11 @@ mod card {
 
     /// [`run`] for a whole program of one console wave.
     fn run_program(cs: &NativeProgram) -> Option<Vec<u32>> {
+        run_group(cs, 64)
+    }
+
+    /// [`run_program`] for one group of `threads` threads: the UAV's first `threads` dwords.
+    fn run_group(cs: &NativeProgram, threads: u32) -> Option<Vec<u32>> {
         let shader = translate(cs, 32).unwrap();
         assert_eq!(shader.wave_size, Some(32), "not split");
         if let Ok(mut v) =
@@ -736,7 +760,7 @@ mod card {
                 &pipe.pso,
                 &Dispatch {
                     roots: ud.into_iter().collect(),
-                    views: &[View::RawUav(64)],
+                    views: &[View::RawUav(threads)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
@@ -929,6 +953,86 @@ mod card {
     fn a_scalar_written_in_a_lane_branch_reaches_its_lanes() {
         let Some(out) = run(&[&MBCNT[..], &IF_FROM_40_V1_7[..]].concat()) else { return };
         let want: Vec<u32> = (0..64).map(|t| if t < 40 { t } else { 7 }).collect();
+        assert_eq!(out, want);
+    }
+
+    // A group of two console waves (128 threads, four host waves) whose branch around a
+    // lane read only one console wave would take. A group barrier inside it that the other
+    // wave never reaches does not hang on every GPU: one whose barriers count arrivals lets
+    // the waves pass at different barriers, so the check is the data, bit for bit.
+
+    /// v_cmp_le_u32 vcc, 104, v0: lanes 40..63 of the second console wave only.
+    const VCC_FROM_104: [u32; 2] = [0x7D86_00FF, 104];
+
+    /// A lane branch only the second console wave would take, whose lanes read lane 10 of
+    /// its lower half. Then every lane adds lane 40's v0, of its own wave's upper half, so
+    /// the first wave meets its other half where the second may still be inside the branch.
+    /// The whole group takes the branch, and the first wave, inside it, changes nothing.
+    #[test]
+    fn a_lane_branch_one_console_wave_takes_reads_its_own_lower_half() {
+        let body = [READLANE_10[0], READLANE_10[1], V1_S14];
+        let after = [READLANE_40[0], READLANE_40[1], vop2(0x25, 1, 12, 1)]; // v1 += s12
+        let cs = two_waves(
+            &[
+                &[V1_V0],
+                &VCC_FROM_104[..],
+                &[IF_VCC[0], 0xBF88_0003],
+                &body[..],
+                &[END_IF],
+                &after[..],
+            ]
+            .concat(),
+        );
+        let Some(out) = run_group(&cs, 128) else { return };
+        let want: Vec<u32> =
+            (0..128).map(|t| if t < 104 { t } else { 74 } + t / 64 * 64 + 40).collect();
+        assert_eq!(out, want);
+    }
+
+    /// The same branch, whose lanes read lane 10 and then turn on every lane of their wave
+    /// (`s_mov_b64 exec, -1`) to set v1 to 7. The first console wave, which would have
+    /// skipped the branch, runs it with the group, and only its own decision keeps its lanes
+    /// out: EXEC turned on inside would not.
+    #[test]
+    fn a_wave_that_would_skip_a_group_wide_branch_keeps_its_lanes_out() {
+        let body = [READLANE_10[0], READLANE_10[1], 0xBEFE_04C1, 0x7E02_0287]; // exec = -1; v1 = 7
+        let after = [READLANE_40[0], READLANE_40[1], vop2(0x25, 1, 12, 1)]; // v1 += s12
+        let cs = two_waves(
+            &[
+                &[V1_V0],
+                &VCC_FROM_104[..],
+                &[IF_VCC[0], 0xBF88_0004],
+                &body[..],
+                &[END_IF],
+                &after[..],
+            ]
+            .concat(),
+        );
+        let Some(out) = run_group(&cs, 128) else { return };
+        let want: Vec<u32> = (0..128).map(|t| if t < 64 { t + 40 } else { 7 + 104 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// A scalar branch the console waves decide each for themselves (on the wave's first
+    /// thread): only the second reads lane 10, its own.
+    fn scalar_branch_one_wave_takes() -> NativeProgram {
+        two_waves(&[
+            V1_V0,
+            READFIRSTLANE_V0_S14,
+            0xBF0A_C00E, // s_cmp_lt_u32 s14, 64: the first console wave
+            0xBF85_0003, // s_cbranch_scc1 over the read
+            READLANE_10[0],
+            READLANE_10[1],
+            V1_S14,
+        ])
+    }
+
+    /// A scalar branch only the second console wave takes, around a read of its lane 10:
+    /// the whole group takes it, and the first wave, inside it, changes nothing.
+    #[test]
+    fn a_scalar_branch_one_console_wave_takes_reads_its_own_lane() {
+        let Some(out) = run_group(&scalar_branch_one_wave_takes(), 128) else { return };
+        let want: Vec<u32> = (0..128).map(|t| if t < 64 { t } else { 74 }).collect();
         assert_eq!(out, want);
     }
 }

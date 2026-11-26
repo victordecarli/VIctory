@@ -95,7 +95,11 @@ become per-lane branches, and vector instructions keep a guard only where
 a lane can reach them with its EXEC bit clear. For a console wave64
 compute program run as two host waves of 32, `structure_wide` keeps
 chosen branches as the console's one decision for the wave, which the
-two host waves exchange, with EXEC a guard inside them. `victory_shader::resource`
+two host waves exchange, with EXEC a guard inside them. In a thread group
+of several console waves the whole group takes such a branch (and a
+scalar branch the waves may take apart), so every
+host wave meets the others at the same group barriers, and each console
+wave's own decision guards its work inside. `victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
 comes from (table, heap, root descriptor or constant). A descriptor a
 waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced

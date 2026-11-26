@@ -1758,10 +1758,11 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        let g = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(self.group_flag(b, g))
     }
 
     // ---- results ----
@@ -6859,6 +6860,10 @@ impl<'a> Lower<'a> {
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
                     _ if self.x.st.wide.contains(&b) => {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
+                        (c, taken, not_taken)
+                    }
+                    _ if self.group_apart(b) => {
+                        let c = self.group_scalar(b, when).map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
