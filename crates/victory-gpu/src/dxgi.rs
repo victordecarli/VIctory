@@ -49,7 +49,8 @@ unsafe fn query(
     found: This,
     out: *mut This,
 ) -> HRESULT {
-    object::answer(kind, iid, object::is(iid, known).then_some(found), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(kind, iid, object::is(iid, known).then_some(found), out) }
 }
 
 /// The DXGI device also answers for the D3D12 device.
@@ -62,7 +63,8 @@ unsafe fn query(
 unsafe extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     // SAFETY: `iid` is null or readable, per this function's contract.
     if unsafe { crate::device::is_device(iid) } {
-        return object::answer(DXGI_DEVICE, iid, Some(crate::device::device()), out);
+        // SAFETY: the pointers passed on are under this function's own contract.
+        return unsafe { object::answer(DXGI_DEVICE, iid, Some(crate::device::device()), out) };
     }
     // SAFETY: the pointers are forwarded as this function's contract gives them.
     unsafe { query(DXGI_DEVICE, iid, &DEVICE_IIDS, this, out) }
@@ -84,7 +86,8 @@ unsafe extern "system" fn device_parent(_: This, iid: *const Iid, out: *mut This
 ///
 /// `out` is null or valid for a write of an object pointer.
 unsafe extern "system" fn device_adapter(_: This, out: *mut This) -> HRESULT {
-    object::answer(DXGI_DEVICE, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(DXGI_DEVICE, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out) }
 }
 
 /// `QueryInterface` of the adapter.
@@ -118,7 +121,8 @@ unsafe extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -
     if index != 0 {
         return NOT_FOUND;
     }
-    object::answer(ADAPTER, &OUTPUT_IIDS[0], Some(&OUTPUT_OBJECT), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(ADAPTER, &OUTPUT_IIDS[0], Some(&OUTPUT_OBJECT), out) }
 }
 
 #[repr(C)]
@@ -189,7 +193,8 @@ unsafe extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) 
     if index != 0 {
         return NOT_FOUND;
     }
-    object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out) }
 }
 
 /// `QueryInterface` of the output.

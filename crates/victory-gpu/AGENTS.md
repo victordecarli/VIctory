@@ -25,7 +25,9 @@ reference count (`object`); objects are static and never destroyed.
 Tables come from `missing_table`, longer than any interface we know, so a
 method a newer title adds logs and fails instead of jumping past the
 table. Fill a slot by writing the `extern "system"` method and putting it
-in that slot.
+in that slot; a method that takes a pointer is `unsafe extern "system"`
+with a `# Safety` section, and so are the `object` helpers it passes the
+pointer to (`answer`, `is`, `hand_out`, `release_boxed`).
 
 A method that is not written yet, or a case it skips, logs once with
 `warn_once!` (`crates/victory-gpu/src/warn.rs`), with enough context that a

@@ -45,7 +45,8 @@ pub(crate) unsafe extern "system" fn create(
     };
     tracing::debug!(?desc, "query heap");
     let heap = Box::new(Heap { object: Object::new(&FUNCTIONS), desc });
-    object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out) }
 }
 
 /// `QueryInterface`.
@@ -56,7 +57,8 @@ pub(crate) unsafe extern "system" fn create(
 /// to an interface id valid for reads, and `out` is null or valid for a
 /// write of an object pointer, for the duration of the call.
 unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    object::answer(QUERY_HEAP, iid, object::is(iid, &HEAP_IIDS).then_some(this), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(QUERY_HEAP, iid, object::is(iid, &HEAP_IIDS).then_some(this), out) }
 }
 /// `Release`.
 ///
@@ -65,7 +67,9 @@ unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> 
 /// `this` is a live query heap this module created, holding the reference
 /// the caller gives up; it must not be used after the last one is released.
 unsafe extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<Heap>(this)
+    // SAFETY: a live object this module made with `hand_out` from a box of
+    // this type (this function's contract).
+    unsafe { object::release_boxed::<Heap>(this) }
 }
 
 /// IUnknown 3, object 4, device child 1.

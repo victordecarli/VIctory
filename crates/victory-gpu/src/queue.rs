@@ -66,7 +66,8 @@ pub(crate) unsafe extern "system" fn create(
         kind: desc.kind,
         desc,
     });
-    object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out) }
 }
 
 /// The console's queue description: an engine or pipe and a queue on it
@@ -113,7 +114,8 @@ pub(crate) unsafe extern "system" fn create_x(
 /// an interface id valid for reads, and `out` is null or valid for a write
 /// of an object pointer, for the duration of the call.
 unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    object::answer(QUEUE, iid, object::is(iid, &QUEUE_IIDS).then_some(this), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(QUEUE, iid, object::is(iid, &QUEUE_IIDS).then_some(this), out) }
 }
 /// `Release`.
 ///
@@ -122,7 +124,9 @@ unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> 
 /// `this` is a live queue this module created, holding the reference the
 /// caller gives up; it must not be used after the last one is released.
 unsafe extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<Queue>(this)
+    // SAFETY: a live object this module made with `hand_out` from a box of
+    // this type (this function's contract).
+    unsafe { object::release_boxed::<Queue>(this) }
 }
 
 /// Runs the lists' host lists and waits for them (`crate::host` waits for
