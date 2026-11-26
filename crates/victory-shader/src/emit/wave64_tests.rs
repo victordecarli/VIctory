@@ -326,6 +326,23 @@ fn encodings_decode_as_named() {
             "s_cbranch_scc1 label_0010",
         ]
     );
+    assert_eq!(
+        sp3(&NESTED_SCALAR_LOOPS)[1..],
+        [
+            "v_readfirstlane_b32 s17, v0",
+            "s_lshr_b32 s17, s17, 6",
+            "s_add_i32 s17, s17, 1",
+            "s_mov_b32 s16, s17",
+            "v_readlane_b32 s14, v0, 10",
+            "v_add_nc_u32 v1, s14, v1",
+            "s_sub_i32 s16, s16, 1",
+            "s_cmp_lg_u32 s16, 0",
+            "s_cbranch_scc1 label_0014",
+            "s_sub_i32 s17, s17, 1",
+            "s_cmp_lg_u32 s17, 0",
+            "s_cbranch_scc1 label_0010",
+        ]
+    );
     assert_eq!(names(&[vop2(0x1D, 3, 0x81, 0)]), ["v_xor_b32"]);
     // (the branch skips the one dword after it)
     assert_eq!(
@@ -452,6 +469,35 @@ const BRANCH_IN_A_SCALAR_LOOP: [u32; 15] = [
     0xBF85_FFF5, // s_cbranch_scc1 back to the v_cmp
 ];
 
+/// v1 = v0; s17 = the wave's first thread / 64 + 1 (read from v0); then s17 rounds of a
+/// loop that copies s17 into s16 and runs s16 rounds of v1 += lane 10's v0 (read into
+/// s14): the first console wave goes round the inner loop once, the second 2 + 1 times.
+/// A loop the console waves of a group take apart inside another.
+const NESTED_SCALAR_LOOPS: [u32; 14] = [
+    V1_V0,
+    0x7E22_0500, // v_readfirstlane_b32 s17, v0
+    0x9011_8611, // s_lshr_b32 s17, s17, 6
+    0x8111_8111, // s_add_i32 s17, s17, 1
+    0xBE90_0311, // s_mov_b32 s16, s17
+    READLANE_10[0],
+    READLANE_10[1],
+    vop2(0x25, 1, 14, 1), // v_add_nc_u32 v1, s14, v1
+    0x8190_8110,          // s_sub_i32 s16, s16, 1
+    0xBF07_8010,          // s_cmp_lg_u32 s16, 0
+    0xBF85_FFFA,          // s_cbranch_scc1 back to the v_readlane
+    0x8191_8111,          // s_sub_i32 s17, s17, 1
+    0xBF07_8011,          // s_cmp_lg_u32 s17, 0
+    0xBF85_FFF6,          // s_cbranch_scc1 back to the s_mov_b32
+];
+
+/// A loop the whole group takes inside another is taken so too: each has its own vote.
+#[test]
+fn a_group_wide_loop_inside_another_splits() {
+    let cs = two_waves(&NESTED_SCALAR_LOOPS);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
+    assert_eq!(lowered(&cs, 32).group_votes, 2);
+}
+
 /// A branch inside a loop goes back to itself only round the loop: it is no loop of its
 /// own, but a branch the group takes in each round.
 #[test]
@@ -474,15 +520,40 @@ fn a_loop_the_waves_of_a_group_leave_apart_splits() {
 }
 
 /// In a group of several console waves, what the group cannot take as one keeps 64-lane
-/// waves: a lane loop of two exits, and a scalar written in a lane branch the group takes
-/// and read past it (a wave that would have skipped the branch ran its scalar
-/// instructions too).
+/// waves: a lane loop of two exits, and a scalar written in a loop the group takes and read
+/// past it (a wave that left the loop early ran the later rounds' scalar instructions too).
 #[test]
 fn what_the_waves_of_a_group_take_apart_keeps_64_lane_waves() {
     assert_eq!(translate(&two_waves(&LOOP_TWO_EXITS), 32).unwrap().wave_size, Some(64));
-    // s14 = 0; s14 = 5 for the lanes from 40 on (in both waves); v1 = s14 after the branch.
-    let scalar_after = [&MBCNT[..], &[S14_0, VCC_FROM_40], &IF_VCC[..], &[S14_5, END_IF, V1_S14]];
-    assert_eq!(translate(&two_waves(&scalar_after.concat()), 32).unwrap().wave_size, Some(64));
+    // v1 = s14, lane 10's v0 as the loop's last round read it.
+    let read_past = [&SCALAR_LOOP_BY_WAVE[..], &[V1_S14]].concat();
+    assert_eq!(translate(&two_waves(&read_past), 32).unwrap().wave_size, Some(64));
+}
+
+/// v1 = the console lane (which asks for 64-lane waves); s14 = 0; s14 = 5 where some lane
+/// from 104 on (the second console wave's) runs; v1 = s14 after the branch: a scalar a
+/// group-wide branch joins.
+const SCALAR_JOINED_PAST_104: [u32; 12] = [
+    MBCNT[0],
+    MBCNT[1],
+    MBCNT[2],
+    MBCNT[3],
+    S14_0,
+    VCC_FROM_104[0],
+    VCC_FROM_104[1],
+    IF_VCC[0],
+    IF_VCC[1],
+    S14_5,
+    END_IF,
+    V1_S14,
+];
+
+/// A scalar the join of a group-wide branch takes from inside it splits: each console wave
+/// takes its own way's value there, by its own decision.
+#[test]
+fn a_scalar_joined_past_a_group_wide_branch_splits() {
+    let cs = two_waves(&SCALAR_JOINED_PAST_104);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
 }
 
 /// v_cmp_le_u32 vcc, 104, v0: lanes 40..63 of the second console wave only.
@@ -1267,6 +1338,24 @@ mod card {
     fn a_branch_inside_a_scalar_loop_runs_in_each_waves_rounds() {
         let Some(out) = run_group(&two_waves(&BRANCH_IN_A_SCALAR_LOOP), 128) else { return };
         let want: Vec<u32> = (0..128).map(|t| if t < 104 { t } else { t + 2 * 74 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// The first console wave goes round the inner loop once, the second three times (2 + 1),
+    /// each adding its own lane 10.
+    #[test]
+    fn a_loop_inside_another_runs_each_waves_rounds() {
+        let Some(out) = run_group(&two_waves(&NESTED_SCALAR_LOOPS), 128) else { return };
+        let want: Vec<u32> = (0..128).map(|t| if t < 64 { t + 10 } else { t + 3 * 74 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// Only the second console wave enters the branch, and only it takes s14 = 5 there; the
+    /// first, which ran the branch's scalars with the group, keeps 0.
+    #[test]
+    fn a_scalar_joined_past_a_group_wide_branch_is_each_waves_own() {
+        let Some(out) = run_group(&two_waves(&SCALAR_JOINED_PAST_104), 128) else { return };
+        let want: Vec<u32> = (0..128).map(|t| if t < 64 { 0 } else { 5 }).collect();
         assert_eq!(out, want);
     }
 
