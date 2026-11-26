@@ -67,6 +67,30 @@ const LOOP_TWO_EXITS: [u32; 13] = [
     0xBF89_FFF6,            // s_cbranch_execnz back to the v_readlane
     END_IF,
 ];
+/// v1 = v0; for the lanes from 20 on, three rounds of a loop on a scalar counter (s15) in
+/// which the lanes from 40 on add lane 10's v0 (read into s14) to v1. The two ways through
+/// the inner branch restore EXEC differently, so the loop's latch joins EXEC with a phi,
+/// which the loop's header joins again over its back edge.
+const UNIFORM_LOOP_IN_A_BRANCH: [u32; 18] = [
+    V1_V0,
+    0x7D86_0094, // v_cmp_le_u32 vcc, 20, v0
+    0xBE92_246A, // s_and_saveexec_b64 s[18:19], vcc
+    0xBF88_000D, // s_cbranch_execz past the loop
+    0xBE8F_0380, // s_mov_b32 s15, 0
+    VCC_FROM_40, // the loop's header
+    0xBE90_246A, // s_and_saveexec_b64 s[16:17], vcc
+    0xBF88_0005, // s_cbranch_execz to the second restore
+    READLANE_10[0],
+    READLANE_10[1],
+    vop2(0x25, 1, 14, 1), // v_add_nc_u32 v1, s14, v1
+    0x88FE_107E,          // s_or_b64 exec, exec, s[16:17]
+    0xBF82_0001,          // s_branch to the latch
+    RESTORE,              // s_mov_b64 exec, s[16:17]
+    0x810F_810F,          // the latch: s_add_i32 s15, s15, 1
+    0xBF0A_830F,          // s_cmp_lt_u32 s15, 3
+    0xBF85_FFF4,          // s_cbranch_scc1 to the header
+    0xBEFE_0412,          // s_mov_b64 exec, s[18:19]
+];
 /// v_mov_b32 v1, 0; s_mov_b32 s12, 7; v_writelane_b32 v1, s12, 40
 const WRITELANE_40: [u32; 4] = [0x7E02_0280, 0xBE8C_0387, 0xD761_0001, 0x0001_500C];
 /// v_lshlrev_b32 v2, 2, v0; buffer_store_dword v1, v2, s[8:11], 0 offen: v1 to dword
@@ -421,6 +445,28 @@ fn branch_encodings_decode_as_named() {
         ]
     );
     assert_eq!(sp3(&[READFIRSTLANE_V0_S14]), ["v_readfirstlane_b32 s14, v0"]);
+    assert_eq!(
+        sp3(&UNIFORM_LOOP_IN_A_BRANCH),
+        [
+            "v_mov_b32 v1, v0",
+            "v_cmp_le_u32 vcc, 20, v0",
+            "s_and_saveexec_b64 s[18:19], vcc",
+            "s_cbranch_execz label_0044",
+            "s_mov_b32 s15, 0",
+            "v_cmp_le_u32 vcc, 40, v0",
+            "s_and_saveexec_b64 s[16:17], vcc",
+            "s_cbranch_execz label_0034",
+            "v_readlane_b32 s14, v0, 10",
+            "v_add_nc_u32 v1, s14, v1",
+            "s_or_b64 exec, exec, s[16:17]",
+            "s_branch label_0038",
+            "s_mov_b64 exec, s[16:17]",
+            "s_add_i32 s15, s15, 1",
+            "s_cmp_lt_u32 s15, 3",
+            "s_cbranch_scc1 label_0014",
+            "s_mov_b64 exec, s[18:19]",
+        ]
+    );
     let two = sp3(&LOOP_TWO_EXITS);
     assert_eq!(
         two[5..8],
@@ -540,6 +586,15 @@ fn sum_in_a_branch() -> NativeProgram {
 #[test]
 fn a_lane_loop_is_taken_wave_wide() {
     assert_eq!(translate(&wave(&LANE_LOOP), 32).unwrap().wave_size, Some(32));
+}
+
+/// A loop on a scalar inside branches taken wave-wide: EXEC entering it is a guard, so the
+/// join of EXEC at its header stays a join (not a constant) and its value over the back
+/// edge, the latch's join, must be known too.
+#[test]
+fn a_uniform_loop_inside_wave_wide_branches_splits() {
+    let cs = wave(&UNIFORM_LOOP_IN_A_BRANCH);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
 }
 
 /// A loop with two exits: each lies in the other's region, so neither is outermost. Both
@@ -782,6 +837,14 @@ mod card {
                 }
             })
             .collect();
+        assert_eq!(out, want);
+    }
+
+    /// The lanes from 40 on add lane 10's v0 in each of three rounds; the others keep v0.
+    #[test]
+    fn a_lane_read_in_a_uniform_loop_inside_a_branch_reaches_the_other_half() {
+        let Some(out) = run_program(&wave(&UNIFORM_LOOP_IN_A_BRANCH)) else { return };
+        let want: Vec<u32> = (0..64).map(|t| if t < 40 { t } else { t + 30 }).collect();
         assert_eq!(out, want);
     }
 

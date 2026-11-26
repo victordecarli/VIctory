@@ -437,6 +437,10 @@ struct Lanes<'a> {
     wide: HashSet<usize>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
+    /// The masks joins that stay joins ([`Atom::Phi`]) get over back edges,
+    /// to work out once every block was seen: lowering such a join reads
+    /// each of its masks.
+    back_args: Vec<Key>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -503,6 +507,7 @@ impl<'a> Lanes<'a> {
             active: HashSet::new(),
             wide: HashSet::new(),
             wave_any: vec![None; blocks.len()],
+            back_args: Vec::new(),
         })
     }
 
@@ -516,6 +521,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.wave_any.fill(None);
+        self.back_args.clear();
         self.active.clear();
     }
 
@@ -567,6 +573,9 @@ impl<'a> Lanes<'a> {
                 self.when[b] = Some(self.branch(last));
                 self.wave_any[b] = self.wave_kind(last);
             }
+        }
+        while let Some(k) = self.back_args.pop() {
+            self.mask(k);
         }
         execs
     }
@@ -782,6 +791,11 @@ impl<'a> Lanes<'a> {
                     let m = if value { Bool::TRUE } else { Bool::FALSE };
                     return Some((m, derived));
                 }
+            }
+        }
+        for (n, &a) in args.iter().enumerate() {
+            if self.index[self.incoming[block][n].0] >= self.index[block] {
+                self.back_args.push(a);
             }
         }
         let born = self.index[block];
