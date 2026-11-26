@@ -312,6 +312,8 @@ fn encodings_decode_as_named() {
     assert_eq!(names(&[READFIRSTLANE]), ["v_readfirstlane_b32"]);
     assert_eq!(names(&WRITELANE_40), ["v_mov_b32", "s_mov_b32", "v_writelane_b32"]);
     assert_eq!(names(&STORE_V1), ["v_lshlrev_b32", "buffer_store_dword"]);
+    assert_eq!(names(&LOAD_V1), ["buffer_load_dword"]);
+    assert_eq!(names(&[vop2(0x1D, 3, 0x81, 0)]), ["v_xor_b32"]);
     // (the branch skips the one dword after it)
     assert_eq!(
         names(&[&IF_VCC[..], &[BARRIER, END_IF]].concat()),
@@ -433,6 +435,69 @@ const RETURN_BELOW_104: [u32; 11] = [
     0xBEFE_04C1, // s_mov_b64 exec, -1
     V1_S14,
 ];
+
+/// buffer_load_dword v1, v2, s[8:11], 0 offen: v1 = dword v2 / 4 of the UAV.
+const LOAD_V1: [u32; 2] = [0xE030_1000, 0x8002_0102];
+
+/// Each thread stores its index to its dword; then the lanes from 104 on (the second
+/// console wave only) read lane 10 and load their dword back, adding the two in v1.
+fn load_in_a_group_wide_branch() -> NativeProgram {
+    let inside = [READLANE_10[0], READLANE_10[1], LOAD_V1[0], LOAD_V1[1], vop2(0x25, 1, 14, 1)];
+    two_waves(
+        &[
+            &[V1_V0],
+            &STORE_V1[..],
+            &VCC_FROM_104[..],
+            &[IF_VCC[0], 0xBF88_0005],
+            &inside[..],
+            &[END_IF],
+        ]
+        .concat(),
+    )
+}
+
+/// A memory access in a group-wide branch runs only in a console wave that would enter
+/// the branch: a wave that would have skipped it, whose scalars there may hold anything
+/// (an index past the descriptor heap), makes no handle and reads nothing.
+#[test]
+fn a_memory_access_in_a_group_wide_branch_waits_for_the_waves_decision() {
+    assert_eq!(lowered(&load_in_a_group_wide_branch(), 32).flagged_accesses, 1);
+    // Outside any group-wide branch, none.
+    assert_eq!(lowered(&two_waves(&[&[V1_V0], &STORE_V1[..]].concat()), 32).flagged_accesses, 0);
+}
+
+/// A memory access reading a lane mask as a number in a group-wide branch keeps 64-lane
+/// waves: the mask's ballot, which the halves exchange, would come where only the console
+/// waves entering run.
+#[test]
+fn a_memory_access_reading_a_lane_mask_in_a_group_wide_branch_keeps_64_lane_waves() {
+    // buffer_load_dword v1, v2, s[8:11], vcc_lo offen
+    let load_at_vcc = [LOAD_V1[0], 0x6A02_0102];
+    let inside = [READLANE_10[0], READLANE_10[1], load_at_vcc[0], load_at_vcc[1]];
+    let body = [&[V1_V0], &STORE_V1[..], &VCC_FROM_104[..], &[IF_VCC[0], 0xBF88_0004]];
+    let cs = two_waves(&[&body.concat()[..], &inside[..], &[END_IF]].concat());
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(64));
+}
+
+/// `if (t < 104) return;`, then the lanes left write LDS, meet at a group barrier of the
+/// program's own and read their neighbour's dword (thread t ^ 1). (`v_mbcnt` first, so the
+/// program asks for the console's lanes.)
+fn barrier_after_an_early_return() -> NativeProgram {
+    let xor1 = vop2(0x1D, 3, 0x81, 0); // v_xor_b32 v3, 1, v0
+    let body = [&LDS_WRITE_T[..], &[BARRIER, xor1], &LDS_READ_MIRROR[1..]].concat();
+    let mut words = MBCNT.to_vec();
+    words.extend(&RETURN_BELOW_104[..7]);
+    words.extend(body);
+    native(&[&words[..], &STORE_V1[..]].concat(), true, 128, true)
+}
+
+/// A group barrier of the program's own in a group-wide branch: every console wave runs
+/// the branch with the group, so every one reaches the barrier, as the console's waves
+/// still running do. The program splits.
+#[test]
+fn a_group_barrier_in_a_group_wide_branch_splits() {
+    assert_eq!(translate(&barrier_after_an_early_return(), 32).unwrap().wave_size, Some(32));
+}
 
 /// A branch one way of which only ends the program (`if (...) return;`) is an `if` without
 /// an `else` to the group: a console wave that would have ended there runs the rest with the
@@ -1087,6 +1152,24 @@ mod card {
     fn a_wave_that_returns_early_stores_nothing() {
         let Some(out) = run_group(&two_waves(&RETURN_BELOW_104), 128) else { return };
         let want: Vec<u32> = (0..128).map(|t| if t < 64 { 0 } else { 74 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// The load in the second console wave's branch reads what its thread stored; the
+    /// first wave, which skips the load, keeps its v1.
+    #[test]
+    fn a_load_in_a_group_wide_branch_reads_for_the_waves_that_enter() {
+        let Some(out) = run_group(&load_in_a_group_wide_branch(), 128) else { return };
+        let want: Vec<u32> = (0..128).map(|t| if t < 104 { t } else { t + 74 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// The first console wave returns early; the lanes left read their neighbour's LDS
+    /// dword past a group barrier.
+    #[test]
+    fn a_group_barrier_after_an_early_return_orders_the_waves_left() {
+        let Some(out) = run_group(&barrier_after_an_early_return(), 128) else { return };
+        let want: Vec<u32> = (0..128).map(|t| if t < 104 { 0 } else { t ^ 1 }).collect();
         assert_eq!(out, want);
     }
 }
