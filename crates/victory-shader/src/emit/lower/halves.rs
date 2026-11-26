@@ -11,8 +11,9 @@
 //! scalar register has a copy per host wave where the console has one per
 //! wave, so a block that only one half enters would leave the other waiting
 //! or with a stale scalar. A program is split only when ([`keeps_64`]):
-//! - its thread group is one console wave (64 threads), or at most 32
-//!   threads (a single host wave, which exchanges nothing);
+//! - its thread group is whole console waves (64 to 1024 threads), or at
+//!   most 32 threads (a single host wave, which exchanges nothing); each
+//!   console wave exchanges through a pair of LDS dwords of its own;
 //! - in a group of two host waves, the program's own LDS is accessed only
 //!   in blocks every lane runs: the console compiler leaves out the
 //!   barriers one wave sharing LDS needs, so a group barrier before each
@@ -45,6 +46,11 @@
 //! exits of one such loop, which lie in each other's regions and are taken
 //! together.
 //!
+//! In a group of several console waves, such a branch is taken by the
+//! whole group instead, each console wave's own decision guarding what it
+//! does inside, and what a group cannot take so keeps 64-lane waves
+//! ([`groups`]).
+//!
 //! Every other console wave64 program keeps 64-lane waves.
 //!
 //! Ported from the fxceless line (`base/fxceless`, `emit/lower.rs`:
@@ -55,16 +61,26 @@
 use super::super::wave::{Op as WaveOp, Shape};
 use super::*;
 
+mod groups;
+
 /// LDS dwords a split program adds past its own: the counter numbering
-/// the group's two host waves, then the exchange pair. None for a group of
-/// a single host wave. Values made once, in the entry block.
+/// the group's host waves, then an exchange pair per console wave. None for
+/// a group of a single host wave. Values made once, in the entry block.
 pub(super) struct Halves {
     two: Option<(u32, u32)>,
+    /// Console waves in the group.
+    waves: u32,
     /// Two host waves sharing the program's own LDS: a group barrier
     /// before each access.
     lds: bool,
     base: Option<V>,
     lane: Option<V>,
+    /// Per IR block in a region the whole group takes ([`groups`]): whether
+    /// this console wave would have entered it (and every region around).
+    flags: HashMap<usize, V>,
+    /// The scalar branches the whole group takes ([`groups::apart_branches`]),
+    /// found at the first branch asked about.
+    apart: Option<Vec<usize>>,
 }
 
 impl Halves {
@@ -72,12 +88,13 @@ impl Halves {
     /// past `lds_dwords`.
     pub(super) fn new(lds_dwords: &mut u32, group: u32) -> Self {
         let lds = group > 32 && *lds_dwords > 0;
+        let waves = group.div_ceil(64);
         let two = (group > 32).then(|| {
             let counter = *lds_dwords;
-            *lds_dwords += DWORDS;
+            *lds_dwords += dwords(group);
             (counter, counter + 1)
         });
-        Halves { two, lds, base: None, lane: None }
+        Halves { two, waves, lds, base: None, lane: None, flags: HashMap::new(), apart: None }
     }
 
     /// Whether each access to the program's own LDS needs a group barrier
@@ -88,12 +105,15 @@ impl Halves {
 
     /// The LDS dwords these halves add past the program's own.
     pub(super) fn dwords(&self) -> u32 {
-        if self.two.is_some() { DWORDS } else { 0 }
+        if self.two.is_some() { dwords(self.waves * 64) } else { 0 }
     }
 }
 
-/// The counter and the exchange pair.
-const DWORDS: u32 = 3;
+/// The LDS dwords the halves of a group of `group` (more than 32) threads
+/// add: the counter and an exchange pair per console wave.
+fn dwords(group: u32) -> u32 {
+    1 + 2 * group.div_ceil(64)
+}
 
 /// `first`, the lowering of `x`, or where it keeps a console wave64 compute
 /// program at 64-lane waves on a host of 32-lane waves, the lowering with
@@ -171,8 +191,9 @@ impl Keep {
 fn keeps_64_at(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Option<Keep> {
     let two = match group {
         0..=32 => false,
-        64 => true,
-        _ => return Keep::fixed("a thread group of other than one console wave"),
+        // one console wave, or several ([`groups`])
+        g if g % 64 == 0 && g <= 1024 => true,
+        _ => return Keep::fixed("a thread group of other than whole console waves"),
     };
     let Some(all) = all_lane_blocks(st) else {
         return Keep::fixed("an indirect exit");
@@ -243,7 +264,9 @@ fn keeps_64_at(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Opt
             }
         }
     }
-    lane_scalar_read_past(p, &lane_scalars, every)
+    lane_scalar_read_past(p, &lane_scalars, every).or_else(|| {
+        if group > 64 { groups::several_keep_64(p, st, group, lds_dwords) } else { None }
+    })
 }
 
 /// A scalar of `lane_scalars` (written where not every lane runs, in the
@@ -488,29 +511,44 @@ impl Lower<'_> {
     }
 
     /// Each half gives `mine` (the same in all its lanes); both get (the
-    /// lower half's, the upper half's). A group of a single host wave has no
-    /// upper half: 0 for it. At `at`, which every thread of the group runs.
+    /// lower half's, the upper half's) of their console wave. A group of a
+    /// single host wave has no upper half: 0 for it. At `at`, which every
+    /// thread of the group runs.
     pub(super) fn exchange(&mut self, at: usize, mine: V) -> (V, V) {
         let Some((_, pair)) = self.halves.as_ref().and_then(|h| h.two) else {
             return (mine, self.s.m.i32(0));
         };
-        let lane = self.console_lane();
-        let five = self.s.m.i32(5);
-        let half = self.s.m.bin(at, Bin::LShr, lane, five);
+        self.post(at, pair, mine);
+        // The console wave's pair: slots 2w and 2w + 1 past the first.
+        let thread = self.console_thread();
+        let (six, one) = (self.s.m.i32(6), self.s.m.i32(1));
+        let wave = self.s.m.bin(at, Bin::LShr, thread, six);
+        let even = self.s.m.bin(at, Bin::Shl, wave, one);
         let first = self.s.m.i32(pair);
-        let index = self.s.m.bin(at, Bin::Add, first, half);
+        let lower = self.s.m.bin(at, Bin::Add, first, even);
+        let upper = self.s.m.bin(at, Bin::Add, lower, one);
         let lds = self.s.lds();
-        let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
-        self.group_sync(at);
-        let second = self.s.m.i32(pair + 1);
-        let p0 = self.s.m.element(at, lds, first);
-        let p1 = self.s.m.element(at, lds, second);
+        let p0 = self.s.m.element(at, lds, lower);
+        let p1 = self.s.m.element(at, lds, upper);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // The pair is written again only after every thread has read it.
         self.group_sync(at);
         (lo, hi)
+    }
+
+    /// This host wave's `mine` into its exchange slot (`first` plus the host
+    /// wave's index in the group), and the group meets.
+    pub(super) fn post(&mut self, at: usize, first: u32, mine: V) {
+        let thread = self.console_thread();
+        let five = self.s.m.i32(5);
+        let wave = self.s.m.bin(at, Bin::LShr, thread, five);
+        let first = self.s.m.i32(first);
+        let index = self.s.m.bin(at, Bin::Add, first, wave);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(at, lds, index);
+        self.s.m.store(at, ptr, mine);
+        self.group_sync(at);
     }
 
     /// `v_readlane` of console lane `lane` (uniform): the half holding it
@@ -680,6 +718,9 @@ impl Lower<'_> {
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[against]);
         self.s.flags |= flags::WAVE_OPS;
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
+        if self.halves.as_ref().is_some_and(|h| h.waves > 1) {
+            return self.group_wide(b, any, some);
+        }
         let (lo, hi) = self.exchange(c, some);
         let either = self.s.m.bin(c, Bin::Or, lo, hi);
         let zero = self.s.m.i32(0);
