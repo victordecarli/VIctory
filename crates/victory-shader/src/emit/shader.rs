@@ -75,6 +75,9 @@ pub(crate) struct Shader {
     /// Group barriers emitted.
     #[cfg(test)]
     pub barriers: u32,
+    /// Reads of another lane (`waveReadLaneAt`) emitted.
+    #[cfg(test)]
+    pub lane_reads: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -121,6 +124,8 @@ impl Shader {
             nonuniform_handles: 0,
             #[cfg(test)]
             barriers: 0,
+            #[cfg(test)]
+            lane_reads: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -153,8 +158,10 @@ impl Shader {
         args: &[V],
     ) -> V {
         #[cfg(test)]
-        if name == "barrier" {
-            self.barriers += 1;
+        match name {
+            "barrier" => self.barriers += 1,
+            "waveReadLaneAt.i32" => self.lane_reads += 1,
+            _ => {}
         }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));

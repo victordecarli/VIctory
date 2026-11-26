@@ -160,6 +160,9 @@ const SAVE_ALL: u32 = 0xBE90_25C1; // s_or_saveexec_b64 s[16:17], -1
 const RESTORE: u32 = 0xBEFE_0410; // s_mov_b64 exec, s[16:17]
 /// v_mov_b32 v1, s7
 const V1_S7: u32 = 0x7E02_0207;
+/// v_mul_u32_u24 v7, 0xabcdef, v0; v_cvt_f32_u32 v7, v7: thread t's float of t * 0xabcdef,
+/// large enough that sums round.
+const V7_FLOAT: [u32; 3] = [vop2(0x0B, 7, 0xFF, 0), 0x00AB_CDEF, vop1(0x06, 7, 0x107)];
 
 /// `WaveActive<op>(v7)` into s7 as the console compiler expands it (the fxceless line's
 /// `WAVE_OR_V7_TO_S7` with `op` and its identity): every lane takes part, those outside the
@@ -194,6 +197,11 @@ const fn reduce(op: u32, ident: u32) -> [u32; 20] {
 /// 4 and 8, then rows 1 and 3 add the total of the row below, then lanes 32..63 the total
 /// of lanes 0..31, EXEC chosen for each step. `exclusive`: less each lane's own term.
 fn prefix_sum(exclusive: bool) -> Vec<u32> {
+    prefix_of(V_ADD_U, exclusive)
+}
+
+/// [`prefix_sum`] with the addition `op`.
+fn prefix_of(op: u32, exclusive: bool) -> Vec<u32> {
     let mut w = vec![
         SAVE_ALL,
         0xD501_0003,
@@ -201,7 +209,7 @@ fn prefix_sum(exclusive: bool) -> Vec<u32> {
         vop1(0x01, 1, 0x103), // v_mov_b32 v1, v3
     ];
     for n in [1, 2, 4, 8] {
-        w.extend(dpp(V_ADD_U, 1, 1, 0x110 + n));
+        w.extend(dpp(op, 1, 1, 0x110 + n));
     }
     w.extend(readlane_v1(14, 15));
     w.extend(readlane_v1(15, 47));
@@ -209,16 +217,16 @@ fn prefix_sum(exclusive: bool) -> Vec<u32> {
         0xBEFE_03FF,
         0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
         0xBEFF_0380, // s_mov_b32 exec_hi, 0
-        vop2(V_ADD_U, 1, 14, 1),
+        vop2(op, 1, 14, 1),
         0xBEFE_0380, // s_mov_b32 exec_lo, 0
         0xBEFF_03FF,
         0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
-        vop2(V_ADD_U, 1, 15, 1),
+        vop2(op, 1, 15, 1),
     ]);
     w.extend(readlane_v1(14, 31));
     w.extend([
         0xBEFF_03C1, // s_mov_b32 exec_hi, -1
-        vop2(V_ADD_U, 1, 14, 1),
+        vop2(op, 1, 14, 1),
     ]);
     if exclusive {
         w.extend([0xBEFE_04C1, vop2(0x26, 1, 0x101, 3)]); // s_mov_b64 exec, -1; v1 -= v3
@@ -499,6 +507,7 @@ fn section_encodings_decode_as_named() {
         assert!(sp3(&reduce(op, ZERO))[2].starts_with(name), "{name}");
     }
     assert!(sp3(&reduce(V_ADD_F, ZERO))[2].starts_with("v_add_f32"));
+    assert_eq!(sp3(&V7_FLOAT), ["v_mul_u32_u24 v7, lit(0x00abcdef), v0", "v_cvt_f32_u32 v7, v7"]);
     assert_eq!(
         sp3(&[&V7_BIT[..], &[V7_NOT], &V7_ROTATED[..], &[V1_S7]].concat()),
         [
@@ -605,14 +614,38 @@ fn the_exits_of_one_loop_are_taken_wave_wide_together() {
     assert_eq!(translate(&wave(&LOOP_TWO_EXITS), 32).unwrap().wave_size, Some(32));
 }
 
-/// The console adds floats in its own tree, which the halves' wave sums do not follow: a
-/// float sum over two host waves keeps 64-lane waves. A group of at most 32 threads is
-/// one host wave, which sums as an unsplit program does.
+/// Floats round at every addition, so a float sum is exact only in the console's order.
+/// The compiler's reduction adds aligned blocks of lanes of equal size (a balanced tree),
+/// which the halves can follow: it splits. A float total taken from a prefix scan adds in
+/// another order and keeps 64-lane waves on two host waves; a group of at most 32 threads
+/// is one host wave, which sums as an unsplit program does.
 #[test]
-fn a_float_wave_sum_splits_only_in_one_host_wave() {
-    let body = [&V7_ROTATED[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
-    assert_eq!(translate(&native(&body, true, 64, false), 32).unwrap().wave_size, Some(64));
-    assert_eq!(translate(&native(&body, true, 32, false), 32).unwrap().wave_size, Some(32));
+fn a_float_wave_sum_splits_where_its_order_is_the_consoles_tree() {
+    let tree = [&V7_FLOAT[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
+    assert_eq!(translate(&native(&tree, true, 64, false), 32).unwrap().wave_size, Some(32));
+    let scan = scan_total();
+    assert_eq!(translate(&native(&scan, true, 64, false), 32).unwrap().wave_size, Some(64));
+    assert_eq!(translate(&native(&scan, true, 32, false), 32).unwrap().wave_size, Some(32));
+}
+
+/// Each half adds its lanes in the tree itself, reading the partner lanes, rather than
+/// trusting the host's wave sum to that order. (The card test below cannot tell the two
+/// apart: the RTX 5070's 32-lane wave sum happened to add in the same tree.)
+#[test]
+fn a_float_tree_sum_in_halves_adds_its_lanes_itself() {
+    let tree = [&V7_FLOAT[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
+    let reads = |lanes| lowered(&native(&tree, true, 64, false), lanes).lane_reads;
+    assert_eq!(reads(32), 5, "one read per level of the tree in a half");
+    assert_eq!(reads(64), 0);
+}
+
+/// The float total of v7 read from lane 63 of an inclusive prefix scan, stored by every
+/// thread.
+fn scan_total() -> Vec<u32> {
+    let mut scan = prefix_of(V_ADD_F, false);
+    scan.pop(); // the restore, after the read
+    scan.extend(readlane_v1(7, 63));
+    [&V7_FLOAT[..], &scan, &[RESTORE, V1_S7], &STORE_V1[..]].concat()
 }
 
 /// [`translate`]'s lowering, for what only the lowering counts.
@@ -776,6 +809,23 @@ mod card {
             let Some(out) = run_program(&cs) else { return };
             assert_eq!(out, vec![want; 64], "{name}");
         }
+    }
+
+    /// A float wave sum over the two halves is the console's to the bit: the balanced tree
+    /// over the lanes in their order, which a sum in lane order does not give here.
+    #[test]
+    fn a_float_wave_sum_is_the_consoles_tree_bit_for_bit() {
+        #[allow(clippy::cast_precision_loss, reason = "the console's conversion rounds too")]
+        let terms: Vec<f32> = (0..64u32).map(|t| (t * 0xAB_CDEF) as f32).collect();
+        let mut tree = terms.clone();
+        while tree.len() > 1 {
+            tree = tree.chunks(2).map(|c| c[0] + c[1]).collect();
+        }
+        let in_a_row: f32 = terms.iter().sum();
+        assert_ne!(tree[0].to_bits(), in_a_row.to_bits(), "these terms tell the orders apart");
+        let body = [&V7_FLOAT[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
+        let Some(out) = run_program(&native(&body, true, 64, false)) else { return };
+        assert_eq!(out, vec![tree[0].to_bits(); 64], "tree {:#x}", tree[0].to_bits());
     }
 
     /// A prefix sum in the upper half goes on from the lower half's total.

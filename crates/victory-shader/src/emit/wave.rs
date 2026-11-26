@@ -79,12 +79,16 @@ pub(crate) enum Sym {
     /// A uniform value from before the section.
     Uni(Value),
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
+    /// `tree`: `lanes` is an aligned block whose terms were added as a
+    /// balanced tree, halves of equal size at each step: the order a float
+    /// sum must keep to give the console's result.
     Red {
         op: Option<Op>,
         src: Value,
         mask: Value,
         ident: u32,
         lanes: u64,
+        tree: bool,
     },
 }
 
@@ -97,6 +101,9 @@ pub(crate) enum Shape {
     Masked(Value, Value, u32),
     /// `op` over every lane.
     Active(Op, Value, Value, u32),
+    /// A float sum over every lane, added as the balanced tree over the
+    /// lanes in their order (lanes 2k and 2k+1, then pairs of those ...).
+    Tree(Value, Value, u32),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
 }
@@ -186,20 +193,37 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
 
 fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     match (a, b) {
+        // (+0 turns a -0 sum into +0: not the tree's value any more)
+        (Sym::K(k), Sym::Red { op: o, src, mask, ident, lanes, tree })
+        | (Sym::Red { op: o, src, mask, ident, lanes, tree }, Sym::K(k))
+            if op.identity(k) =>
+        {
+            let tree = tree && !(op == Op::AddF && k == 0);
+            Sym::Red { op: o, src, mask, ident, lanes, tree }
+        }
         (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) => x,
         (
-            Sym::Red { op: oa, src, mask, ident, lanes: la },
-            Sym::Red { op: ob, src: sb, mask: mb, ident: ib, lanes: lb },
+            Sym::Red { op: oa, src, mask, ident, lanes: la, tree: ta },
+            Sym::Red { op: ob, src: sb, mask: mb, ident: ib, lanes: lb, tree: tb },
         ) if (src, mask, ident) == (sb, mb, ib)
             && op.identity(ident)
             && oa.is_none_or(|o| o == op)
             && ob.is_none_or(|o| o == op)
             && (!op.counts() || la & lb == 0) =>
         {
-            Sym::Red { op: Some(op), src, mask, ident, lanes: la | lb }
+            let lanes = la | lb;
+            let tree = ta && tb && la.count_ones() == lb.count_ones() && aligned(lanes);
+            Sym::Red { op: Some(op), src, mask, ident, lanes, tree }
         }
         _ => Sym::Unknown,
     }
+}
+
+/// `lanes` is a block of 2^n lanes starting at a multiple of 2^n.
+fn aligned(lanes: u64) -> bool {
+    let n = lanes.count_ones();
+    let first = lanes.trailing_zeros();
+    n.is_power_of_two() && first.is_multiple_of(n) && lanes >> first == u64::MAX >> (64 - n)
 }
 
 fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
@@ -344,7 +368,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
                         (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
-                            Sym::Red { op: None, src: x, mask: m, ident, lanes: 1 << l }
+                            Sym::Red { op: None, src: x, mask: m, ident, lanes: 1 << l, tree: true }
                         }
                         _ => Sym::Unknown,
                     })
@@ -378,20 +402,29 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied()) {
                         (
-                            Sym::Red { op: None | Some(Op::AddU), src, mask, ident: 0, lanes },
+                            Sym::Red {
+                                op: None | Some(Op::AddU),
+                                src,
+                                mask,
+                                ident: 0,
+                                lanes,
+                                tree: _,
+                            },
                             Some(Sym::Red {
                                 op: None | Some(Op::AddU),
                                 src: s2,
                                 mask: m2,
                                 ident: 0,
                                 lanes: l2,
+                                tree: _,
                             }),
                         ) if (src, mask) == (s2, m2) && lanes & l2 == l2 => {
                             let rest = lanes & !l2;
                             if rest == 0 {
                                 Sym::K(0)
                             } else {
-                                Sym::Red { op: Some(Op::AddU), src, mask, ident: 0, lanes: rest }
+                                let op = Some(Op::AddU);
+                                Sym::Red { op, src, mask, ident: 0, lanes: rest, tree: false }
                             }
                         }
                         _ => Sym::Unknown,
@@ -439,8 +472,8 @@ fn shapes(
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
-        Sym::Red { op: Some(op), src, mask, ident, lanes } if lanes == all => {
-            Some(Shape::Active(op, src, mask, ident))
+        Sym::Red { op: Some(op), src, mask, ident, lanes, tree } if lanes == all => {
+            Some(active(op, src, mask, ident, tree))
         }
         _ => None,
     };
@@ -457,10 +490,28 @@ fn shapes(
     out
 }
 
+/// `op` over every lane: a float sum added as the balanced tree is a [`Shape::Tree`].
+fn active(op: Op, src: Value, mask: Value, ident: u32, tree: bool) -> Shape {
+    match op {
+        Op::AddF if tree => Shape::Tree(src, mask, ident),
+        Op::AddU
+        | Op::AddF
+        | Op::MinU
+        | Op::MaxU
+        | Op::MinI
+        | Op::MaxI
+        | Op::MinF
+        | Op::MaxF
+        | Op::Or
+        | Op::And
+        | Op::Xor => Shape::Active(op, src, mask, ident),
+    }
+}
+
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     let first = lanes[0];
     let own = |l: usize, s: Sym| match s {
-        Sym::Red { op: None, src, mask, ident, lanes } if lanes == 1 << l => {
+        Sym::Red { op: None, src, mask, ident, lanes, tree: _ } if lanes == 1 << l => {
             Some((src, mask, ident))
         }
         _ => None,
@@ -474,8 +525,8 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         return match first {
             Sym::K(k) => Some(Shape::K(k)),
             Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
-            Sym::Red { op: Some(op), src, mask, ident, lanes } if lanes == all => {
-                Some(Shape::Active(op, src, mask, ident))
+            Sym::Red { op: Some(op), src, mask, ident, lanes, tree } if lanes == all => {
+                Some(active(op, src, mask, ident, tree))
             }
             _ => None,
         };
@@ -485,7 +536,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     for (l, &s) in lanes.iter().enumerate() {
         let below = (1u64 << l) - 1;
         let (op, src, mask, ident, set) = match s {
-            Sym::Red { op, src, mask, ident, lanes } => (op, src, mask, ident, lanes),
+            Sym::Red { op, src, mask, ident, lanes, tree: _ } => (op, src, mask, ident, lanes),
             // Lane 0 of an exclusive prefix holds the identity.
             Sym::K(_) if l == 0 => continue,
             _ => return None,
@@ -539,9 +590,22 @@ mod tests {
     }
 
     #[test]
+    fn aligned_blocks_are_powers_of_two_at_their_multiples() {
+        assert!(aligned(0b1) && aligned(0b1100) && aligned(0xFF00) && aligned(u64::MAX));
+        assert!(aligned(u64::MAX << 32) && !aligned(0b110) && !aligned(0b111) && !aligned(0));
+    }
+
+    #[test]
     fn prefixes_are_recognised() {
         let (x, m) = (Value(1), Value(2));
-        let red = |lanes: u64| Sym::Red { op: Some(Op::AddU), src: x, mask: m, ident: 0, lanes };
+        let red = |lanes: u64| Sym::Red {
+            op: Some(Op::AddU),
+            src: x,
+            mask: m,
+            ident: 0,
+            lanes,
+            tree: false,
+        };
         let inclusive: Vec<Sym> = (0..64).map(|l| red(u64::MAX >> (63 - l))).collect();
         assert_eq!(per_lane(&inclusive, u64::MAX), Some(Shape::Prefix(Op::AddU, x, m, 0, true)));
         let mut exclusive: Vec<Sym> = (0..64).map(|l| red((1u64 << l) - 1)).collect();
