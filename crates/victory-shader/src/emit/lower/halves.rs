@@ -81,6 +81,11 @@ pub(super) struct Halves {
     /// The scalar branches the whole group takes ([`groups::apart_branches`]),
     /// found at the first branch asked about.
     apart: Option<Vec<usize>>,
+    /// The loops the whole group takes, by the block closing their branch
+    /// ([`groups::group_loop`]), found at the first block asked about.
+    loops: Option<HashMap<usize, groups::GroupLoop>>,
+    /// Per header of such a loop: this console wave's flag in it.
+    acts: HashMap<usize, groups::Act>,
 }
 
 impl Halves {
@@ -94,7 +99,17 @@ impl Halves {
             *lds_dwords += dwords(group);
             (counter, counter + 1)
         });
-        Halves { two, waves, lds, base: None, lane: None, flags: HashMap::new(), apart: None }
+        Halves {
+            two,
+            waves,
+            lds,
+            base: None,
+            lane: None,
+            flags: HashMap::new(),
+            apart: None,
+            loops: None,
+            acts: HashMap::new(),
+        }
     }
 
     /// Whether each access to the program's own LDS needs a group barrier
