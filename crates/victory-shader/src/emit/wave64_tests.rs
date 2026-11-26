@@ -413,6 +413,41 @@ fn what_the_waves_of_a_group_take_apart_keeps_64_lane_waves() {
     assert_eq!(translate(&two_waves(&scalar_after.concat()), 32).unwrap().wave_size, Some(64));
 }
 
+/// v_cmp_le_u32 vcc, 104, v0: lanes 40..63 of the second console wave only.
+const VCC_FROM_104: [u32; 2] = [0x7D86_00FF, 104];
+
+/// `if (t < 104) return;` as the console compiler ends a program early: a wave with no lane
+/// left in EXEC jumps to an `s_endpgm` of its own. The lanes left read lane 10, turn on every
+/// lane of their wave (`s_mov_b64 exec, -1`) and set v1 to it. Only the second console wave
+/// goes on.
+const RETURN_BELOW_104: [u32; 11] = [
+    V1_V0,
+    VCC_FROM_104[0],
+    VCC_FROM_104[1],
+    IF_VCC[0],   // s_and_saveexec_b64 s[12:13], vcc
+    0xBF88_0001, // s_cbranch_execz to the s_endpgm
+    0xBF82_0001, // s_branch over it
+    S_ENDPGM,
+    READLANE_10[0],
+    READLANE_10[1],
+    0xBEFE_04C1, // s_mov_b64 exec, -1
+    V1_S14,
+];
+
+/// A branch one way of which only ends the program (`if (...) return;`) is an `if` without
+/// an `else` to the group: a console wave that would have ended there runs the rest with the
+/// group, its own decision guarding what it does, and ends with it. A way to the end that
+/// does work first keeps 64-lane waves.
+#[test]
+fn a_branch_to_the_end_of_the_program_is_an_if_without_an_else() {
+    let cs = two_waves(&RETURN_BELOW_104);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
+    // The way to the end stores v1 first (the s_branch skips the store and the s_endpgm).
+    let mut work = RETURN_BELOW_104.to_vec();
+    work.splice(5..7, [0xBF82_0004].into_iter().chain(STORE_V1).chain([S_ENDPGM]));
+    assert_eq!(translate(&two_waves(&work), 32).unwrap().wave_size, Some(64));
+}
+
 /// LDS shared within one console wave: the console runs its accesses in program order, the
 /// two halves at a group barrier before each, which every thread must reach. So the program
 /// splits where every lane accesses LDS, and where only some lanes do once the branch
@@ -500,6 +535,18 @@ fn branch_encodings_decode_as_named() {
         ["s_andn2_b64 exec, exec, vcc", "s_cbranch_execz label_0030", "v_add_nc_u32 v1, 1, v1"]
     );
     assert_eq!(two[10..], ["s_cbranch_execnz label_0008", "s_mov_b64 exec, s[12:13]"]);
+    assert_eq!(
+        sp3(&RETURN_BELOW_104)[2..],
+        [
+            "s_and_saveexec_b64 s[12:13], vcc",
+            "s_cbranch_execz label_0018",
+            "s_branch label_001C",
+            "s_endpgm",
+            "v_readlane_b32 s14, v0, 10",
+            "s_mov_b64 exec, -1",
+            "v_mov_b32 v1, s14",
+        ]
+    );
 }
 
 #[test]
@@ -961,9 +1008,6 @@ mod card {
     // wave never reaches does not hang on every GPU: one whose barriers count arrivals lets
     // the waves pass at different barriers, so the check is the data, bit for bit.
 
-    /// v_cmp_le_u32 vcc, 104, v0: lanes 40..63 of the second console wave only.
-    const VCC_FROM_104: [u32; 2] = [0x7D86_00FF, 104];
-
     /// A lane branch only the second console wave would take, whose lanes read lane 10 of
     /// its lower half. Then every lane adds lane 40's v0, of its own wave's upper half, so
     /// the first wave meets its other half where the second may still be inside the branch.
@@ -1033,6 +1077,16 @@ mod card {
     fn a_scalar_branch_one_console_wave_takes_reads_its_own_lane() {
         let Some(out) = run_group(&scalar_branch_one_wave_takes(), 128) else { return };
         let want: Vec<u32> = (0..128).map(|t| if t < 64 { t } else { 74 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// The first console wave returns early, before the second reads its lane 10 and stores
+    /// from every lane: the first runs the rest with the group, and its own decision, not
+    /// the EXEC turned on there, keeps it from storing.
+    #[test]
+    fn a_wave_that_returns_early_stores_nothing() {
+        let Some(out) = run_group(&two_waves(&RETURN_BELOW_104), 128) else { return };
+        let want: Vec<u32> = (0..128).map(|t| if t < 64 { 0 } else { 74 }).collect();
         assert_eq!(out, want);
     }
 }

@@ -11,7 +11,9 @@
 //! the region keeps its VGPRs and stores nothing. Every console wave thus
 //! meets the others at the same group barriers, the only ones that are
 //! well defined. A scalar branch the console waves may take apart, around
-//! such a place, is taken so too ([`apart_branches`]).
+//! such a place, is taken so too ([`apart_branches`]). A way that only ends
+//! the program (`if (...) return;`) counts as the region's join
+//! ([`group_region`]).
 //!
 //! That is exact only where the region has nothing else a skipping wave
 //! could get wrong ([`several_keep_64`]): such a wave still runs the
@@ -58,18 +60,22 @@ fn region_of(succ: &[Vec<usize>], pdom: &[Vec<bool>], d: usize) -> (Vec<bool>, b
 }
 
 /// The region the whole group takes at the lane branch closing block `d`:
-/// an `if` without an `else` (one way is the join), not closing a loop.
-pub(super) fn group_region(st: &Structured, d: usize) -> Result<GroupRegion, Why> {
+/// an `if` without an `else` (one way is the join), not closing a loop. A
+/// way that only ends the program (`if (...) return;`, [`bare_end`]) joins
+/// at the end: a console wave that would have ended there runs the rest
+/// with the group, its flag guarding it, and ends with it.
+pub(super) fn group_region(p: &Program, st: &Structured, d: usize) -> Result<GroupRegion, Why> {
     let succ = successors(st).ok_or("an indirect exit")?;
     let LaneExit::Branch { taken, not_taken, .. } = st.exits[d] else {
         return Err("a group-wide branch that is no branch");
     };
     let pdom = post_dominators(&succ);
-    let (blocks, cycle) = region_of(&succ, &pdom, d);
+    let (mut blocks, cycle) = region_of(&succ, &pdom, d);
     if cycle {
         return Err("a lane loop around a meeting in a group of several console waves");
     }
-    let enter = match (pdom[d][taken], pdom[d][not_taken]) {
+    let joins = |b: usize| pdom[d][b] || bare_end(p, st, b);
+    let enter = match (joins(taken), joins(not_taken)) {
         (true, false) => not_taken,
         (false, true) => taken,
         _ => {
@@ -78,7 +84,14 @@ pub(super) fn group_region(st: &Structured, d: usize) -> Result<GroupRegion, Why
             );
         }
     };
+    let end = if enter == taken { not_taken } else { taken };
+    blocks[end] = false;
     Ok(GroupRegion { enter, blocks })
+}
+
+/// Whether IR block `b` only ends the program: `s_endpgm` alone.
+fn bare_end(p: &Program, st: &Structured, b: usize) -> bool {
+    st.exits[b] == LaneExit::End && p.blocks[b].insts.iter().all(|i| i.name() == "s_endpgm")
 }
 
 /// Whether `inst` is where the halves or the group meet: a lane read, a
@@ -110,7 +123,7 @@ pub(super) fn several_keep_64(
     let mut taken: Vec<usize> = st.wide.iter().copied().chain(apart).collect();
     taken.sort_unstable();
     for &d in &taken {
-        let region = match group_region(st, d) {
+        let region = match group_region(p, st, d) {
             Ok(r) => r,
             Err(why) => return Keep::fixed(why),
         };
@@ -284,7 +297,7 @@ impl Lower<'_> {
     /// wave's own answer becomes the flag of the region's blocks. The
     /// condition for the way taken.
     pub(in super::super) fn group_wide(&mut self, b: usize, any: bool, some: V) -> Result<V, Why> {
-        let region = group_region(self.x.st, b)?;
+        let region = group_region(self.x.p, self.x.st, b)?;
         let LaneExit::Branch { taken, .. } = self.x.st.exits[b] else {
             return Err("a group-wide branch that is no branch");
         };
