@@ -50,6 +50,9 @@ pub(crate) struct Lowered {
     /// Group barriers emitted.
     #[cfg(test)]
     pub barriers: u32,
+    /// Reads of another lane emitted.
+    #[cfg(test)]
+    pub lane_reads: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -764,10 +767,12 @@ impl<'a> Lower<'a> {
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
         use super::wave::{Op, Shape};
+        let tree = matches!(shape, Shape::Tree(..));
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::Tree(src, mask, ident) => (Op::AddF, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -852,7 +857,7 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        let r = self.whole_wave(op, prefix.is_some(), r, x)?;
+        let r = self.whole_wave(op, prefix.is_some(), tree, r, x)?;
         Ok(if float { self.as_int(r) } else { r })
     }
 
@@ -949,6 +954,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             barriers: self.s.barriers,
+            #[cfg(test)]
+            lane_reads: self.s.lane_reads,
             wave_size: self.s.wave_size,
             dxil: self.s.finish().map_err(Stop::Fail)?,
             user_data,

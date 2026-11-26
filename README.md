@@ -28,13 +28,13 @@ README describes where it is now.
 
 | Programs | Validated for a 32-lane GPU | Share | |
 |---|---:|---:|---|
-| **All** | 21,677 of 26,148 | 82.9% | `████████████████░░░░` |
+| **All** | 21,699 of 26,148 | 82.9% | `████████████████░░░░` |
 | Mesh | 8,152 of 8,765 | 93.0% | `██████████████████░░` |
 | Vertex/pixel | 12,167 of 14,649 | 83.0% | `████████████████░░░░` |
-| Compute | 1,358 of 2,734 | 49.6% | `█████████░░░░░░░░░░░` |
+| Compute | 1,380 of 2,734 | 50.4% | `██████████░░░░░░░░░░` |
 
-Measured with `victory translate --validate --host-lanes 32 --json` over the game directory (files above 2 GiB are not read), built at commit `f10c1f063d` (2026-11-25). A program counts once its DXIL passes the validator and, on a GPU with 32-lane waves, does not need 64-lane waves; creating its pipeline on a GPU is not part of the share.
-59 more compute programs pass the validator but need 64-lane waves, which such a GPU refuses.
+Measured with `victory translate --validate --host-lanes 32 --json` over the game directory (files above 2 GiB are not read), built at commit `f703802cd3` (2026-11-26). A program counts once its DXIL passes the validator and, on a GPU with 32-lane waves, does not need 64-lane waves; creating its pipeline on a GPU is not part of the share.
+37 more compute programs pass the validator but need 64-lane waves, which such a GPU refuses.
 <!-- progress:end -->
 
 ## Status
@@ -207,6 +207,14 @@ kind of program (found, and validated: emitted as DXIL the validator
 accepts; for compute, how many of those need 64-lane waves), aggregate
 numbers only; `cargo xtask progress --record <file>` turns
 them into the [Shader translation](#shader-translation) block.
+
+Every count is of entry points, not of files or containers: each native
+program a container holds is one program, counted under its stage. The
+vertex/pixel row also holds the merged geometry stages (LS, HS, ES, GS),
+which are found but not translated. A run translates fewer: the first
+vertex, pixel, compute or mesh program of each container the title
+creates a pipeline from. A container holding a second such program would
+count it here and never run it.
 
 `victory translate` also reads:
 

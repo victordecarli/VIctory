@@ -49,6 +49,48 @@ const LANE_LOOP: [u32; 9] = [
     0xBF89_FFFA,          // s_cbranch_execnz back to the v_readlane
     END_IF,
 ];
+/// v1 = v0; each round, v1 += lane 10's v0 (read into s14), and the lanes that reached 40
+/// leave (`break`: the loop's first exit, when every lane left); then v1 += 1, and the
+/// lanes that reached 40 leave at the loop's second exit.
+const LOOP_TWO_EXITS: [u32; 13] = [
+    V1_V0,
+    0xBE8C_047E, // s_mov_b64 s[12:13], exec
+    READLANE_10[0],
+    READLANE_10[1],
+    vop2(0x25, 1, 14, 1),   // v_add_nc_u32 v1, s14, v1
+    0x7D86_02A8,            // v_cmp_le_u32 vcc, 40, v1
+    0x8AFE_6A7E,            // s_andn2_b64 exec, exec, vcc
+    0xBF88_0004,            // s_cbranch_execz past the loop
+    vop2(0x25, 1, 0x81, 1), // v_add_nc_u32 v1, 1, v1
+    0x7D86_02A8,            // v_cmp_le_u32 vcc, 40, v1
+    0x8AFE_6A7E,            // s_andn2_b64 exec, exec, vcc
+    0xBF89_FFF6,            // s_cbranch_execnz back to the v_readlane
+    END_IF,
+];
+/// v1 = v0; for the lanes from 20 on, three rounds of a loop on a scalar counter (s15) in
+/// which the lanes from 40 on add lane 10's v0 (read into s14) to v1. The two ways through
+/// the inner branch restore EXEC differently, so the loop's latch joins EXEC with a phi,
+/// which the loop's header joins again over its back edge.
+const UNIFORM_LOOP_IN_A_BRANCH: [u32; 18] = [
+    V1_V0,
+    0x7D86_0094, // v_cmp_le_u32 vcc, 20, v0
+    0xBE92_246A, // s_and_saveexec_b64 s[18:19], vcc
+    0xBF88_000D, // s_cbranch_execz past the loop
+    0xBE8F_0380, // s_mov_b32 s15, 0
+    VCC_FROM_40, // the loop's header
+    0xBE90_246A, // s_and_saveexec_b64 s[16:17], vcc
+    0xBF88_0005, // s_cbranch_execz to the second restore
+    READLANE_10[0],
+    READLANE_10[1],
+    vop2(0x25, 1, 14, 1), // v_add_nc_u32 v1, s14, v1
+    0x88FE_107E,          // s_or_b64 exec, exec, s[16:17]
+    0xBF82_0001,          // s_branch to the latch
+    RESTORE,              // s_mov_b64 exec, s[16:17]
+    0x810F_810F,          // the latch: s_add_i32 s15, s15, 1
+    0xBF0A_830F,          // s_cmp_lt_u32 s15, 3
+    0xBF85_FFF4,          // s_cbranch_scc1 to the header
+    0xBEFE_0412,          // s_mov_b64 exec, s[18:19]
+];
 /// v_mov_b32 v1, 0; s_mov_b32 s12, 7; v_writelane_b32 v1, s12, 40
 const WRITELANE_40: [u32; 4] = [0x7E02_0280, 0xBE8C_0387, 0xD761_0001, 0x0001_500C];
 /// v_lshlrev_b32 v2, 2, v0; buffer_store_dword v1, v2, s[8:11], 0 offen: v1 to dword
@@ -118,6 +160,9 @@ const SAVE_ALL: u32 = 0xBE90_25C1; // s_or_saveexec_b64 s[16:17], -1
 const RESTORE: u32 = 0xBEFE_0410; // s_mov_b64 exec, s[16:17]
 /// v_mov_b32 v1, s7
 const V1_S7: u32 = 0x7E02_0207;
+/// v_mul_u32_u24 v7, 0xabcdef, v0; v_cvt_f32_u32 v7, v7: thread t's float of t * 0xabcdef,
+/// large enough that sums round.
+const V7_FLOAT: [u32; 3] = [vop2(0x0B, 7, 0xFF, 0), 0x00AB_CDEF, vop1(0x06, 7, 0x107)];
 
 /// `WaveActive<op>(v7)` into s7 as the console compiler expands it (the fxceless line's
 /// `WAVE_OR_V7_TO_S7` with `op` and its identity): every lane takes part, those outside the
@@ -152,6 +197,11 @@ const fn reduce(op: u32, ident: u32) -> [u32; 20] {
 /// 4 and 8, then rows 1 and 3 add the total of the row below, then lanes 32..63 the total
 /// of lanes 0..31, EXEC chosen for each step. `exclusive`: less each lane's own term.
 fn prefix_sum(exclusive: bool) -> Vec<u32> {
+    prefix_of(V_ADD_U, exclusive)
+}
+
+/// [`prefix_sum`] with the addition `op`.
+fn prefix_of(op: u32, exclusive: bool) -> Vec<u32> {
     let mut w = vec![
         SAVE_ALL,
         0xD501_0003,
@@ -159,7 +209,7 @@ fn prefix_sum(exclusive: bool) -> Vec<u32> {
         vop1(0x01, 1, 0x103), // v_mov_b32 v1, v3
     ];
     for n in [1, 2, 4, 8] {
-        w.extend(dpp(V_ADD_U, 1, 1, 0x110 + n));
+        w.extend(dpp(op, 1, 1, 0x110 + n));
     }
     w.extend(readlane_v1(14, 15));
     w.extend(readlane_v1(15, 47));
@@ -167,16 +217,16 @@ fn prefix_sum(exclusive: bool) -> Vec<u32> {
         0xBEFE_03FF,
         0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
         0xBEFF_0380, // s_mov_b32 exec_hi, 0
-        vop2(V_ADD_U, 1, 14, 1),
+        vop2(op, 1, 14, 1),
         0xBEFE_0380, // s_mov_b32 exec_lo, 0
         0xBEFF_03FF,
         0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
-        vop2(V_ADD_U, 1, 15, 1),
+        vop2(op, 1, 15, 1),
     ]);
     w.extend(readlane_v1(14, 31));
     w.extend([
         0xBEFF_03C1, // s_mov_b32 exec_hi, -1
-        vop2(V_ADD_U, 1, 14, 1),
+        vop2(op, 1, 14, 1),
     ]);
     if exclusive {
         w.extend([0xBEFE_04C1, vop2(0x26, 1, 0x101, 3)]); // s_mov_b64 exec, -1; v1 -= v3
@@ -403,6 +453,34 @@ fn branch_encodings_decode_as_named() {
         ]
     );
     assert_eq!(sp3(&[READFIRSTLANE_V0_S14]), ["v_readfirstlane_b32 s14, v0"]);
+    assert_eq!(
+        sp3(&UNIFORM_LOOP_IN_A_BRANCH),
+        [
+            "v_mov_b32 v1, v0",
+            "v_cmp_le_u32 vcc, 20, v0",
+            "s_and_saveexec_b64 s[18:19], vcc",
+            "s_cbranch_execz label_0044",
+            "s_mov_b32 s15, 0",
+            "v_cmp_le_u32 vcc, 40, v0",
+            "s_and_saveexec_b64 s[16:17], vcc",
+            "s_cbranch_execz label_0034",
+            "v_readlane_b32 s14, v0, 10",
+            "v_add_nc_u32 v1, s14, v1",
+            "s_or_b64 exec, exec, s[16:17]",
+            "s_branch label_0038",
+            "s_mov_b64 exec, s[16:17]",
+            "s_add_i32 s15, s15, 1",
+            "s_cmp_lt_u32 s15, 3",
+            "s_cbranch_scc1 label_0014",
+            "s_mov_b64 exec, s[18:19]",
+        ]
+    );
+    let two = sp3(&LOOP_TWO_EXITS);
+    assert_eq!(
+        two[5..8],
+        ["s_andn2_b64 exec, exec, vcc", "s_cbranch_execz label_0030", "v_add_nc_u32 v1, 1, v1"]
+    );
+    assert_eq!(two[10..], ["s_cbranch_execnz label_0008", "s_mov_b64 exec, s[12:13]"]);
 }
 
 #[test]
@@ -429,6 +507,7 @@ fn section_encodings_decode_as_named() {
         assert!(sp3(&reduce(op, ZERO))[2].starts_with(name), "{name}");
     }
     assert!(sp3(&reduce(V_ADD_F, ZERO))[2].starts_with("v_add_f32"));
+    assert_eq!(sp3(&V7_FLOAT), ["v_mul_u32_u24 v7, lit(0x00abcdef), v0", "v_cvt_f32_u32 v7, v7"]);
     assert_eq!(
         sp3(&[&V7_BIT[..], &[V7_NOT], &V7_ROTATED[..], &[V1_S7]].concat()),
         [
@@ -518,14 +597,55 @@ fn a_lane_loop_is_taken_wave_wide() {
     assert_eq!(translate(&wave(&LANE_LOOP), 32).unwrap().wave_size, Some(32));
 }
 
-/// The console adds floats in its own tree, which the halves' wave sums do not follow: a
-/// float sum over two host waves keeps 64-lane waves. A group of at most 32 threads is
-/// one host wave, which sums as an unsplit program does.
+/// A loop on a scalar inside branches taken wave-wide: EXEC entering it is a guard, so the
+/// join of EXEC at its header stays a join (not a constant) and its value over the back
+/// edge, the latch's join, must be known too.
 #[test]
-fn a_float_wave_sum_splits_only_in_one_host_wave() {
-    let body = [&V7_ROTATED[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
-    assert_eq!(translate(&native(&body, true, 64, false), 32).unwrap().wave_size, Some(64));
-    assert_eq!(translate(&native(&body, true, 32, false), 32).unwrap().wave_size, Some(32));
+fn a_uniform_loop_inside_wave_wide_branches_splits() {
+    let cs = wave(&UNIFORM_LOOP_IN_A_BRANCH);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
+}
+
+/// A loop with two exits: each lies in the other's region, so neither is outermost. Both
+/// close the same loop and the console takes each for the whole wave, so they are taken
+/// wave-wide together.
+#[test]
+fn the_exits_of_one_loop_are_taken_wave_wide_together() {
+    assert_eq!(translate(&wave(&LOOP_TWO_EXITS), 32).unwrap().wave_size, Some(32));
+}
+
+/// Floats round at every addition, so a float sum is exact only in the console's order.
+/// The compiler's reduction adds aligned blocks of lanes of equal size (a balanced tree),
+/// which the halves can follow: it splits. A float total taken from a prefix scan adds in
+/// another order and keeps 64-lane waves on two host waves; a group of at most 32 threads
+/// is one host wave, which sums as an unsplit program does.
+#[test]
+fn a_float_wave_sum_splits_where_its_order_is_the_consoles_tree() {
+    let tree = [&V7_FLOAT[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
+    assert_eq!(translate(&native(&tree, true, 64, false), 32).unwrap().wave_size, Some(32));
+    let scan = scan_total();
+    assert_eq!(translate(&native(&scan, true, 64, false), 32).unwrap().wave_size, Some(64));
+    assert_eq!(translate(&native(&scan, true, 32, false), 32).unwrap().wave_size, Some(32));
+}
+
+/// Each half adds its lanes in the tree itself, reading the partner lanes, rather than
+/// trusting the host's wave sum to that order. (The card test below cannot tell the two
+/// apart: the RTX 5070's 32-lane wave sum happened to add in the same tree.)
+#[test]
+fn a_float_tree_sum_in_halves_adds_its_lanes_itself() {
+    let tree = [&V7_FLOAT[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
+    let reads = |lanes| lowered(&native(&tree, true, 64, false), lanes).lane_reads;
+    assert_eq!(reads(32), 5, "one read per level of the tree in a half");
+    assert_eq!(reads(64), 0);
+}
+
+/// The float total of v7 read from lane 63 of an inclusive prefix scan, stored by every
+/// thread.
+fn scan_total() -> Vec<u32> {
+    let mut scan = prefix_of(V_ADD_F, false);
+    scan.pop(); // the restore, after the read
+    scan.extend(readlane_v1(7, 63));
+    [&V7_FLOAT[..], &scan, &[RESTORE, V1_S7], &STORE_V1[..]].concat()
 }
 
 /// [`translate`]'s lowering, for what only the lowering counts.
@@ -691,6 +811,23 @@ mod card {
         }
     }
 
+    /// A float wave sum over the two halves is the console's to the bit: the balanced tree
+    /// over the lanes in their order, which a sum in lane order does not give here.
+    #[test]
+    fn a_float_wave_sum_is_the_consoles_tree_bit_for_bit() {
+        #[allow(clippy::cast_precision_loss, reason = "the console's conversion rounds too")]
+        let terms: Vec<f32> = (0..64u32).map(|t| (t * 0xAB_CDEF) as f32).collect();
+        let mut tree = terms.clone();
+        while tree.len() > 1 {
+            tree = tree.chunks(2).map(|c| c[0] + c[1]).collect();
+        }
+        let in_a_row: f32 = terms.iter().sum();
+        assert_ne!(tree[0].to_bits(), in_a_row.to_bits(), "these terms tell the orders apart");
+        let body = [&V7_FLOAT[..], &reduce(V_ADD_F, ZERO)[..], &[V1_S7], &STORE_V1[..]].concat();
+        let Some(out) = run_program(&native(&body, true, 64, false)) else { return };
+        assert_eq!(out, vec![tree[0].to_bits(); 64], "tree {:#x}", tree[0].to_bits());
+    }
+
     /// A prefix sum in the upper half goes on from the lower half's total.
     #[test]
     fn a_wave_prefix_sum_runs_on_across_the_halves() {
@@ -727,6 +864,37 @@ mod card {
                 v
             })
             .collect();
+        assert_eq!(out, want);
+    }
+
+    /// The upper half's lanes all leave at the first exit of the first round; the lower
+    /// half's go on reading lane 10.
+    #[test]
+    fn a_lane_read_in_a_loop_of_two_exits_reaches_the_other_half() {
+        let Some(out) = run_program(&wave(&LOOP_TWO_EXITS)) else { return };
+        let want: Vec<u32> = (0..64)
+            .map(|t| {
+                let mut v = t;
+                loop {
+                    v += 10;
+                    if v >= 40 {
+                        break v;
+                    }
+                    v += 1;
+                    if v >= 40 {
+                        break v;
+                    }
+                }
+            })
+            .collect();
+        assert_eq!(out, want);
+    }
+
+    /// The lanes from 40 on add lane 10's v0 in each of three rounds; the others keep v0.
+    #[test]
+    fn a_lane_read_in_a_uniform_loop_inside_a_branch_reaches_the_other_half() {
+        let Some(out) = run_program(&wave(&UNIFORM_LOOP_IN_A_BRANCH)) else { return };
+        let want: Vec<u32> = (0..64).map(|t| if t < 40 { t } else { t + 30 }).collect();
         assert_eq!(out, want);
     }
 

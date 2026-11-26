@@ -19,8 +19,8 @@
 //!   access keeps the console wave's order across the halves;
 //! - in a group of two host waves, its whole-wave sections
 //!   ([`super::super::wave`]) lie in blocks every lane runs, where the halves
-//!   exchange their results, and sum no floats (the console adds them in an
-//!   order of its own); it has no `ds_(b)permute`;
+//!   exchange their results, and sum floats only as the balanced tree over
+//!   the lanes, which the halves follow; it has no `ds_(b)permute`;
 //! - in a group of two host waves, every place the halves exchange lies in
 //!   a block every lane runs;
 //! - a block only some lanes run holds no group barrier, and a scalar
@@ -41,7 +41,9 @@
 //! blocks. A branch closing a loop each lane leaves on its own is taken so
 //! too: the wave goes round again while some lane of it is left, and the
 //! lanes that left stay out of the vector instructions. Only branches in no
-//! other lane branch's region are taken so, outermost first.
+//! other lane branch's region are taken so, outermost first, but for the
+//! exits of one such loop, which lie in each other's regions and are taken
+//! together.
 //!
 //! Every other console wave64 program keeps 64-lane waves.
 //!
@@ -268,8 +270,10 @@ fn lane_scalar_read_past(
 
 /// The lane branches to take wave-wide next so that `p` could run in
 /// halves: those around the block holding the reason [`keeps_64`] gives
-/// that lie in no other lane branch's region (a branch closing a loop each
-/// lane leaves on its own lies in its own). Empty when there is none.
+/// that lie in no other lane branch's region, but for the regions of the
+/// branches that lie in theirs too: the exits of one loop each lanes leave
+/// on their own, taken together. (A branch closing such a loop lies in its
+/// own region.) Empty when there is none.
 pub(super) fn to_widen(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Vec<usize> {
     let Some(Keep { at: Some(at), .. }) = keeps_64_at(p, st, group, lds_dwords) else {
         return Vec::new();
@@ -277,20 +281,19 @@ pub(super) fn to_widen(p: &Program, st: &Structured, group: u32, lds_dwords: u32
     let Some(regions) = lane_regions(st) else {
         return Vec::new();
     };
-    let inside_another = |d: usize| {
-        regions.iter().any(|r| r.branch != d && r.blocks.get(d).copied().unwrap_or(false))
+    let holds = |r: &Region, b: usize| r.blocks.get(b).copied().unwrap_or(false);
+    // Some other branch's region holds `r`'s branch, and `r`'s does not hold it back.
+    let enclosed = |r: &Region| {
+        regions.iter().any(|o| o.branch != r.branch && holds(o, r.branch) && !holds(r, o.branch))
     };
-    regions
-        .iter()
-        .filter(|r| !inside_another(r.branch) && r.blocks.get(at).copied().unwrap_or(false))
-        .map(|r| r.branch)
-        .collect()
+    regions.iter().filter(|r| !enclosed(r) && holds(r, at)).map(|r| r.branch).collect()
 }
 
 /// Why the whole-wave sections of `p` keep 64-lane waves. In a group of two
 /// host waves each section lies where every lane runs, so that both halves
-/// reach the exchange of their results ([`Lower::whole_wave`]), and sums no
-/// floats: the console adds them in its own order.
+/// reach the exchange of their results ([`Lower::whole_wave`]), and sums
+/// floats only in the order the halves can follow ([`Shape::Tree`]): each
+/// addition rounds, so another order gives another sum.
 fn sections_keep_64(p: &Program, two: bool, every: impl Fn(usize) -> bool) -> Option<Keep> {
     if !two {
         return None;
@@ -557,8 +560,16 @@ impl Lower<'_> {
     /// The console wave's `op` over its lanes' terms `x` (integers), or with
     /// `prefix` each lane's prefix sum, from `r`, this host wave's (of `op`'s
     /// type). Two host waves exchange their results, where every lane runs
-    /// ([`keeps_64`]); a single host wave's are the console wave's.
-    pub(super) fn whole_wave(&mut self, op: WaveOp, prefix: bool, r: V, x: V) -> Result<V, Why> {
+    /// ([`keeps_64`]); a single host wave's are the console wave's. `tree`:
+    /// a float sum added as the balanced tree ([`Shape::Tree`]).
+    pub(super) fn whole_wave(
+        &mut self,
+        op: WaveOp,
+        prefix: bool,
+        tree: bool,
+        r: V,
+        x: V,
+    ) -> Result<V, Why> {
         if self.halves.as_ref().and_then(|h| h.two).is_none() {
             return Ok(r);
         }
@@ -589,7 +600,13 @@ impl Lower<'_> {
             return Ok(self.s.m.bin(c, Bin::Add, r, add));
         }
         let float = matches!(op, WaveOp::MinF | WaveOp::MaxF);
-        let mine = if float { self.as_int(r) } else { r };
+        let mine = if tree {
+            self.half_tree(x)
+        } else if float {
+            self.as_int(r)
+        } else {
+            r
+        };
         let (lo, hi) = self.exchange(c, mine);
         // DXIL's IMax, IMin, UMax, UMin
         let code = match op {
@@ -601,6 +618,7 @@ impl Lower<'_> {
                 let (lo, hi) = (self.as_float(lo), self.as_float(hi));
                 return Ok(self.max_min(op == WaveOp::MaxF, lo, hi));
             }
+            WaveOp::AddF if tree => return Ok(self.tree_sum(lo, hi)),
             WaveOp::AddF => return Err(FLOAT_SUM),
             WaveOp::MaxI => 37,
             WaveOp::MinI => 38,
@@ -608,6 +626,34 @@ impl Lower<'_> {
             WaveOp::MinU => 40,
         };
         Ok(self.s.op(c, "binary.i32", Attr::ReadNone, i32t, code, &[lo, hi]))
+    }
+
+    /// This host wave's 32 terms `x` (float bits) added as the console's
+    /// balanced tree: each lane adds the partial sum of the lane whose number
+    /// differs in one bit, for bits 0 to 4. Every lane runs here (the
+    /// section's block, [`keeps_64`]), and addition is commutative, so each
+    /// step adds what the console's does. The float bits of the sum.
+    fn half_tree(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        self.s.flags |= flags::WAVE_OPS;
+        let mut sum = x;
+        for step in 0..5 {
+            let bit = self.s.m.i32(1 << step);
+            let partner = self.s.m.bin(c, Bin::Xor, lane, bit);
+            let theirs = self.read_lane(sum, partner);
+            let (a, b) = (self.as_float(sum), self.as_float(theirs));
+            let added = self.s.m.bin(c, Bin::Add, a, b);
+            sum = self.as_int(added);
+        }
+        sum
+    }
+
+    /// The console's last addition of a float tree: the halves' sums (bits).
+    fn tree_sum(&mut self, lo: V, hi: V) -> V {
+        let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+        self.s.m.bin(self.cur, Bin::Add, lo, hi)
     }
 
     /// The condition of the branch closing IR block `b`, which the console
