@@ -86,6 +86,9 @@ pub(super) struct Halves {
     loops: Option<HashMap<usize, groups::GroupLoop>>,
     /// Per header of such a loop: this console wave's flag in it.
     acts: HashMap<usize, groups::Act>,
+    /// Per block joining the ways of an `if` the whole group takes: those
+    /// `if`s ([`Lower::group_join`]).
+    joins: HashMap<usize, Vec<groups::Join>>,
 }
 
 impl Halves {
@@ -109,6 +112,7 @@ impl Halves {
             apart: None,
             loops: None,
             acts: HashMap::new(),
+            joins: HashMap::new(),
         }
     }
 

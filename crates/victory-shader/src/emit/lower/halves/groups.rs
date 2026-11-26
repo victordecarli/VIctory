@@ -21,11 +21,16 @@
 //! round, is taken so too ([`group_loop`]): the group goes round while some
 //! console wave would, and a wave's flag in the loop, a phi at its header,
 //! turns off once the wave would have left ([`Lower::group_round`]), so it
-//! keeps its VGPRs from then on. A wave already out votes to leave.
+//! keeps its VGPRs from then on. A wave already out votes to leave. A loop
+//! inside such a loop is taken so too: a wave enters it with its flag in
+//! the loop around.
 //!
 //! That is exact only where the region has nothing else a skipping wave
 //! could get wrong ([`several_keep_64`]): such a wave still runs the
-//! region's scalar instructions, which no guard holds back.
+//! region's scalar instructions, which no guard holds back. A scalar the
+//! `if`'s join takes from inside it is each wave's own there: a wave that
+//! would have skipped the `if` takes what the join takes from its branch
+//! ([`Lower::group_join`]).
 
 use super::*;
 
@@ -34,6 +39,10 @@ use super::*;
 pub(super) struct GroupRegion {
     pub(super) enter: usize,
     pub(super) blocks: Vec<bool>,
+    /// For an `if`: the block its branch closes and the block its ways join
+    /// at, whose scalar phis each console wave takes by its own way
+    /// ([`Lower::group_join`]). None for a loop.
+    pub(super) join: Option<(usize, usize)>,
 }
 
 /// The successors of each IR block, None with an indirect exit.
@@ -96,7 +105,7 @@ pub(super) fn group_region(p: &Program, st: &Structured, d: usize) -> Result<Gro
     };
     let end = if enter == taken { not_taken } else { taken };
     blocks[end] = false;
-    Ok(GroupRegion { enter, blocks })
+    Ok(GroupRegion { enter, blocks, join: Some((d, end)) })
 }
 
 /// Whether IR block `b` only ends the program: `s_endpgm` alone.
@@ -116,10 +125,11 @@ pub(super) struct GroupLoop {
 }
 
 /// The loop around the branch closing block `d`, None when `d` is in none:
-/// the blocks on a way from `d` back to itself. The whole group takes it
-/// only where the branch is its one way out and every round passes the
-/// branch, so that each round a console wave goes on or leaves there.
-pub(super) fn group_loop(st: &Structured, d: usize) -> Result<Option<GroupLoop>, Why> {
+/// the innermost loop holding `d` that `d` leaves ([`loop_left_at`]). The
+/// whole group takes it only where the branch is its one way out and every
+/// round passes the branch, so that each round a console wave goes on or
+/// leaves there. A loop inside it is taken so too, each with its own flag.
+pub(super) fn group_loop(p: &Program, st: &Structured, d: usize) -> Result<Option<GroupLoop>, Why> {
     let succ = successors(st).ok_or("an indirect exit")?;
     let LaneExit::Branch { taken, not_taken, .. } = st.exits[d] else {
         return Err("a group-wide branch that is no branch");
@@ -137,9 +147,7 @@ pub(super) fn group_loop(st: &Structured, d: usize) -> Result<Option<GroupLoop>,
     if !cycle {
         return Ok(None);
     }
-    let from = reached(&succ, &succ[d]);
-    let back = reached(&preds, &[d]);
-    let blocks: Vec<bool> = (0..n).map(|b| from[b] && back[b]).collect();
+    let blocks = loop_left_at(p, &succ, &preds, d)?;
     let leaves = |b: usize| succ[b].iter().any(|&t| !blocks[t]);
     if (0..n).any(|b| blocks[b] && b != d && leaves(b)) {
         return Err("a group-wide loop left at more than one place");
@@ -169,16 +177,51 @@ pub(super) fn group_loop(st: &Structured, d: usize) -> Result<Option<GroupLoop>,
     Ok(Some(GroupLoop { header, blocks, after }))
 }
 
-/// The blocks reached from `start` along `edges`, `start` included.
-fn reached(edges: &[Vec<usize>], start: &[usize]) -> Vec<bool> {
-    let mut seen = vec![false; edges.len()];
-    let mut stack = start.to_vec();
-    while let Some(b) = stack.pop() {
-        if !std::mem::replace(&mut seen[b], true) {
-            stack.extend(&edges[b]);
+/// Per IR block of `p`: whether it lies in the innermost loop holding block
+/// `d` that `d` leaves. A loop is a natural one: its header dominates the
+/// blocks going back to it, and it holds the blocks reaching those without
+/// passing the header (every way back to the header together). The blocks
+/// reaching `d` and reached from it would take in, for a loop inside
+/// another, the outer one too.
+fn loop_left_at(
+    p: &Program,
+    succ: &[Vec<usize>],
+    preds: &[Vec<usize>],
+    d: usize,
+) -> Result<Vec<bool>, Why> {
+    let idom = idoms(p);
+    let n = succ.len();
+    let mut innermost: Option<(usize, Vec<bool>)> = None;
+    let mut held = false;
+    for h in 0..n {
+        let back: Vec<usize> =
+            preds[h].iter().copied().filter(|&t| dominates(&idom, h, t)).collect();
+        if back.is_empty() {
+            continue;
+        }
+        let mut body = vec![false; n];
+        body[h] = true;
+        let mut stack = back;
+        while let Some(b) = stack.pop() {
+            if !std::mem::replace(&mut body[b], true) {
+                // (blocks the entry does not reach are in no loop)
+                stack.extend(preds[b].iter().filter(|&&q| idom[q] != usize::MAX));
+            }
+        }
+        if !body[d] {
+            continue;
+        }
+        held = true;
+        let size = body.iter().filter(|&&x| x).count();
+        if succ[d].iter().any(|&t| !body[t]) && innermost.as_ref().is_none_or(|(s, _)| size < *s) {
+            innermost = Some((size, body));
         }
     }
-    seen
+    match innermost {
+        Some((_, body)) => Ok(body),
+        None if held => Err("a group-wide loop branch with no way out"),
+        None => Err("a group-wide loop entered at more than one block"),
+    }
 }
 
 /// Whether `inst` accesses memory other than LDS: what [`Lower::flagged`]
@@ -235,21 +278,18 @@ pub(super) fn several_keep_64(
     taken.sort_unstable();
     let mut loops = Vec::new();
     for &d in &taken {
-        match group_loop(st, d) {
+        match group_loop(p, st, d) {
             Ok(Some(lp)) => loops.push((d, lp)),
             Ok(None) => {}
             Err(why) => return Keep::fixed(why),
         }
     }
-    for (d, lp) in &loops {
-        if loops.iter().any(|(e, _)| e != d && lp.blocks[*e]) {
-            return Keep::fixed("a group-wide loop in another");
-        }
-    }
     for &d in &taken {
         // (a console wave out of a loop runs its later rounds as one that skips them)
         let region = match loops.iter().find(|(e, _)| *e == d) {
-            Some((_, lp)) => GroupRegion { enter: lp.header, blocks: lp.blocks.clone() },
+            Some((_, lp)) => {
+                GroupRegion { enter: lp.header, blocks: lp.blocks.clone(), join: None }
+            }
             None => match group_region(p, st, d) {
                 Ok(r) => r,
                 Err(why) => return Keep::fixed(why),
@@ -296,7 +336,10 @@ pub(super) fn apart_branches(p: &Program, st: &Structured, lds: bool) -> Option<
 /// scalar instructions, could get wrong: a scalar store or atomic, a lane
 /// write (which ignores EXEC), or a scalar written there and read outside
 /// it (EXEC aside: inside, a skipping wave's lanes stay out of it, and it
-/// is restored as it was). A group barrier of the program's own is no
+/// is restored as it was), but by a scalar phi (no lane mask) where an
+/// `if`'s ways join, which takes each wave's own way
+/// ([`Lower::group_join`]; its branch must dominate the way in, whose
+/// values the phi's take). A group barrier of the program's own is no
 /// trouble: every console wave reaches it, with the group. Nor is a memory
 /// access ([`Lower::flagged`]), but for one reading a lane mask as a
 /// number, whose ballot could have the halves meet where only some console
@@ -333,17 +376,56 @@ fn skipping_wave_keeps_64(p: &Program, st: &Structured, region: &GroupRegion) ->
             }
         }
     }
-    let outside_reads =
-        p.blocks.iter().enumerate().filter(|&(b, _)| !inside(b)).flat_map(|(_, block)| {
-            let insts = block.insts.iter().flat_map(|i| i.reads.iter().map(|r| r.1));
-            insts.chain(block.phis.iter().flat_map(|phi| phi.args.iter().copied()))
+    // A scalar phi joining an `if`'s ways takes each console wave's own way
+    // ([`Lower::group_join`]).
+    let idom = region.join.map(|_| idoms(p));
+    let joined = |b: usize, phi: &crate::ir::Phi, n: usize| {
+        region.join.is_some_and(|(d, end)| {
+            let q = p.blocks[b].preds[n];
+            b == end
+                && inside(q)
+                && phi.args.len() == p.blocks[b].preds.len()
+                && (matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                    || phi.reg == Reg::Scc)
+                && !st.masks.contains_key(&phi.value)
+                && !st.highs.contains_key(&phi.value)
+                && p.blocks[b].preds.contains(&d)
+                && idom.as_ref().is_some_and(|idom| dominates(idom, d, q))
+        })
+    };
+    for (b, block) in p.blocks.iter().enumerate().filter(|&(b, _)| !inside(b)) {
+        let insts = block.insts.iter().flat_map(|i| i.reads.iter().map(|r| r.1));
+        let phis = block.phis.iter().flat_map(|phi| {
+            phi.args.iter().enumerate().filter(|&(n, _)| !joined(b, phi, n)).map(|(_, &a)| a)
         });
-    for v in outside_reads {
-        if written.contains(&v) {
+        if insts.chain(phis).any(|v| written.contains(&v)) {
             return Keep::fixed("a scalar written in a group-wide branch, read past it");
         }
     }
     None
+}
+
+/// Each IR block's immediate dominator in `p` ([`crate::ir::idoms`]).
+fn idoms(p: &Program) -> Vec<usize> {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (k, &b) in order.iter().enumerate() {
+        index[b] = k;
+    }
+    crate::ir::idoms(&p.blocks, &order, &index)
+}
+
+/// Whether block `h` dominates block `b`, by their immediate dominators.
+fn dominates(idom: &[usize], h: usize, mut b: usize) -> bool {
+    loop {
+        if b == h {
+            return true;
+        }
+        if idom[b] == b || idom[b] == usize::MAX {
+            return false;
+        }
+        b = idom[b];
+    }
 }
 
 /// The values that may differ between the console waves of a group: what
@@ -452,6 +534,9 @@ impl Lower<'_> {
                 if inside {
                     h.flags.insert(blk, own);
                 }
+            }
+            if let Some((d, end)) = region.join {
+                h.joins.entry(end).or_default().push(Join { d, blocks: region.blocks, own });
             }
         }
         Ok(if flip { self.not(group) } else { group })
@@ -577,6 +662,61 @@ impl Lower<'_> {
     }
 }
 
+/// An `if` the whole group takes ([`Lower::group_wide`]), at the block its
+/// ways join at.
+pub(super) struct Join {
+    /// The block its branch closes.
+    d: usize,
+    /// Per IR block: whether it lies in the `if`.
+    blocks: Vec<bool>,
+    /// Whether this console wave enters it.
+    own: V,
+}
+
+impl Lower<'_> {
+    /// `x`, what the scalar phi `i` of IR block `j` takes over the way from
+    /// block `q` (in DXIL block `at`), as each console wave takes it: where
+    /// `j` joins the ways of an `if` the whole group takes and `q` lies in
+    /// it, a console wave that would have skipped the `if` takes, instead,
+    /// what the phi takes from the `if`'s branch. It ran the `if`'s scalar
+    /// instructions with the group ([`skipping_wave_keeps_64`]). Innermost
+    /// `if` first.
+    pub(in super::super) fn group_join(
+        &mut self,
+        j: usize,
+        i: usize,
+        q: usize,
+        at: usize,
+        x: V,
+    ) -> Result<V, Why> {
+        let phi = &self.x.p.blocks[j].phis[i];
+        let scalar = matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1);
+        if !scalar && phi.reg != Reg::Scc {
+            return Ok(x);
+        }
+        let Some(joins) = self.halves.as_ref().and_then(|h| h.joins.get(&j)) else {
+            return Ok(x);
+        };
+        let mut around: Vec<(usize, usize, V)> = joins
+            .iter()
+            .filter(|r| r.blocks.get(q).copied().unwrap_or(false))
+            .map(|r| (r.blocks.iter().filter(|&&b| b).count(), r.d, r.own))
+            .collect();
+        around.sort_unstable_by_key(|&(size, d, _)| (size, d));
+        let mut v = x;
+        for (_, d, own) in around {
+            let preds = &self.x.p.blocks[j].preds;
+            let n = preds.iter().position(|&p| p == d).ok_or("an if joined past its branch")?;
+            let old = match (self.vals.get(&phi.args[n]).copied(), phi.reg == Reg::Scc) {
+                (Some(Val::I32(o)), false) | (Some(Val::Bit(o)), true) => o,
+                _ => return Err("a group-wide if joining a value with no DXIL form"),
+            };
+            v = self.s.m.select(at, own, v, old);
+        }
+        Ok(v)
+    }
+}
+
 impl Lower<'_> {
     /// Whether the scalar branch closing block `b` is one the whole group
     /// takes ([`apart_branches`]).
@@ -626,7 +766,7 @@ impl Lower<'_> {
         for d in self.x.st.wide.iter().chain(apart.iter()).copied() {
             // (a loop the group cannot take kept the program at 64-lane
             // waves, [`several_keep_64`])
-            if let Ok(Some(lp)) = group_loop(self.x.st, d) {
+            if let Ok(Some(lp)) = group_loop(self.x.p, self.x.st, d) {
                 loops.insert(d, lp);
             }
         }

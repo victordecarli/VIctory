@@ -7060,6 +7060,12 @@ impl<'a> Lower<'a> {
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
+                let x = if self.read_phis.contains(&phi.value) {
+                    self.group_join(b, i, q, qb, x)
+                        .map_err(|w| Stop::Retry(phi.value, w))?
+                } else {
+                    x
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
