@@ -208,6 +208,14 @@ accepts; for compute, how many of those need 64-lane waves), aggregate
 numbers only; `cargo xtask progress --record <file>` turns
 them into the [Shader translation](#shader-translation) block.
 
+Every count is of entry points, not of files or containers: each native
+program a container holds is one program, counted under its stage. The
+vertex/pixel row also holds the merged geometry stages (LS, HS, ES, GS),
+which are found but not translated. A run translates fewer: the first
+vertex, pixel, compute or mesh program of each container the title
+creates a pipeline from. A container holding a second such program would
+count it here and never run it.
+
 `victory translate` also reads:
 
 | Variable | Effect |
