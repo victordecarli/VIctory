@@ -53,6 +53,10 @@ pub(crate) struct Lowered {
     /// Reads of another lane emitted.
     #[cfg(test)]
     pub lane_reads: u32,
+    /// Memory accesses run only by a console wave that would enter their
+    /// group-wide branch ([`halves`]).
+    #[cfg(test)]
+    pub flagged_accesses: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -242,6 +246,9 @@ struct Lower<'a> {
     abort: Option<usize>,
     /// A console wave64 program run as two host waves of 32 ([`halves`]).
     halves: Option<halves::Halves>,
+    /// See [`Lowered::flagged_accesses`].
+    #[cfg(test)]
+    flagged_accesses: u32,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -552,6 +559,8 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             halves: split,
+            #[cfg(test)]
+            flagged_accesses: 0,
         }
     }
 
@@ -956,6 +965,8 @@ impl<'a> Lower<'a> {
             barriers: self.s.barriers,
             #[cfg(test)]
             lane_reads: self.s.lane_reads,
+            #[cfg(test)]
+            flagged_accesses: self.flagged_accesses,
             wave_size: self.s.wave_size,
             dxil: self.s.finish().map_err(Stop::Fail)?,
             user_data,
@@ -2379,15 +2390,17 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
-            Fields::Smem { .. } => self.smem(inst, (b, i)),
+            Fields::Smem { .. } => self.flagged(b, inst, |l| l.smem(inst, (b, i))),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
-            Fields::Image { .. } => self.image(inst, b, i),
-            Fields::Buffer { .. } => self.buffer(inst, b, i),
+            Fields::Image { .. } => self.flagged(b, inst, |l| l.image(inst, b, i)),
+            Fields::Buffer { .. } => self.flagged(b, inst, |l| l.buffer(inst, b, i)),
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i),
-            Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
+            Fields::Flat { .. } if name.starts_with("global_") => {
+                self.flagged(b, inst, |l| l.flat(inst, b, i))
+            }
             Fields::Flat { .. } => Err("flat memory"),
         };
         match r {

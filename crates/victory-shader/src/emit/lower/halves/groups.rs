@@ -8,9 +8,11 @@
 //! wave would, and inside, each console wave runs its vector instructions
 //! only if it would have entered: its decision is a flag added to every
 //! guard there ([`Lower::group_flag`]), so a wave that would have skipped
-//! the region keeps its VGPRs and stores nothing. Every console wave thus
-//! meets the others at the same group barriers, the only ones that are
-//! well defined. A scalar branch the console waves may take apart, around
+//! the region keeps its VGPRs and stores nothing, and it accesses no memory
+//! there ([`Lower::flagged`]): its scalars may hold anything, an index past
+//! the descriptor heap among them. Every console wave thus meets the others
+//! at the same group barriers, the only ones that are well defined, the
+//! program's own included. A scalar branch the console waves may take apart, around
 //! such a place, is taken so too ([`apart_branches`]). A way that only ends
 //! the program (`if (...) return;`) counts as the region's join
 //! ([`group_region`]).
@@ -94,6 +96,30 @@ fn bare_end(p: &Program, st: &Structured, b: usize) -> bool {
     st.exits[b] == LaneExit::End && p.blocks[b].insts.iter().all(|i| i.name() == "s_endpgm")
 }
 
+/// Whether `inst` accesses memory other than LDS: what [`Lower::flagged`]
+/// runs only where the console wave would.
+fn memory_access(inst: &Inst) -> bool {
+    match inst.fields {
+        Fields::Smem { .. } | Fields::Image { .. } | Fields::Buffer { .. } => true,
+        Fields::Flat { .. } => inst.name().starts_with("global_"),
+        Fields::Sop { .. }
+        | Fields::Sopp { .. }
+        | Fields::Valu(_)
+        | Fields::Vintrp { .. }
+        | Fields::Ds { .. }
+        | Fields::Exp { .. } => false,
+    }
+}
+
+/// Whether `inst` reads a lane mask other than EXEC (which every vector
+/// instruction reads) as an operand.
+fn reads_mask(st: &Structured, inst: &Inst) -> bool {
+    inst.reads.iter().any(|&(r, v)| {
+        !matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)
+            && (st.masks.contains_key(&v) || st.highs.contains_key(&v))
+    })
+}
+
 /// Whether `inst` is where the halves or the group meet: a lane read, a
 /// lane mask read as a number, an LDS access (with LDS of the program's
 /// own), or a group barrier. (Whole-wave sections are per block.)
@@ -127,7 +153,7 @@ pub(super) fn several_keep_64(
             Ok(r) => r,
             Err(why) => return Keep::fixed(why),
         };
-        if let Some(keep) = skipping_wave_keeps_64(p, &region) {
+        if let Some(keep) = skipping_wave_keeps_64(p, st, &region) {
             return Some(keep);
         }
     }
@@ -166,10 +192,14 @@ pub(super) fn apart_branches(p: &Program, st: &Structured, lds: bool) -> Option<
 
 /// What a console wave that would have skipped `region`, but runs its
 /// scalar instructions, could get wrong: a scalar store or atomic, a lane
-/// write (which ignores EXEC), a group barrier of the program's own, or a
-/// scalar written there and read outside it (EXEC aside: inside, a
-/// skipping wave's lanes stay out of it, and it is restored as it was).
-fn skipping_wave_keeps_64(p: &Program, region: &GroupRegion) -> Option<Keep> {
+/// write (which ignores EXEC), or a scalar written there and read outside
+/// it (EXEC aside: inside, a skipping wave's lanes stay out of it, and it
+/// is restored as it was). A group barrier of the program's own is no
+/// trouble: every console wave reaches it, with the group. Nor is a memory
+/// access ([`Lower::flagged`]), but for one reading a lane mask as a
+/// number, whose ballot could have the halves meet where only some console
+/// waves run.
+fn skipping_wave_keeps_64(p: &Program, st: &Structured, region: &GroupRegion) -> Option<Keep> {
     let inside = |b: usize| region.blocks.get(b).copied().unwrap_or(false);
     let mut written = HashSet::new();
     for (b, block) in p.blocks.iter().enumerate().filter(|&(b, _)| inside(b)) {
@@ -181,10 +211,11 @@ fn skipping_wave_keeps_64(p: &Program, region: &GroupRegion) -> Option<Keep> {
             let n = inst.name();
             let scalar_store = matches!(inst.fields, Fields::Smem { .. })
                 && (n.contains("store") || n.contains("atomic"));
-            if scalar_store || n == "v_writelane_b32" || n == "s_barrier" {
-                return Keep::fixed(
-                    "a group-wide branch around a scalar store, a lane write or a group barrier",
-                );
+            if scalar_store || n == "v_writelane_b32" {
+                return Keep::fixed("a group-wide branch around a scalar store or a lane write");
+            }
+            if memory_access(inst) && reads_mask(st, inst) {
+                return Keep::fixed("a memory access reading a lane mask in a group-wide branch");
             }
             for &(r, w) in &inst.writes {
                 if matches!(r, Reg::S(c) if c != EXEC && c != EXEC + 1) || r == Reg::Scc {
@@ -368,6 +399,58 @@ impl Lower<'_> {
             Some(g) => self.s.m.bin(self.cur, Bin::And, g, f),
             None => f,
         })
+    }
+}
+
+impl Lower<'_> {
+    /// `lower`, the lowering of `inst`, an access to memory in IR block `b`
+    /// ([`memory_access`]), run only by a console wave that would have
+    /// entered the group-wide region around it ([`Self::group_wide`]): one
+    /// that would have skipped it may hold anything in its scalars there, so
+    /// it makes no handle and reads nothing. What `inst` writes keeps, where
+    /// it did not run, a VGPR's old value, and zero for anything else (a
+    /// scalar the wave never reads, [`skipping_wave_keeps_64`]).
+    pub(in super::super) fn flagged(
+        &mut self,
+        b: usize,
+        inst: &Inst,
+        lower: impl FnOnce(&mut Self) -> Result<(), Why>,
+    ) -> Result<(), Why> {
+        let Some(flag) = self.halves.as_ref().and_then(|h| h.flags.get(&b).copied()) else {
+            return lower(self);
+        };
+        // Made before the branch, so that they hold on the way around it.
+        let mut outside = Vec::with_capacity(inst.writes.len());
+        for &(r, w) in &inst.writes {
+            let old = match (r, inst.read(r).map(|o| self.i32_of(o))) {
+                (Reg::V(_), Some(Ok(o))) => o,
+                // The validator refuses reads of undef.
+                _ => self.s.m.i32(0),
+            };
+            outside.push((w, old));
+        }
+        let at = self.begin_guarded(Some(flag));
+        #[cfg(test)]
+        {
+            self.flagged_accesses += u32::from(at.is_some());
+        }
+        let lowered = lower(self);
+        let mut joins = Vec::new();
+        let mut written = Vec::new();
+        for (w, old) in outside {
+            let (x, old, bit) = match self.vals.get(&w).copied() {
+                Some(Val::I32(x)) => (x, old, false),
+                Some(Val::Bit(x)) => (x, self.s.m.bool(false), true),
+                Some(Val::Missing(_)) | None => continue,
+            };
+            joins.push((x, old));
+            written.push((w, bit));
+        }
+        let joined = self.end_guarded(at, &joins);
+        for ((w, bit), v) in written.into_iter().zip(joined) {
+            self.vals.insert(w, if bit { Val::Bit(v) } else { Val::I32(v) });
+        }
+        lowered
     }
 }
 
