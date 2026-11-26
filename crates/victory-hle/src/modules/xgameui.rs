@@ -39,7 +39,8 @@ unsafe extern "system" fn profile_card_async(
     xuid: u64,
 ) -> HRESULT {
     tracing::info!(xuid, "profile card: nothing to show");
-    xasync::finished(block, (&raw const PROFILE).cast(), S_OK)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const PROFILE).cast(), S_OK) }
 }
 /// The result of [`profile_card_async`].
 ///
@@ -49,7 +50,8 @@ unsafe extern "system" fn profile_card_async(
 /// valid for reads and writes.
 unsafe extern "system" fn profile_card_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
-    xasync::XAsyncGetResult(block, (&raw const PROFILE).cast(), 0, none, none.cast())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetResult(block, (&raw const PROFILE).cast(), 0, none, none.cast()) }
 }
 
 /// Grand Theft Auto VI treats `E_ABORT` as cancelled and goes on; any
@@ -73,20 +75,23 @@ unsafe extern "system" fn text_entry_async(
     let [title, description, default] =
         [title, description, default].map(|t| text(t).unwrap_or_default());
     tracing::info!(title, description, max_length, "text entry");
-    xasync::pending_with(block, (&raw const TEXT).cast(), move || {
-        match ask(&title, &description, &default, max_length) {
-            Some(typed) => {
-                tracing::info!(length = typed.chars().count(), "text entry: done");
-                let mut bytes = limit(&typed, max_length).into_bytes();
-                bytes.push(0);
-                Ok(bytes)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        xasync::pending_with(block, (&raw const TEXT).cast(), move || {
+            match ask(&title, &description, &default, max_length) {
+                Some(typed) => {
+                    tracing::info!(length = typed.chars().count(), "text entry: done");
+                    let mut bytes = limit(&typed, max_length).into_bytes();
+                    bytes.push(0);
+                    Ok(bytes)
+                }
+                None => {
+                    tracing::info!("text entry: cancelled");
+                    Err(E_ABORT)
+                }
             }
-            None => {
-                tracing::info!("text entry: cancelled");
-                Err(E_ABORT)
-            }
-        }
-    })
+        })
+    }
 }
 /// Bytes of the result, its NUL included.
 ///
@@ -100,7 +105,8 @@ unsafe extern "system" fn text_entry_size(
     out: *mut u32,
 ) -> HRESULT {
     let mut size = 0;
-    let hr = xasync::XAsyncGetResultSize(block, &mut size);
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let hr = unsafe { xasync::XAsyncGetResultSize(block, &mut size) };
     if hr < 0 {
         return hr;
     }
@@ -122,7 +128,10 @@ unsafe extern "system" fn text_entry_result(
 ) -> HRESULT {
     let mut written = 0;
     let identity = (&raw const TEXT).cast();
-    let hr = xasync::XAsyncGetResult(block, identity, size as usize, buffer.cast(), &mut written);
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let hr = unsafe {
+        xasync::XAsyncGetResult(block, identity, size as usize, buffer.cast(), &mut written)
+    };
     if hr < 0 || used.is_null() {
         return hr;
     }
@@ -317,7 +326,8 @@ mod tests {
         let card = method::<Card>(&OBJECT, 0x38);
         // SAFETY: `b` outlives the call, which completes before it is read.
         assert_eq!(unsafe { card(this, &mut b, std::ptr::null(), 1) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, S_OK);
         // SAFETY: `b` is the block just started.
         assert_eq!(unsafe { method::<Done>(&OBJECT, 0x40)(this, &mut b) }, S_OK);
 
@@ -340,7 +350,8 @@ mod tests {
         // SAFETY: NUL-terminated literals and null for the rest; `b`
         // outlives the call.
         assert_eq!(unsafe { entry(this, &mut b, c"Name".as_ptr(), null, null, 0, 16) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), E_ABORT);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, E_ABORT);
         let mut size = 0;
         let get_size = method::<Size>(&OBJECT, 0x90);
         // SAFETY: `b` is the block just started, `size` a local to write.
@@ -350,7 +361,8 @@ mod tests {
         let default = c"abc".as_ptr();
         // SAFETY: as above.
         assert_eq!(unsafe { entry(this, &mut b, c"Type".as_ptr(), null, default, 0, 6) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, S_OK);
         // SAFETY: as above.
         assert_eq!(unsafe { get_size(this, &mut b, &mut size) }, S_OK);
         assert_eq!(size, 7);

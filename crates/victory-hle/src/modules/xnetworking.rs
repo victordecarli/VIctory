@@ -73,7 +73,8 @@ static PORT: u8 = 0;
 /// `block` is null or an async block valid for reads and writes until the
 /// call this starts has completed and its result has been read.
 unsafe extern "system" fn udp_port_async(_: This, block: *mut AsyncBlock) -> HRESULT {
-    xasync::finished_with(block, (&raw const PORT).cast(), Ok(xasync::bytes(UDP_PORT)))
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished_with(block, (&raw const PORT).cast(), Ok(xasync::bytes(UDP_PORT))) }
 }
 /// The port from [`udp_port_async`].
 ///
@@ -86,7 +87,8 @@ unsafe extern "system" fn udp_port_result(
     block: *mut AsyncBlock,
     out: *mut u16,
 ) -> HRESULT {
-    xasync::result(block, (&raw const PORT).cast(), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::result(block, (&raw const PORT).cast(), out) }
 }
 
 static SECURITY: u8 = 0;
@@ -105,7 +107,8 @@ unsafe extern "system" fn security_info_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     tracing::debug!(url = text(url).unwrap_or_default(), "security information: offline");
-    xasync::finished(block, (&raw const SECURITY).cast(), UNREACHABLE)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const SECURITY).cast(), UNREACHABLE) }
 }
 /// The size of the security information's result.
 ///
@@ -118,7 +121,8 @@ unsafe extern "system" fn security_info_size(
     block: *mut AsyncBlock,
     out: *mut usize,
 ) -> HRESULT {
-    xasync::XAsyncGetResultSize(block, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetResultSize(block, out) }
 }
 /// The security information itself (never, offline).
 ///
@@ -135,7 +139,10 @@ unsafe extern "system" fn security_info_result(
     buffer: *mut u8,
     _info: *mut *const c_void,
 ) -> HRESULT {
-    xasync::XAsyncGetResult(block, (&raw const SECURITY).cast(), size, buffer.cast(), used)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        xasync::XAsyncGetResult(block, (&raw const SECURITY).cast(), size, buffer.cast(), used)
+    }
 }
 
 /// No security information can exist offline, so no certificate passes.
@@ -225,7 +232,8 @@ mod tests {
         let mut b = block();
         // SAFETY: `b` outlives the call, which completes before it is read.
         assert_eq!(unsafe { method::<Begin>(&OBJECT, 0x20)(this, &mut b) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, S_OK);
         let mut port = 0;
         // SAFETY: `b` is the block just started, `port` a local to write.
         assert_eq!(unsafe { method::<Port>(&OBJECT, 0x28)(this, &mut b, &mut port) }, S_OK);
@@ -237,7 +245,8 @@ mod tests {
         let url = c"https://example.invalid/";
         // SAFETY: a NUL-terminated literal; `b` outlives the call.
         assert_eq!(unsafe { method::<Url>(&OBJECT, 0x40)(this, url.as_ptr(), &mut b) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), UNREACHABLE);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, UNREACHABLE);
         let mut size = 0;
         let get_size = method::<Size>(&OBJECT, 0x48);
         // SAFETY: `b` is the block just started, `size` a local to write.
