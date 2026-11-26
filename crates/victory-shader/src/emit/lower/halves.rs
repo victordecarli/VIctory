@@ -89,6 +89,9 @@ pub(super) struct Halves {
     /// Per block joining the ways of an `if` the whole group takes: those
     /// `if`s ([`Lower::group_join`]).
     joins: HashMap<usize, Vec<groups::Join>>,
+    /// Per block joining the ways of an `if` with an `else` the whole group
+    /// takes: that `if` ([`Lower::group_else`]).
+    arms: HashMap<usize, groups::Arms>,
 }
 
 impl Halves {
@@ -113,6 +116,7 @@ impl Halves {
             loops: None,
             acts: HashMap::new(),
             joins: HashMap::new(),
+            arms: HashMap::new(),
         }
     }
 

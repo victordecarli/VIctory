@@ -15,7 +15,11 @@
 //! program's own included. A scalar branch the console waves may take apart, around
 //! such a place, is taken so too ([`apart_branches`]). A way that only ends
 //! the program (`if (...) return;`) counts as the region's join
-//! ([`group_region`]).
+//! ([`group_region`]). An `if` with an `else` is taken where only one way
+//! has such a place ([`group_if_else`]): the group runs that way as the
+//! region, then each console wave that takes the other, quiet, way runs it
+//! on its own, by a branch of its own ([`Lower::group_else`]), so each
+//! comes to the join by its own way.
 //!
 //! A loop around such a place whose branch is its one way out, passed every
 //! round, is taken so too ([`group_loop`]): the group goes round while some
@@ -43,6 +47,11 @@ pub(super) struct GroupRegion {
     /// at, whose scalar phis each console wave takes by its own way
     /// ([`Lower::group_join`]). None for a loop.
     pub(super) join: Option<(usize, usize)>,
+    /// For an `if` with an `else` where the halves and the group meet on one
+    /// way only (the region): where the other, quiet, way begins, which each
+    /// console wave that takes it runs on its own once the group ran the
+    /// region ([`Lower::group_target`]).
+    pub(super) quiet: Option<usize>,
 }
 
 /// The successors of each IR block, None with an indirect exit.
@@ -82,8 +91,15 @@ fn region_of(succ: &[Vec<usize>], pdom: &[Vec<bool>], d: usize) -> (Vec<bool>, b
 /// an `if` without an `else` (one way is the join), not closing a loop. A
 /// way that only ends the program (`if (...) return;`, [`bare_end`]) joins
 /// at the end: a console wave that would have ended there runs the rest
-/// with the group, its flag guarding it, and ends with it.
-pub(super) fn group_region(p: &Program, st: &Structured, d: usize) -> Result<GroupRegion, Why> {
+/// with the group, its flag guarding it, and ends with it. An `if` with an
+/// `else` is taken where only one way meets ([`group_if_else`]). `lds`: the
+/// program has LDS of its own.
+pub(super) fn group_region(
+    p: &Program,
+    st: &Structured,
+    d: usize,
+    lds: bool,
+) -> Result<GroupRegion, Why> {
     let succ = successors(st).ok_or("an indirect exit")?;
     let LaneExit::Branch { taken, not_taken, .. } = st.exits[d] else {
         return Err("a group-wide branch that is no branch");
@@ -97,15 +113,72 @@ pub(super) fn group_region(p: &Program, st: &Structured, d: usize) -> Result<Gro
     let enter = match (joins(taken), joins(not_taken)) {
         (true, false) => not_taken,
         (false, true) => taken,
-        _ => {
-            return Err(
-                "a lane branch with work on both ways around a meeting in a group of several console waves",
-            );
-        }
+        (false, false) => return group_if_else(p, st, &succ, &pdom, d, lds),
+        (true, true) => return Err(BOTH_WAYS),
     };
     let end = if enter == taken { not_taken } else { taken };
     blocks[end] = false;
-    Ok(GroupRegion { enter, blocks, join: Some((d, end)) })
+    Ok(GroupRegion { enter, blocks, join: Some((d, end)), quiet: None })
+}
+
+const BOTH_WAYS: Why =
+    "a lane branch with work on both ways around a meeting in a group of several console waves";
+
+/// The region the whole group takes at the branch closing block `d`, an
+/// `if` with an `else` whose ways join at the block first post-dominating
+/// `d`: the way where the halves or the group meet, the other way quiet
+/// (no such place, so no branch the group takes either). Each way begins
+/// at a block only `d` leads to, and the join is reached from the ways
+/// alone.
+fn group_if_else(
+    p: &Program,
+    st: &Structured,
+    succ: &[Vec<usize>],
+    pdom: &[Vec<bool>],
+    d: usize,
+    lds: bool,
+) -> Result<GroupRegion, Why> {
+    let LaneExit::Branch { taken, not_taken, .. } = st.exits[d] else {
+        return Err("a group-wide branch that is no branch");
+    };
+    let n = succ.len();
+    let first = |c: usize| (0..n).all(|o| o == d || !pdom[d][o] || pdom[c][o]);
+    let join = (0..n).find(|&c| c != d && pdom[d][c] && first(c)).ok_or(BOTH_WAYS)?;
+    let way = |s: usize| {
+        let mut blocks = vec![false; n];
+        let mut stack = vec![s];
+        while let Some(b) = stack.pop() {
+            if blocks[b] || pdom[d][b] {
+                continue;
+            }
+            blocks[b] = true;
+            stack.extend(&succ[b]);
+        }
+        blocks
+    };
+    let (t, f) = (way(taken), way(not_taken));
+    let meet = |w: &[bool]| (0..n).any(|b| w[b] && meets_in(p, st, b, lds));
+    let (enter, quiet, blocks) = match (meet(&t), meet(&f)) {
+        (true, false) => (taken, not_taken, t.clone()),
+        (false, true) => (not_taken, taken, f.clone()),
+        (true, true) | (false, false) => return Err(BOTH_WAYS),
+    };
+    let only_from_d = |b: usize| p.blocks[b].preds == [d];
+    let apart = (0..n).all(|b| !(t[b] && f[b]));
+    let joined = p.blocks[join].preds.iter().all(|&q| t[q] || f[q]);
+    if !(apart && joined && only_from_d(enter) && only_from_d(quiet)) {
+        return Err(BOTH_WAYS);
+    }
+    Ok(GroupRegion { enter, blocks, join: Some((d, join)), quiet: Some(quiet) })
+}
+
+/// Whether IR block `b` is where the halves or the group meet: a branch
+/// the console wave takes as one, a whole-wave section, or an instruction
+/// that [`meets`].
+fn meets_in(p: &Program, st: &Structured, b: usize, lds: bool) -> bool {
+    st.wide.contains(&b)
+        || !super::super::super::wave::sections(p, b).is_empty()
+        || p.blocks[b].insts.iter().any(|i| meets(st, i, lds))
 }
 
 /// Whether IR block `b` only ends the program: `s_endpgm` alone.
@@ -288,9 +361,9 @@ pub(super) fn several_keep_64(
         // (a console wave out of a loop runs its later rounds as one that skips them)
         let region = match loops.iter().find(|(e, _)| *e == d) {
             Some((_, lp)) => {
-                GroupRegion { enter: lp.header, blocks: lp.blocks.clone(), join: None }
+                GroupRegion { enter: lp.header, blocks: lp.blocks.clone(), join: None, quiet: None }
             }
-            None => match group_region(p, st, d) {
+            None => match group_region(p, st, d, lds_dwords > 0) {
                 Ok(r) => r,
                 Err(why) => return Keep::fixed(why),
             },
@@ -309,11 +382,7 @@ pub(super) fn several_keep_64(
 /// of its own. None with an indirect exit.
 pub(super) fn apart_branches(p: &Program, st: &Structured, lds: bool) -> Option<Vec<usize>> {
     let succ = successors(st)?;
-    let meet = |b: usize| {
-        st.wide.contains(&b)
-            || !super::super::super::wave::sections(p, b).is_empty()
-            || p.blocks[b].insts.iter().any(|i| meets(st, i, lds))
-    };
+    let meet = |b: usize| meets_in(p, st, b, lds);
     let pdom = post_dominators(&succ);
     let varying = group_varying(p, st, &succ, &pdom);
     let mut apart = Vec::new();
@@ -382,15 +451,18 @@ fn skipping_wave_keeps_64(p: &Program, st: &Structured, region: &GroupRegion) ->
     let joined = |b: usize, phi: &crate::ir::Phi, n: usize| {
         region.join.is_some_and(|(d, end)| {
             let q = p.blocks[b].preds[n];
+            let scalar = (matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                || phi.reg == Reg::Scc)
+                && !st.masks.contains_key(&phi.value)
+                && !st.highs.contains_key(&phi.value);
             b == end
                 && inside(q)
                 && phi.args.len() == p.blocks[b].preds.len()
-                && (matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1)
-                    || phi.reg == Reg::Scc)
-                && !st.masks.contains_key(&phi.value)
-                && !st.highs.contains_key(&phi.value)
-                && p.blocks[b].preds.contains(&d)
-                && idom.as_ref().is_some_and(|idom| dominates(idom, d, q))
+                // (past an `else`, each wave comes by its own way)
+                && (region.quiet.is_some()
+                    || scalar
+                        && p.blocks[b].preds.contains(&d)
+                        && idom.as_ref().is_some_and(|idom| dominates(idom, d, q)))
         })
     };
     for (b, block) in p.blocks.iter().enumerate().filter(|&(b, _)| !inside(b)) {
@@ -520,7 +592,8 @@ impl Lower<'_> {
         {
             return self.group_round(b, any, some);
         }
-        let region = group_region(self.x.p, self.x.st, b)?;
+        let lds = self.halves.as_ref().is_some_and(|h| h.lds);
+        let region = group_region(self.x.p, self.x.st, b, lds)?;
         let LaneExit::Branch { taken, .. } = self.x.st.exits[b] else {
             return Err("a group-wide branch that is no branch");
         };
@@ -535,11 +608,87 @@ impl Lower<'_> {
                     h.flags.insert(blk, own);
                 }
             }
-            if let Some((d, end)) = region.join {
-                h.joins.entry(end).or_default().push(Join { d, blocks: region.blocks, own });
+        }
+        match (region.join, region.quiet) {
+            (Some((d, end)), Some(quiet)) => self.group_else(d, end, quiet, region.blocks, own)?,
+            (Some((d, end)), None) => {
+                if let Some(h) = self.halves.as_mut() {
+                    h.joins.entry(end).or_default().push(Join { d, blocks: region.blocks, own });
+                }
             }
+            (None, _) => {}
         }
         Ok(if flip { self.not(group) } else { group })
+    }
+
+    /// The `else` of the `if` at block `d` ([`group_if_else`]): past the
+    /// region (`arm`), whose ways to `join` go to a block of their own, each
+    /// console wave goes on by its own decision `own`: to `join`, or into
+    /// the quiet way, which it runs on its own. The group comes there
+    /// straight from `d` when no console wave enters the region.
+    fn group_else(
+        &mut self,
+        d: usize,
+        join: usize,
+        quiet: usize,
+        arm: Vec<bool>,
+        own: V,
+    ) -> Result<(), Why> {
+        let (Some(j), Some(q)) = (self.block[join], self.block[quiet]) else {
+            return Err("an if with an else joining where the entry does not reach");
+        };
+        let (skip, dispatch) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(skip, Term::Br(dispatch));
+        self.s.m.terminate(dispatch, Term::CondBr(own, j, q));
+        let Some(h) = self.halves.as_mut() else {
+            return Err("a group-wide branch outside halves");
+        };
+        if h.arms.contains_key(&join) {
+            return Err("two ifs with an else the group takes joining at one block");
+        }
+        h.arms.insert(join, Arms { d, quiet, arm, skip, dispatch });
+        Ok(())
+    }
+
+    /// The DXIL block a way from IR block `from` to `to` goes to instead of
+    /// `to`'s, around an `if` with an `else` the whole group takes
+    /// ([`Self::group_else`]): from its branch into the quiet way, the block
+    /// the group comes by when no console wave enters the region; from the
+    /// region to the join, the block where each console wave goes its own
+    /// way.
+    pub(in super::super) fn group_target(&self, from: usize, to: usize) -> Option<usize> {
+        let arms = &self.halves.as_ref()?.arms;
+        if let Some(a) = arms.get(&to).filter(|a| a.arm.get(from).copied().unwrap_or(false)) {
+            return Some(a.dispatch);
+        }
+        arms.values().find(|a| a.d == from && a.quiet == to).map(|a| a.skip)
+    }
+
+    /// The incoming values of a phi of IR block `j`, each with its DXIL
+    /// block and its IR block. Where `j` joins an `if` with an `else` the
+    /// whole group takes, those from the region come to the join through
+    /// the block where each console wave goes its own way, by a phi there
+    /// (`zero` over the way the group takes when no console wave enters the
+    /// region: no console wave goes on from there to the join).
+    pub(in super::super) fn group_arms(
+        &mut self,
+        j: usize,
+        incoming: Vec<(V, usize, usize)>,
+        zero: V,
+    ) -> Vec<(V, usize)> {
+        let Some(a) = self.halves.as_ref().and_then(|h| h.arms.get(&j)) else {
+            return incoming.into_iter().map(|(x, at, _)| (x, at)).collect();
+        };
+        let (skip, dispatch) = (a.skip, a.dispatch);
+        let (inside, mut outside): (Vec<_>, Vec<_>) =
+            incoming.into_iter().partition(|&(_, _, q)| a.arm.get(q).copied().unwrap_or(false));
+        let ty = self.s.m.type_of(zero);
+        let phi = self.s.m.phi(dispatch, ty);
+        let mut through = vec![(zero, skip)];
+        through.extend(inside.into_iter().map(|(x, at, _)| (x, at)));
+        self.s.m.set_phi(phi, through);
+        outside.push((phi, dispatch, j));
+        outside.into_iter().map(|(x, at, _)| (x, at)).collect()
     }
 
     /// The group's vote at a branch it takes as one: each host wave posts
@@ -660,6 +809,22 @@ impl Lower<'_> {
         }
         lowered
     }
+}
+
+/// An `if` with an `else` the whole group takes ([`Lower::group_else`]), at
+/// the block its ways join at.
+pub(super) struct Arms {
+    /// The block its branch closes.
+    d: usize,
+    /// The block its quiet way begins at.
+    quiet: usize,
+    /// Per IR block: whether it lies in the region, the way the group runs.
+    arm: Vec<bool>,
+    /// The DXIL block the group comes by from `d` when no console wave
+    /// enters the region.
+    skip: usize,
+    /// The DXIL block where each console wave goes its own way.
+    dispatch: usize,
 }
 
 /// An `if` the whole group takes ([`Lower::group_wide`]), at the block its

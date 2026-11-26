@@ -6874,7 +6874,10 @@ impl<'a> Lower<'a> {
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
-                Term::Br(self.dxil_block(t)?)
+                match self.group_target(b, t) {
+                    Some(to) => Term::Br(to),
+                    None => Term::Br(self.dxil_block(t)?),
+                }
             }
             LaneExit::Branch {
                 when,
@@ -7006,7 +7009,10 @@ impl<'a> Lower<'a> {
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> Result<usize, Stop> {
-        let target = self.dxil_block(to)?;
+        let target = match self.group_target(from, to) {
+            Some(t) => t,
+            None => self.dxil_block(to)?,
+        };
         let preds = self.x.p.blocks[to]
             .preds
             .iter()
@@ -7066,8 +7072,10 @@ impl<'a> Lower<'a> {
                 } else {
                     x
                 };
-                incoming.push((x, qb));
+                incoming.push((x, qb, q));
             }
+            let zero = if bit { self.s.m.bool(false) } else { self.s.m.i32(0) };
+            let incoming = self.group_arms(b, incoming, zero);
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
@@ -7086,8 +7094,10 @@ impl<'a> Lower<'a> {
                         unsupported(offset, "a lane-mask join of an untracked mask")
                     })?;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
+                incoming.push((x, qb, q));
             }
+            let zero = self.s.m.bool(false);
+            let incoming = self.group_arms(b, incoming, zero);
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
