@@ -265,7 +265,8 @@ fn saves_persist_across_providers() {
     type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
     let mut b = block();
     assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
-    assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, S_OK);
     // SAFETY: this test's own locals, valid for the call.
     unsafe { close_update(this, update) };
     // SAFETY: this test's own locals, valid for the call.
@@ -303,9 +304,11 @@ fn saves_persist_across_providers() {
     let wanted = [c"world".as_ptr(), c"player.dat".as_ptr()];
     // SAFETY: this test's own locals, valid for the call.
     assert_eq!(unsafe { read_async(this, container, wanted.as_ptr(), 2, &mut b) }, S_OK);
-    assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, S_OK);
     let mut size = 0;
-    assert_eq!(xasync::XAsyncGetResultSize(&mut b, &mut size), S_OK);
+    // SAFETY: this test's own locals, valid for the call.
+    assert_eq!(unsafe { xasync::XAsyncGetResultSize(&mut b, &mut size) }, S_OK);
     assert_eq!(size, 2 * BLOB + "world\0hello".len() + "player.dat\0xy".len());
     let mut buffer = vec![0u64; size.div_ceil(8)];
     let mut count = 0;

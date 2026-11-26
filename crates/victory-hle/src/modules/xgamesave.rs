@@ -627,7 +627,8 @@ unsafe extern "system" fn initialize_async(
     } else {
         Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
     };
-    xasync::finished_with(block, (&raw const INIT).cast(), result)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished_with(block, (&raw const INIT).cast(), result) }
 }
 /// # Safety
 ///
@@ -639,7 +640,8 @@ unsafe extern "system" fn initialize_result(
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
-    xasync::result(block, (&raw const INIT).cast(), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::result(block, (&raw const INIT).cast(), out) }
 }
 /// # Safety
 ///
@@ -664,7 +666,8 @@ unsafe extern "system" fn quota_async(
     // SAFETY: as this function's contract gives them.
     let result =
         unsafe { get(provider) }.ok_or(E_INVALIDARG).map(|p| xasync::bytes(p.remaining() as i64));
-    xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result) }
 }
 /// # Safety
 ///
@@ -672,7 +675,8 @@ unsafe extern "system" fn quota_async(
 /// a structure or block of its type, a NUL-terminated string, or a buffer
 /// for its stated size, for the duration of the call.
 unsafe extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
-    xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::result(block, (&raw const QUOTA_CALL).cast(), out) }
 }
 
 /// # Safety
@@ -692,7 +696,8 @@ unsafe extern "system" fn delete_async(
         (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
         _ => E_INVALIDARG,
     };
-    xasync::finished(block, (&raw const DELETE).cast(), hr)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const DELETE).cast(), hr) }
 }
 /// # Safety
 ///
@@ -701,7 +706,8 @@ unsafe extern "system" fn delete_async(
 /// its stated size, for the duration of the call.
 unsafe extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
-    xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast()) }
 }
 
 /// Reports the container if it exists; a missing one is no error, the
@@ -875,7 +881,8 @@ unsafe extern "system" fn read_async(
         Some(c) => read(c, unsafe { names(blob_names, count) }).map(|blobs| layout(&blobs, 0)),
         None => Err(E_INVALIDARG),
     };
-    xasync::finished_with(block, (&raw const READ).cast(), result)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished_with(block, (&raw const READ).cast(), result) }
 }
 /// # Safety
 ///
@@ -890,7 +897,10 @@ unsafe extern "system" fn read_result(
     count: *mut u32,
 ) -> HRESULT {
     let mut used = 0;
-    let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let hr = unsafe {
+        xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used)
+    };
     // The documented error for a small buffer; the result stays for a
     // retry with a larger one.
     if hr == xasync::E_NOT_SUFFICIENT_BUFFER {
@@ -1020,7 +1030,8 @@ unsafe extern "system" fn submit_async(
 ) -> HRESULT {
     // SAFETY: as this function's contract gives them.
     let hr = unsafe { get(update) }.map_or(E_INVALIDARG, Update::submit);
-    xasync::finished(block, (&raw const SUBMIT).cast(), hr)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const SUBMIT).cast(), hr) }
 }
 /// # Safety
 ///
@@ -1029,7 +1040,8 @@ unsafe extern "system" fn submit_async(
 /// its stated size, for the duration of the call.
 unsafe extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
-    xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast()) }
 }
 
 static VTABLE: Methods<30> = Methods([

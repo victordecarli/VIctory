@@ -213,7 +213,8 @@ unsafe extern "system" fn install_chunks_async(
     // contract.
     let ours = unsafe { is_ours(id) };
     let result = if ours { Ok(xasync::bytes(monitor())) } else { Err(NO_PACKAGE) };
-    xasync::finished_with(block, (&raw const INSTALL).cast(), result)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished_with(block, (&raw const INSTALL).cast(), result) }
 }
 /// # Safety
 ///
@@ -225,7 +226,8 @@ unsafe extern "system" fn install_chunks_result(
     block: *mut AsyncBlock,
     out: *mut *const c_void,
 ) -> HRESULT {
-    xasync::result(block, (&raw const INSTALL).cast(), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::result(block, (&raw const INSTALL).cast(), out) }
 }
 
 /// Nothing to download.
@@ -306,7 +308,8 @@ unsafe extern "system" fn mount_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     tracing::info!(id = text(id).unwrap_or_default(), "package mount: not installed");
-    xasync::finished(block, (&raw const MOUNT).cast(), NO_PACKAGE)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const MOUNT).cast(), NO_PACKAGE) }
 }
 /// # Safety
 ///
@@ -318,7 +321,8 @@ unsafe extern "system" fn mount_result(
     block: *mut AsyncBlock,
     out: *mut *const c_void,
 ) -> HRESULT {
-    xasync::result(block, (&raw const MOUNT).cast(), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::result(block, (&raw const MOUNT).cast(), out) }
 }
 
 /// Titles enumerate content packages (kind 1); there are none.
@@ -430,6 +434,7 @@ mod tests {
         let mount = method::<Mount>(&OBJECT, 0x128);
         // SAFETY: a NUL-terminated literal; `block` outlives the call.
         assert_eq!(unsafe { mount(this, c"dlc".as_ptr(), &mut block) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut block, true) }, NO_PACKAGE);
     }
 }

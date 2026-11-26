@@ -58,7 +58,8 @@ static GAME_LICENSE: u8 = 0;
 /// call this starts has completed and its result has been read.
 unsafe fn offline(block: *mut AsyncBlock, what: &str) -> HRESULT {
     tracing::info!(what, "store call: offline");
-    xasync::finished(block, (&raw const FAILED).cast(), NETWORK_ERROR)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const FAILED).cast(), NETWORK_ERROR) }
 }
 /// The result functions of calls that failed: their status.
 ///
@@ -67,7 +68,8 @@ unsafe fn offline(block: *mut AsyncBlock, what: &str) -> HRESULT {
 /// `block` is null or the async block of a call this object started, still
 /// valid for reads and writes.
 unsafe extern "system" fn status(_: This, block: *mut AsyncBlock) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetStatus(block, false) }
 }
 
 /// # Safety
@@ -110,7 +112,14 @@ unsafe extern "system" fn entitled_products_async(
     _per_page: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    xasync::finished_with(block, (&raw const QUERY_CALL).cast(), Ok(xasync::bytes(handle(&QUERY))))
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        xasync::finished_with(
+            block,
+            (&raw const QUERY_CALL).cast(),
+            Ok(xasync::bytes(handle(&QUERY))),
+        )
+    }
 }
 /// # Safety
 ///
@@ -122,7 +131,8 @@ unsafe extern "system" fn query_result(
     block: *mut AsyncBlock,
     out: *mut Handle,
 ) -> HRESULT {
-    xasync::result(block, (&raw const QUERY_CALL).cast(), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::result(block, (&raw const QUERY_CALL).cast(), out) }
 }
 /// Empty, so the callback never runs.
 extern "system" fn enumerate_products(
@@ -143,7 +153,8 @@ extern "system" fn has_more_pages(_: This, _: Handle) -> bool {
 /// `block` is null or an async block valid for reads and writes until the
 /// call this starts has completed and its result has been read.
 unsafe extern "system" fn next_page_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
-    xasync::finished(block, (&raw const QUERY_CALL).cast(), E_ILLEGAL_METHOD_CALL)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const QUERY_CALL).cast(), E_ILLEGAL_METHOD_CALL) }
 }
 
 /// The licence handle of a call that completes at once.
@@ -154,7 +165,10 @@ unsafe extern "system" fn next_page_async(_: This, _: Handle, block: *mut AsyncB
 /// call this starts has completed and its result has been read.
 unsafe fn license_for(owned: bool, block: *mut AsyncBlock) -> HRESULT {
     let license = handle(if owned { &VALID } else { &INVALID });
-    xasync::finished_with(block, (&raw const LICENSE_CALL).cast(), Ok(xasync::bytes(license)))
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        xasync::finished_with(block, (&raw const LICENSE_CALL).cast(), Ok(xasync::bytes(license)))
+    }
 }
 /// Only the game's own package is installed, so only its licence is valid.
 ///
@@ -202,7 +216,8 @@ unsafe extern "system" fn license_result(
     block: *mut AsyncBlock,
     out: *mut Handle,
 ) -> HRESULT {
-    xasync::result(block, (&raw const LICENSE_CALL).cast(), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::result(block, (&raw const LICENSE_CALL).cast(), out) }
 }
 extern "system" fn is_license_valid(_: This, license: Handle) -> bool {
     license == handle(&VALID)
@@ -251,7 +266,8 @@ unsafe extern "system" fn game_license_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let license = xasync::bytes(game_license());
-    xasync::finished_with(block, (&raw const GAME_LICENSE).cast(), Ok(license))
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished_with(block, (&raw const GAME_LICENSE).cast(), Ok(license)) }
 }
 /// # Safety
 ///
@@ -263,7 +279,8 @@ unsafe extern "system" fn game_license_result(
     block: *mut AsyncBlock,
     out: *mut GameLicense,
 ) -> HRESULT {
-    xasync::result(block, (&raw const GAME_LICENSE).cast(), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::result(block, (&raw const GAME_LICENSE).cast(), out) }
 }
 
 /// # Safety
@@ -322,7 +339,8 @@ unsafe extern "system" fn size_status(
     block: *mut AsyncBlock,
     _out: *mut usize,
 ) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetStatus(block, false) }
 }
 /// # Safety
 ///
@@ -334,14 +352,16 @@ unsafe extern "system" fn string_status(
     _: usize,
     _: *mut c_char,
 ) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetStatus(block, false) }
 }
 /// # Safety
 ///
 /// `block` is null or the async block of a call this object started, still
 /// valid for reads and writes. `_out` is not written.
 unsafe extern "system" fn count_status(_: This, block: *mut AsyncBlock, _out: *mut u32) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetStatus(block, false) }
 }
 /// # Safety
 ///
@@ -353,7 +373,8 @@ unsafe extern "system" fn array_status(
     _: u32,
     _: *mut c_void,
 ) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetStatus(block, false) }
 }
 
 /// # Safety
@@ -574,7 +595,8 @@ mod tests {
         let begin = method::<Begin>(&OBJECT, 0xe0);
         // SAFETY: `b` outlives the call, which completes before it is read.
         assert_eq!(unsafe { begin(this, handle(&CONTEXT), &mut b) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, S_OK);
         let mut license = std::mem::MaybeUninit::<GameLicense>::zeroed();
         let get = method::<Result>(&OBJECT, 0xe8);
         // SAFETY: `b` is the block just started; `license` has room for one.
@@ -587,7 +609,8 @@ mod tests {
         let updates = method::<Begin>(&OBJECT, 0x1b8);
         // SAFETY: `b` outlives the call, which completes before it is read.
         assert_eq!(unsafe { updates(this, handle(&CONTEXT), &mut b) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, NETWORK_ERROR);
         type Count = unsafe extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
         let count = method::<Count>(&OBJECT, 0x1c0);
         // SAFETY: `b` is the block just started, the count a temporary.
@@ -600,7 +623,8 @@ mod tests {
         let durable = method::<Durable>(&OBJECT, 0x238);
         // SAFETY: a NUL-terminated literal; `b` outlives the call.
         assert_eq!(unsafe { durable(this, handle(&CONTEXT), c"9XYZ".as_ptr(), &mut b) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut b, true) }, S_OK);
         let mut l = std::ptr::null();
         let license_result = method::<License>(&OBJECT, 0x240);
         // SAFETY: `b` is the block just started, `l` a local to write.

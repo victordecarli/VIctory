@@ -102,7 +102,8 @@ extern "system" fn add_provider(op: u32, data: *const ProviderData) -> HRESULT {
     // SAFETY: the async runtime passes valid provider data.
     let data = unsafe { &*data };
     match op {
-        BEGIN => xasync::XAsyncComplete(data.block, S_OK, size_of::<Handle>()),
+        // SAFETY: the call on this block is in flight, so the block is valid.
+        BEGIN => unsafe { xasync::XAsyncComplete(data.block, S_OK, size_of::<Handle>()) },
         GET_RESULT => return put(data.buffer.cast::<Handle>(), user()),
         _ => {}
     }
@@ -120,13 +121,16 @@ static ADD: u8 = 0;
 /// call this starts has completed and its result has been read.
 unsafe extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> HRESULT {
     tracing::info!(options, "XUserAddAsync: the offline local user");
-    xasync::XAsyncBegin(
-        block,
-        std::ptr::null_mut(),
-        (&raw const ADD).cast(),
-        std::ptr::null(),
-        Some(add_provider),
-    )
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        xasync::XAsyncBegin(
+            block,
+            std::ptr::null_mut(),
+            (&raw const ADD).cast(),
+            std::ptr::null(),
+            Some(add_provider),
+        )
+    }
 }
 /// The user added by [`add_async`].
 ///
@@ -136,13 +140,16 @@ unsafe extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBloc
 /// valid for reads and writes. `out` is null or valid for a write of a user
 /// handle.
 unsafe extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
-    xasync::XAsyncGetResult(
-        block,
-        (&raw const ADD).cast(),
-        size_of::<Handle>(),
-        out.cast(),
-        std::ptr::null_mut(),
-    )
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        xasync::XAsyncGetResult(
+            block,
+            (&raw const ADD).cast(),
+            size_of::<Handle>(),
+            out.cast(),
+            std::ptr::null_mut(),
+        )
+    }
 }
 /// # Safety
 ///
@@ -253,7 +260,8 @@ unsafe extern "system" fn resolve_privilege_async(
     _privilege: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    xasync::finished(block, (&raw const RESOLVE).cast(), S_OK)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const RESOLVE).cast(), S_OK) }
 }
 /// The result of [`resolve_privilege_async`].
 ///
@@ -263,7 +271,8 @@ unsafe extern "system" fn resolve_privilege_async(
 /// valid for reads and writes.
 unsafe extern "system" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
-    xasync::XAsyncGetResult(block, (&raw const RESOLVE).cast(), 0, none, none.cast())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetResult(block, (&raw const RESOLVE).cast(), 0, none, none.cast()) }
 }
 
 /// The documented "failed to get token": tokens come from the service.
@@ -291,7 +300,8 @@ unsafe extern "system" fn token_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     tracing::info!(url = text(url).unwrap_or_default(), "token and signature: offline");
-    xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN) }
 }
 /// The size of the token result.
 ///
@@ -301,7 +311,8 @@ unsafe extern "system" fn token_async(
 /// valid for reads and writes. `out` is null or valid for a write of a
 /// `usize`.
 unsafe extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
-    xasync::XAsyncGetResultSize(block, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetResultSize(block, out) }
 }
 /// The token result.
 ///
@@ -318,7 +329,8 @@ unsafe extern "system" fn token_result(
     _data: *mut *const c_void,
     used: *mut usize,
 ) -> HRESULT {
-    xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used) }
 }
 
 /// The user never changes and no device is ever associated, so these
@@ -443,7 +455,8 @@ mod tests {
         };
         // SAFETY: `block` outlives the call, which completes before it is read.
         assert_eq!(unsafe { slot::<Add>(&OBJECT, 0x38)(this, 1, &mut block) }, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut block, true) }, S_OK);
         let mut handle = std::ptr::null();
         let add_result = slot::<AddResult>(&OBJECT, 0x40);
         // SAFETY: `block` is the block just started, `handle` a local to write.
@@ -489,6 +502,7 @@ mod tests {
             token(this, handle, 0, c"GET".as_ptr(), url.as_ptr(), 0, null, 0, null, &mut block)
         };
         assert_eq!(begun, S_OK);
-        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), FAILED_TO_GET_TOKEN);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut block, true) }, FAILED_TO_GET_TOKEN);
     }
 }

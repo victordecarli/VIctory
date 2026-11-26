@@ -156,7 +156,8 @@ static PROMPT: u8 = 0;
 /// call this starts has completed and its result has been read.
 unsafe extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
     let hr = if bytes <= space().total_free { S_OK } else { E_ABORT };
-    xasync::finished(block, (&raw const PROMPT).cast(), hr)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::finished(block, (&raw const PROMPT).cast(), hr) }
 }
 
 /// The answer from [`prompt_for_space`].
@@ -167,7 +168,8 @@ unsafe extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut Asyn
 /// valid for reads and writes.
 unsafe extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
-    xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast()) }
 }
 
 static VTABLE: Methods<8> = Methods([
@@ -242,7 +244,8 @@ mod tests {
             };
             // SAFETY: `block` outlives the call, which completes before it is read.
             assert_eq!(unsafe { prompt(this, bytes, &mut block) }, S_OK);
-            assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
+            // SAFETY: this test's own locals, valid for the call.
+            assert_eq!(unsafe { xasync::XAsyncGetStatus(&mut block, true) }, expect);
             // SAFETY: `block` is the block just started.
             assert_eq!(unsafe { result(this, &mut block) }, expect, "{bytes} bytes");
         }

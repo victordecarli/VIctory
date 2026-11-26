@@ -11,10 +11,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`XTaskQueueCreate`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -240,18 +236,26 @@ fn process_queue() -> Option<Arc<Queue>> {
 }
 
 /// A new reference to the queue behind `handle` (null: the process queue).
-fn queue(handle: *const Queue) -> Option<Arc<Queue>> {
+///
+/// # Safety
+///
+/// `handle` is null or a queue handle we returned that is not yet closed.
+unsafe fn queue(handle: *const Queue) -> Option<Arc<Queue>> {
     if handle.is_null() {
         return process_queue();
     }
-    // SAFETY: a handle we returned, which the title has not closed.
+    // SAFETY: an open handle we returned (the caller's contract), so it is
+    // `Arc::into_raw` of a queue with a reference of its own.
     unsafe {
         Arc::increment_strong_count(handle);
         Some(Arc::from_raw(handle))
     }
 }
 
-pub fn XTaskQueueCreate(work: u32, completion: u32, out: *mut *const Queue) -> HRESULT {
+/// # Safety
+///
+/// `out` is null or valid for a write of a queue handle.
+pub unsafe fn XTaskQueueCreate(work: u32, completion: u32, out: *mut *const Queue) -> HRESULT {
     let (Some(work), Some(completion)) = (Mode::from_raw(work), Mode::from_raw(completion)) else {
         return E_INVALIDARG;
     };
@@ -265,8 +269,18 @@ pub fn XTaskQueueCreate(work: u32, completion: u32, out: *mut *const Queue) -> H
 }
 
 /// A port handle points at the port, which its queue keeps alive.
-pub fn XTaskQueueGetPort(handle: *const Queue, port: u32, out: *mut *const c_void) -> HRESULT {
-    let Some(queue) = queue(handle) else {
+///
+/// # Safety
+///
+/// `handle` is null or an open queue handle; `out` is null or valid for a
+/// write of a port handle.
+pub unsafe fn XTaskQueueGetPort(
+    handle: *const Queue,
+    port: u32,
+    out: *mut *const c_void,
+) -> HRESULT {
+    // SAFETY: the caller's contract on `handle`.
+    let Some(queue) = (unsafe { queue(handle) }) else {
         return E_INVALIDARG;
     };
     if port > COMPLETION || out.is_null() {
@@ -277,7 +291,12 @@ pub fn XTaskQueueGetPort(handle: *const Queue, port: u32, out: *mut *const c_voi
     S_OK
 }
 
-pub fn XTaskQueueCreateComposite(
+/// # Safety
+///
+/// `work` and `completion` are null or port handles from
+/// [`XTaskQueueGetPort`] whose queues are still open; `out` is null or
+/// valid for a write of a queue handle.
+pub unsafe fn XTaskQueueCreateComposite(
     work: *const c_void,
     completion: *const c_void,
     out: *mut *const Queue,
@@ -298,8 +317,13 @@ pub fn XTaskQueueCreateComposite(
     S_OK
 }
 
-pub fn XTaskQueueDuplicateHandle(handle: *const Queue, out: *mut *const Queue) -> HRESULT {
-    match queue(handle) {
+/// # Safety
+///
+/// `handle` is null or an open queue handle; `out` is null or valid for a
+/// write of a queue handle.
+pub unsafe fn XTaskQueueDuplicateHandle(handle: *const Queue, out: *mut *const Queue) -> HRESULT {
+    // SAFETY: the caller's contract on `handle`.
+    match unsafe { queue(handle) } {
         Some(queue) if !out.is_null() => {
             // SAFETY: checked non-null.
             unsafe { out.write(Arc::into_raw(queue)) };
@@ -309,9 +333,14 @@ pub fn XTaskQueueDuplicateHandle(handle: *const Queue, out: *mut *const Queue) -
     }
 }
 
-pub fn XTaskQueueCloseHandle(handle: *const Queue) {
+/// # Safety
+///
+/// `handle` is null or an open queue handle, which is closed by this call
+/// and not used again.
+pub unsafe fn XTaskQueueCloseHandle(handle: *const Queue) {
     if !handle.is_null() {
-        // SAFETY: a handle we returned; this drops its reference.
+        // SAFETY: an open handle we returned (the caller's contract); this
+        // drops its reference.
         unsafe { Arc::decrement_strong_count(handle) };
     }
 }
@@ -319,8 +348,13 @@ pub fn XTaskQueueCloseHandle(handle: *const Queue) {
 /// Runs one queued callback of a manual port; false if none came in time,
 /// or none can come: the queue was terminated (which ends a wait under way,
 /// as a dispatcher thread's loop expects).
-pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> bool {
-    let Some(queue) = queue(handle) else {
+///
+/// # Safety
+///
+/// `handle` is null or an open queue handle.
+pub unsafe fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> bool {
+    // SAFETY: the caller's contract on `handle`.
+    let Some(queue) = (unsafe { queue(handle) }) else {
         return false;
     };
     let Some(port) = queue.ports.get(port as usize) else {
@@ -338,14 +372,18 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     }
 }
 
-pub fn XTaskQueueSubmitDelayedCallback(
+/// # Safety
+///
+/// `handle` is null or an open queue handle.
+pub unsafe fn XTaskQueueSubmitDelayedCallback(
     handle: *const Queue,
     port: u32,
     delay_ms: u32,
     context: *mut c_void,
     callback: Option<Callback>,
 ) -> HRESULT {
-    match (queue(handle), callback) {
+    // SAFETY: the caller's contract on `handle`.
+    match (unsafe { queue(handle) }, callback) {
         (Some(queue), Some(callback)) => queue.submit(port, delay_ms, Task::new(context, callback)),
         _ => E_INVALIDARG,
     }
@@ -353,13 +391,18 @@ pub fn XTaskQueueSubmitDelayedCallback(
 
 /// Cancels what is still queued (callbacks see `canceled`), refuses new
 /// work, then calls `callback`.
-pub fn XTaskQueueTerminate(
+///
+/// # Safety
+///
+/// `handle` is null or an open queue handle.
+pub unsafe fn XTaskQueueTerminate(
     handle: *const Queue,
     _wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
-    let Some(queue) = queue(handle) else {
+    // SAFETY: the caller's contract on `handle`.
+    let Some(queue) = (unsafe { queue(handle) }) else {
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
@@ -381,13 +424,18 @@ pub fn XTaskQueueTerminate(
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-pub fn XTaskQueueRegisterMonitor(
+/// # Safety
+///
+/// `handle` is null or an open queue handle; `token` is null or valid for
+/// a write of a `u64`.
+pub unsafe fn XTaskQueueRegisterMonitor(
     handle: *const Queue,
     context: *mut c_void,
     callback: Option<MonitorCallback>,
     token: *mut u64,
 ) -> HRESULT {
-    let (Some(queue), Some(callback)) = (queue(handle), callback) else {
+    // SAFETY: the caller's contract on `handle`.
+    let (Some(queue), Some(callback)) = (unsafe { queue(handle) }, callback) else {
         return E_INVALIDARG;
     };
     if token.is_null() {
@@ -400,14 +448,22 @@ pub fn XTaskQueueRegisterMonitor(
     S_OK
 }
 
-pub fn XTaskQueueUnregisterMonitor(handle: *const Queue, token: u64) {
-    if let Some(queue) = queue(handle) {
+/// # Safety
+///
+/// `handle` is null or an open queue handle.
+pub unsafe fn XTaskQueueUnregisterMonitor(handle: *const Queue, token: u64) {
+    // SAFETY: the caller's contract on `handle`.
+    if let Some(queue) = unsafe { queue(handle) } {
         lock(&queue.monitors).retain(|m| m.0 != token);
     }
 }
 
 /// A new handle to the process queue, if there is one.
-pub fn XTaskQueueGetCurrentProcessTaskQueue(out: *mut *const Queue) -> bool {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a queue handle.
+pub unsafe fn XTaskQueueGetCurrentProcessTaskQueue(out: *mut *const Queue) -> bool {
     let found = process_queue();
     if !out.is_null() {
         // SAFETY: checked non-null.
@@ -416,12 +472,18 @@ pub fn XTaskQueueGetCurrentProcessTaskQueue(out: *mut *const Queue) -> bool {
     found.is_some()
 }
 
-pub fn XTaskQueueSetCurrentProcessTaskQueue(handle: *const Queue) {
-    let new = if handle.is_null() { None } else { queue(handle) };
+/// # Safety
+///
+/// `handle` is null or an open queue handle.
+pub unsafe fn XTaskQueueSetCurrentProcessTaskQueue(handle: *const Queue) {
+    // SAFETY: the caller's contract on `handle`.
+    let new = if handle.is_null() { None } else { unsafe { queue(handle) } };
     *lock(&PROCESS_QUEUE) = Some(new);
 }
 
-/// An async block: what the title fills in, then the system area.
+/// An async block: what the title fills in, then the system area. In the
+/// `# Safety` sections here and in the modules that start calls, "an async
+/// block" is one whose `queue` is null or an open queue handle.
 #[repr(C)]
 pub struct AsyncBlock {
     pub queue: *const Queue,
@@ -476,16 +538,24 @@ fn call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
 }
 
 /// The block's status and result-size words.
-fn words(block: *mut AsyncBlock) -> (&'static AtomicUsize, &'static AtomicUsize) {
-    // SAFETY: the title's block outlives the call; its system area is ours.
+///
+/// # Safety
+///
+/// `block` is a valid async block for as long as the words are used.
+unsafe fn words(block: *mut AsyncBlock) -> (&'static AtomicUsize, &'static AtomicUsize) {
+    // SAFETY: a valid block (the caller's contract); its system area is ours.
     unsafe {
         let internal = std::ptr::addr_of_mut!((*block).internal).cast::<AtomicUsize>();
         (&*internal.add(1), &*internal.add(2))
     }
 }
 
-fn status(block: *mut AsyncBlock) -> HRESULT {
-    words(block).0.load(Ordering::Acquire) as u32 as i32
+/// # Safety
+///
+/// `block` is a valid async block.
+unsafe fn status(block: *mut AsyncBlock) -> HRESULT {
+    // SAFETY: the caller's contract.
+    unsafe { words(block) }.0.load(Ordering::Acquire) as u32 as i32
 }
 
 fn release(block: *mut AsyncBlock) {
@@ -496,7 +566,12 @@ fn release(block: *mut AsyncBlock) {
     }
 }
 
-pub fn XAsyncBegin(
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes until the
+/// call this starts has completed and its result has been read (or it has
+/// failed).
+pub unsafe fn XAsyncBegin(
     block: *mut AsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
@@ -509,7 +584,8 @@ pub fn XAsyncBegin(
     if block.is_null() || call(block).is_some() {
         return E_INVALIDARG;
     }
-    let (status, size) = words(block);
+    // SAFETY: checked non-null; valid for the call (the caller's contract).
+    let (status, size) = unsafe { words(block) };
     status.store(E_PENDING as u32 as usize, Ordering::Release);
     size.store(0, Ordering::Release);
     let call = Arc::new(Call {
@@ -523,13 +599,19 @@ pub fn XAsyncBegin(
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
     if hr < 0 {
-        XAsyncComplete(block, hr, 0);
+        // SAFETY: the call just begun on it, so the block is valid.
+        unsafe { XAsyncComplete(block, hr, 0) };
     }
     S_OK
 }
 
 /// Queues the provider's `DoWork` on the block's work port.
-pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
+///
+/// # Safety
+///
+/// `block` is null or an async block; if a call is in flight on it, the
+/// block is valid for reads and writes.
+pub unsafe fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     extern "system" fn work(block: *mut c_void, canceled: bool) {
         let block = block.cast::<AsyncBlock>();
         let Some(call) = call(block) else { return };
@@ -539,15 +621,18 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
             call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
         };
         if hr != E_PENDING {
-            XAsyncComplete(block, hr, 0);
+            // SAFETY: the call was in flight when its work was queued, and
+            // a block in flight stays valid until it completes.
+            unsafe { XAsyncComplete(block, hr, 0) };
         }
     }
     if block.is_null() || call(block).is_none() {
         return E_INVALIDARG;
     }
-    // SAFETY: a block in flight is valid.
+    // SAFETY: a block in flight is valid (the caller's contract).
     let handle = unsafe { (*block).queue };
-    match queue(handle) {
+    // SAFETY: the block's queue is null or open (the caller's contract).
+    match unsafe { queue(handle) } {
         Some(queue) => queue.submit(WORK, delay_ms, Task::new(block.cast(), work)),
         None => E_INVALIDARG,
     }
@@ -555,7 +640,12 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
 
 /// Records the result (the first one wins), wakes waiters and queues the
 /// completion routine on the block's completion port.
-pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+///
+/// # Safety
+///
+/// `block` is an async block; if a call is in flight on it, the block is
+/// valid for reads and writes.
+pub unsafe fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
     extern "system" fn complete(block: *mut c_void, _canceled: bool) {
         let block = block.cast::<AsyncBlock>();
         // SAFETY: read before the status was published; see below.
@@ -573,9 +663,10 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     }
     // Read before publishing: once the status is set, the title may free
     // the block.
-    // SAFETY: a block in flight is valid.
+    // SAFETY: a block in flight is valid (the caller's contract).
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
-    let (status, size) = words(block);
+    // SAFETY: as above; the words are used only before the status is set.
+    let (status, size) = unsafe { words(block) };
     if result < 0 || required_size == 0 {
         release(block);
     }
@@ -586,14 +677,18 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     drop(done);
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
-        match queue(handle) {
+        // SAFETY: the block's queue is null or open (the caller's contract).
+        match unsafe { queue(handle) } {
             Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
             _ => task.run(true),
         }
     }
 }
 
-pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or an async block valid for reads.
+pub unsafe fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
@@ -601,18 +696,24 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
         let done = lock(&call.done);
         drop(call.finished.wait_while(done, |d| !*d));
     }
-    status(block)
+    // SAFETY: checked non-null; valid (the caller's contract).
+    unsafe { status(block) }
 }
 
-pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
+/// # Safety
+///
+/// `block` is null or an async block valid for reads; `out` is null or
+/// valid for a write of a `usize`.
+pub unsafe fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     if block.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
-    let hr = status(block);
+    // SAFETY: checked non-null; valid (the caller's contract).
+    let hr = unsafe { status(block) };
     // Any nonnegative completion carries a result, not just S_OK: S_FALSE
     // is a success code too and a provider may return data with it.
     if hr >= 0 {
-        // SAFETY: checked non-null.
+        // SAFETY: both checked non-null and valid (the caller's contract).
         unsafe { out.write(words(block).1.load(Ordering::Acquire)) };
     }
     hr
@@ -620,15 +721,26 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 
 /// Asks the provider to cancel; the call fails with `E_ABORT` unless the
 /// provider completed it first.
-pub fn XAsyncCancel(block: *mut AsyncBlock) {
+///
+/// # Safety
+///
+/// As [`XAsyncComplete`].
+pub unsafe fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
-        XAsyncComplete(block, E_ABORT, 0);
+        // SAFETY: the caller's contract, which is `XAsyncComplete`'s.
+        unsafe { XAsyncComplete(block, E_ABORT, 0) };
     }
 }
 
 /// Has the provider write the result into `buffer`, then ends the call.
-pub fn XAsyncGetResult(
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes; `buffer`
+/// is null or valid for writes of `buffer_size` bytes; `used` is null or
+/// valid for a write of a `usize`.
+pub unsafe fn XAsyncGetResult(
     block: *mut AsyncBlock,
     identity: *const c_void,
     buffer_size: usize,
@@ -638,8 +750,8 @@ pub fn XAsyncGetResult(
     if block.is_null() {
         return E_INVALIDARG;
     }
-    let hr = status(block);
-    let size = words(block).1.load(Ordering::Acquire);
+    // SAFETY: checked non-null; valid (the caller's contract).
+    let (hr, size) = unsafe { (status(block), words(block).1.load(Ordering::Acquire)) };
     if hr < 0 || size == 0 {
         if hr >= 0 && !used.is_null() {
             // SAFETY: checked non-null.
@@ -667,13 +779,23 @@ pub fn XAsyncGetResult(
 
 /// Starts a call on `block` that is already over: it completes with `hr`
 /// and no result data, through the block's completion port as usual.
-pub fn finished(block: *mut AsyncBlock, identity: *const c_void, hr: HRESULT) -> HRESULT {
-    finished_with(block, identity, if hr < 0 { Err(hr) } else { Ok(Vec::new()) })
+///
+/// # Safety
+///
+/// As [`XAsyncBegin`].
+pub unsafe fn finished(block: *mut AsyncBlock, identity: *const c_void, hr: HRESULT) -> HRESULT {
+    let result = if hr < 0 { Err(hr) } else { Ok(Vec::new()) };
+    // SAFETY: the caller's contract, which is `finished_with`'s.
+    unsafe { finished_with(block, identity, result) }
 }
 
 /// Like [`finished`], with the bytes `XAsyncGetResult` hands out for
 /// `identity` (an error has none).
-pub fn finished_with(
+///
+/// # Safety
+///
+/// As [`XAsyncBegin`].
+pub unsafe fn finished_with(
     block: *mut AsyncBlock,
     identity: *const c_void,
     result: Result<Vec<u8>, HRESULT>,
@@ -693,7 +815,9 @@ pub fn finished_with(
                     Ok(bytes) => (S_OK, bytes.len()),
                     Err(hr) => (*hr, 0),
                 };
-                XAsyncComplete(data.block, hr, len);
+                // SAFETY: the call is beginning on this block, which is
+                // valid until it completes.
+                unsafe { XAsyncComplete(data.block, hr, len) };
             }
             // SAFETY: as above; the runtime checked the buffer's size.
             OP_GET_RESULT => unsafe {
@@ -706,7 +830,9 @@ pub fn finished_with(
         S_OK
     }
     let context = Box::into_raw(Box::new(result));
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let hr =
+        // SAFETY: the caller's contract on `block`.
+        unsafe { XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider)) };
     if hr < 0 {
         // Refused before the call existed, so no cleanup will come.
         // SAFETY: still ours.
@@ -717,7 +843,11 @@ pub fn finished_with(
 
 /// Like [`finished_with`], but the result comes from `work`, run on a
 /// thread of ours; the call stays pending until it returns (a dialog, say).
-pub fn pending_with(
+///
+/// # Safety
+///
+/// As [`XAsyncBegin`].
+pub unsafe fn pending_with(
     block: *mut AsyncBlock,
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
@@ -746,7 +876,9 @@ pub fn pending_with(
                         let state = unsafe { &*(state as *const Data) };
                         state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
                     }
-                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    // SAFETY: the call is still pending on this block, so
+                    // it is valid until this completes it.
+                    unsafe { XAsyncComplete(block as *mut AsyncBlock, hr, len) };
                 });
             }
             // SAFETY: as above; the runtime checked the buffer's size.
@@ -760,7 +892,9 @@ pub fn pending_with(
     }
     let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
     let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let hr =
+        // SAFETY: the caller's contract on `block`.
+        unsafe { XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider)) };
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
         drop(unsafe { Box::from_raw(context) });
@@ -770,8 +904,14 @@ pub fn pending_with(
 
 /// The result of a call begun with [`finished_with`] for `identity`, as a
 /// `T` written through `out`.
-pub fn result<T>(block: *mut AsyncBlock, identity: *const c_void, out: *mut T) -> HRESULT {
-    XAsyncGetResult(block, identity, size_of::<T>(), out.cast(), std::ptr::null_mut())
+///
+/// # Safety
+///
+/// `block` is null or an async block valid for reads and writes; `out` is
+/// null or valid for a write of a `T`.
+pub unsafe fn result<T>(block: *mut AsyncBlock, identity: *const c_void, out: *mut T) -> HRESULT {
+    // SAFETY: the caller's contract; `out` holds `size_of::<T>()` bytes.
+    unsafe { XAsyncGetResult(block, identity, size_of::<T>(), out.cast(), std::ptr::null_mut()) }
 }
 
 /// The bytes of a value, for [`finished_with`].
@@ -784,12 +924,18 @@ type Work = extern "system" fn(*mut AsyncBlock) -> HRESULT;
 
 /// Runs `work` on the block's work port as an async call of its own; its
 /// return value is the call's result.
-pub fn XAsyncRun(block: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
+///
+/// # Safety
+///
+/// As [`XAsyncBegin`].
+pub unsafe fn XAsyncRun(block: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data.
         let data = unsafe { &*data };
         match op {
-            OP_BEGIN => XAsyncSchedule(data.block, 0),
+            // SAFETY: the call is beginning on this block, which is valid
+            // and whose queue is open, as `XAsyncRun` requires.
+            OP_BEGIN => unsafe { XAsyncSchedule(data.block, 0) },
             OP_DO_WORK => {
                 // SAFETY: the context is the `Work` given to `XAsyncRun`.
                 let work = unsafe { std::mem::transmute::<*mut c_void, Work>(data.context) };
@@ -802,7 +948,8 @@ pub fn XAsyncRun(block: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
         return E_INVALIDARG;
     };
     let identity = XAsyncRun as *const c_void;
-    XAsyncBegin(block, work as *mut c_void, identity, std::ptr::null(), Some(provider))
+    // SAFETY: the caller's contract on `block`.
+    unsafe { XAsyncBegin(block, work as *mut c_void, identity, std::ptr::null(), Some(provider)) }
 }
 
 // The object `QueryApiImpl` returns. Each method takes the object first,
@@ -814,19 +961,42 @@ pub static OBJECT: Object = Object::new("task queue", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, PROVIDER, &OBJECT)];
 
 type This = *const Object;
-extern "system" fn m_get_status(_: This, b: *mut AsyncBlock, wait: u8) -> HRESULT {
-    XAsyncGetStatus(b, wait != 0)
+/// # Safety
+///
+/// As [`XAsyncGetStatus`].
+unsafe extern "system" fn m_get_status(_: This, b: *mut AsyncBlock, wait: u8) -> HRESULT {
+    // SAFETY: the caller's contract, which is `XAsyncGetStatus`'s.
+    unsafe { XAsyncGetStatus(b, wait != 0) }
 }
-extern "system" fn m_get_result_size(_: This, b: *mut AsyncBlock, out: *mut usize) -> HRESULT {
-    XAsyncGetResultSize(b, out)
+/// # Safety
+///
+/// As [`XAsyncGetResultSize`].
+unsafe extern "system" fn m_get_result_size(
+    _: This,
+    b: *mut AsyncBlock,
+    out: *mut usize,
+) -> HRESULT {
+    // SAFETY: the caller's contract, which is `XAsyncGetResultSize`'s.
+    unsafe { XAsyncGetResultSize(b, out) }
 }
-extern "system" fn m_cancel(_: This, b: *mut AsyncBlock) {
-    XAsyncCancel(b)
+/// # Safety
+///
+/// As [`XAsyncCancel`].
+unsafe extern "system" fn m_cancel(_: This, b: *mut AsyncBlock) {
+    // SAFETY: the caller's contract, which is `XAsyncCancel`'s.
+    unsafe { XAsyncCancel(b) }
 }
-extern "system" fn m_run(_: This, b: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
-    XAsyncRun(b, work)
+/// # Safety
+///
+/// As [`XAsyncRun`].
+unsafe extern "system" fn m_run(_: This, b: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
+    // SAFETY: the caller's contract, which is `XAsyncRun`'s.
+    unsafe { XAsyncRun(b, work) }
 }
-extern "system" fn m_begin(
+/// # Safety
+///
+/// As [`XAsyncBegin`].
+unsafe extern "system" fn m_begin(
     _: This,
     b: *mut AsyncBlock,
     context: *mut c_void,
@@ -834,15 +1004,27 @@ extern "system" fn m_begin(
     name: *const u8,
     provider: Option<Provider>,
 ) -> HRESULT {
-    XAsyncBegin(b, context, identity, name, provider)
+    // SAFETY: the caller's contract, which is `XAsyncBegin`'s.
+    unsafe { XAsyncBegin(b, context, identity, name, provider) }
 }
-extern "system" fn m_schedule(_: This, b: *mut AsyncBlock, delay: u32) -> HRESULT {
-    XAsyncSchedule(b, delay)
+/// # Safety
+///
+/// As [`XAsyncSchedule`].
+unsafe extern "system" fn m_schedule(_: This, b: *mut AsyncBlock, delay: u32) -> HRESULT {
+    // SAFETY: the caller's contract, which is `XAsyncSchedule`'s.
+    unsafe { XAsyncSchedule(b, delay) }
 }
-extern "system" fn m_complete(_: This, b: *mut AsyncBlock, hr: HRESULT, size: usize) {
-    XAsyncComplete(b, hr, size)
+/// # Safety
+///
+/// As [`XAsyncComplete`].
+unsafe extern "system" fn m_complete(_: This, b: *mut AsyncBlock, hr: HRESULT, size: usize) {
+    // SAFETY: the caller's contract, which is `XAsyncComplete`'s.
+    unsafe { XAsyncComplete(b, hr, size) }
 }
-extern "system" fn m_get_result(
+/// # Safety
+///
+/// As [`XAsyncGetResult`].
+unsafe extern "system" fn m_get_result(
     _: This,
     b: *mut AsyncBlock,
     identity: *const c_void,
@@ -850,51 +1032,83 @@ extern "system" fn m_get_result(
     buffer: *mut c_void,
     used: *mut usize,
 ) -> HRESULT {
-    XAsyncGetResult(b, identity, size, buffer, used)
+    // SAFETY: the caller's contract, which is `XAsyncGetResult`'s.
+    unsafe { XAsyncGetResult(b, identity, size, buffer, used) }
 }
-extern "system" fn m_create(
+/// # Safety
+///
+/// As [`XTaskQueueCreate`].
+unsafe extern "system" fn m_create(
     _: This,
     work: u32,
     completion: u32,
     out: *mut *const Queue,
 ) -> HRESULT {
-    XTaskQueueCreate(work, completion, out)
+    // SAFETY: the caller's contract, which is `XTaskQueueCreate`'s.
+    unsafe { XTaskQueueCreate(work, completion, out) }
 }
-extern "system" fn m_create_composite(
+/// # Safety
+///
+/// As [`XTaskQueueCreateComposite`].
+unsafe extern "system" fn m_create_composite(
     _: This,
     work: *const c_void,
     completion: *const c_void,
     out: *mut *const Queue,
 ) -> HRESULT {
-    XTaskQueueCreateComposite(work, completion, out)
+    // SAFETY: the caller's contract, which is `XTaskQueueCreateComposite`'s.
+    unsafe { XTaskQueueCreateComposite(work, completion, out) }
 }
-extern "system" fn m_get_port(
+/// # Safety
+///
+/// As [`XTaskQueueGetPort`].
+unsafe extern "system" fn m_get_port(
     _: This,
     q: *const Queue,
     port: u32,
     out: *mut *const c_void,
 ) -> HRESULT {
-    XTaskQueueGetPort(q, port, out)
+    // SAFETY: the caller's contract, which is `XTaskQueueGetPort`'s.
+    unsafe { XTaskQueueGetPort(q, port, out) }
 }
-extern "system" fn m_duplicate(_: This, q: *const Queue, out: *mut *const Queue) -> HRESULT {
-    XTaskQueueDuplicateHandle(q, out)
+/// # Safety
+///
+/// As [`XTaskQueueDuplicateHandle`].
+unsafe extern "system" fn m_duplicate(_: This, q: *const Queue, out: *mut *const Queue) -> HRESULT {
+    // SAFETY: the caller's contract, which is `XTaskQueueDuplicateHandle`'s.
+    unsafe { XTaskQueueDuplicateHandle(q, out) }
 }
-extern "system" fn m_dispatch(_: This, q: *const Queue, port: u32, timeout: u32) -> bool {
-    XTaskQueueDispatch(q, port, timeout)
+/// # Safety
+///
+/// As [`XTaskQueueDispatch`].
+unsafe extern "system" fn m_dispatch(_: This, q: *const Queue, port: u32, timeout: u32) -> bool {
+    // SAFETY: the caller's contract, which is `XTaskQueueDispatch`'s.
+    unsafe { XTaskQueueDispatch(q, port, timeout) }
 }
-extern "system" fn m_close(_: This, q: *const Queue) {
-    XTaskQueueCloseHandle(q)
+/// # Safety
+///
+/// As [`XTaskQueueCloseHandle`].
+unsafe extern "system" fn m_close(_: This, q: *const Queue) {
+    // SAFETY: the caller's contract, which is `XTaskQueueCloseHandle`'s.
+    unsafe { XTaskQueueCloseHandle(q) }
 }
-extern "system" fn m_submit(
+/// # Safety
+///
+/// As [`XTaskQueueSubmitDelayedCallback`].
+unsafe extern "system" fn m_submit(
     _: This,
     q: *const Queue,
     port: u32,
     context: *mut c_void,
     callback: Option<Callback>,
 ) -> HRESULT {
-    XTaskQueueSubmitDelayedCallback(q, port, 0, context, callback)
+    // SAFETY: the caller's contract, which is `XTaskQueueSubmitDelayedCallback`'s.
+    unsafe { XTaskQueueSubmitDelayedCallback(q, port, 0, context, callback) }
 }
-extern "system" fn m_submit_delayed(
+/// # Safety
+///
+/// As [`XTaskQueueSubmitDelayedCallback`].
+unsafe extern "system" fn m_submit_delayed(
     _: This,
     q: *const Queue,
     port: u32,
@@ -902,34 +1116,55 @@ extern "system" fn m_submit_delayed(
     context: *mut c_void,
     callback: Option<Callback>,
 ) -> HRESULT {
-    XTaskQueueSubmitDelayedCallback(q, port, delay, context, callback)
+    // SAFETY: the caller's contract, which is `XTaskQueueSubmitDelayedCallback`'s.
+    unsafe { XTaskQueueSubmitDelayedCallback(q, port, delay, context, callback) }
 }
-extern "system" fn m_terminate(
+/// # Safety
+///
+/// As [`XTaskQueueTerminate`].
+unsafe extern "system" fn m_terminate(
     _: This,
     q: *const Queue,
     wait: u8,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
-    XTaskQueueTerminate(q, wait != 0, context, callback)
+    // SAFETY: the caller's contract, which is `XTaskQueueTerminate`'s.
+    unsafe { XTaskQueueTerminate(q, wait != 0, context, callback) }
 }
-extern "system" fn m_register_monitor(
+/// # Safety
+///
+/// As [`XTaskQueueRegisterMonitor`].
+unsafe extern "system" fn m_register_monitor(
     _: This,
     q: *const Queue,
     context: *mut c_void,
     callback: Option<MonitorCallback>,
     token: *mut u64,
 ) -> HRESULT {
-    XTaskQueueRegisterMonitor(q, context, callback, token)
+    // SAFETY: the caller's contract, which is `XTaskQueueRegisterMonitor`'s.
+    unsafe { XTaskQueueRegisterMonitor(q, context, callback, token) }
 }
-extern "system" fn m_unregister_monitor(_: This, q: *const Queue, token: u64) {
-    XTaskQueueUnregisterMonitor(q, token)
+/// # Safety
+///
+/// As [`XTaskQueueUnregisterMonitor`].
+unsafe extern "system" fn m_unregister_monitor(_: This, q: *const Queue, token: u64) {
+    // SAFETY: the caller's contract, which is `XTaskQueueUnregisterMonitor`'s.
+    unsafe { XTaskQueueUnregisterMonitor(q, token) }
 }
-extern "system" fn m_get_process_queue(_: This, out: *mut *const Queue) -> bool {
-    XTaskQueueGetCurrentProcessTaskQueue(out)
+/// # Safety
+///
+/// As [`XTaskQueueGetCurrentProcessTaskQueue`].
+unsafe extern "system" fn m_get_process_queue(_: This, out: *mut *const Queue) -> bool {
+    // SAFETY: the caller's contract, which is `XTaskQueueGetCurrentProcessTaskQueue`'s.
+    unsafe { XTaskQueueGetCurrentProcessTaskQueue(out) }
 }
-extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
-    XTaskQueueSetCurrentProcessTaskQueue(q)
+/// # Safety
+///
+/// As [`XTaskQueueSetCurrentProcessTaskQueue`].
+unsafe extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
+    // SAFETY: the caller's contract, which is `XTaskQueueSetCurrentProcessTaskQueue`'s.
+    unsafe { XTaskQueueSetCurrentProcessTaskQueue(q) }
 }
 /// The runtime's debug check that the caller is not a time-critical thread,
 /// which every runtime call in a title makes first.
@@ -1006,9 +1241,11 @@ mod tests {
         // SAFETY: the runtime passes valid provider data.
         let data = unsafe { &*data };
         match op {
-            OP_BEGIN => XAsyncSchedule(data.block, 0),
+            // SAFETY: the call on this block is in flight, so the block is valid.
+            OP_BEGIN => unsafe { XAsyncSchedule(data.block, 0) },
             OP_DO_WORK => {
-                XAsyncComplete(data.block, S_OK, 8);
+                // SAFETY: the call on this block is in flight, so the block is valid.
+                unsafe { XAsyncComplete(data.block, S_OK, 8) };
                 S_OK
             }
             OP_GET_RESULT => {
@@ -1029,7 +1266,8 @@ mod tests {
     fn async_calls_complete_and_return_results() {
         let mut q = std::ptr::null();
         // Work on a thread pool, completion dispatched by hand.
-        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueCreate(1, 0, &mut q) }, S_OK);
         let mut block = AsyncBlock {
             queue: q,
             context: std::ptr::null_mut(),
@@ -1038,30 +1276,45 @@ mod tests {
         };
         let identity = 0x1d as *const c_void;
         assert_eq!(
-            XAsyncBegin(&mut block, 42 as *mut c_void, identity, std::ptr::null(), Some(provider)),
+            // SAFETY: this test's own locals, valid for the call.
+            unsafe {
+                XAsyncBegin(
+                    &mut block,
+                    42 as *mut c_void,
+                    identity,
+                    std::ptr::null(),
+                    Some(provider),
+                )
+            },
             S_OK
         );
-        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XAsyncGetStatus(&mut block, true) }, S_OK);
         let mut size = 0;
-        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XAsyncGetResultSize(&mut block, &mut size) }, S_OK);
         assert_eq!(size, 8);
         assert_eq!(COMPLETED.load(Ordering::SeqCst), 0, "completion is manual");
-        assert!(XTaskQueueDispatch(q, COMPLETION, INFINITE));
+        // SAFETY: this test's own locals, valid for the call.
+        assert!(unsafe { XTaskQueueDispatch(q, COMPLETION, INFINITE) });
         assert_eq!(COMPLETED.load(Ordering::SeqCst), 1);
 
         let mut value = 0u64;
         let mut small = 0u32;
         let out = (&mut small as *mut u32).cast();
         assert_eq!(
-            XAsyncGetResult(&mut block, identity, 4, out, std::ptr::null_mut()),
+            // SAFETY: this test's own locals, valid for the call.
+            unsafe { XAsyncGetResult(&mut block, identity, 4, out, std::ptr::null_mut()) },
             E_NOT_SUFFICIENT_BUFFER
         );
         let out = (&mut value as *mut u64).cast();
         let mut used = 0;
-        assert_eq!(XAsyncGetResult(&mut block, identity, 8, out, &mut used), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XAsyncGetResult(&mut block, identity, 8, out, &mut used) }, S_OK);
         assert_eq!((value, used), (42, 8));
         assert!(call(&mut block).is_none(), "the call ends with its result");
-        XTaskQueueCloseHandle(q);
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { XTaskQueueCloseHandle(q) };
     }
 
     #[test]
@@ -1071,9 +1324,11 @@ mod tests {
             // SAFETY: the runtime passes valid provider data.
             let data = unsafe { &*data };
             match op {
-                OP_BEGIN => XAsyncSchedule(data.block, 0),
+                // SAFETY: the call on this block is in flight, so the block is valid.
+                OP_BEGIN => unsafe { XAsyncSchedule(data.block, 0) },
                 OP_DO_WORK => {
-                    XAsyncComplete(data.block, S_FALSE, 8);
+                    // SAFETY: the call on this block is in flight, so the block is valid.
+                    unsafe { XAsyncComplete(data.block, S_FALSE, 8) };
                     S_OK
                 }
                 OP_GET_RESULT => {
@@ -1085,7 +1340,8 @@ mod tests {
             }
         }
         let mut q = std::ptr::null();
-        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        // SAFETY: the call on this block is in flight, so the block is valid.
+        assert_eq!(unsafe { XTaskQueueCreate(0, 0, &mut q) }, S_OK);
         let mut block = AsyncBlock {
             queue: q,
             context: std::ptr::null_mut(),
@@ -1094,29 +1350,39 @@ mod tests {
         };
         let identity = 0x77 as *const c_void;
         assert_eq!(
-            XAsyncBegin(
-                &mut block,
-                std::ptr::null_mut(),
-                identity,
-                std::ptr::null(),
-                Some(provider)
-            ),
+            // SAFETY: the call on this block is in flight, so the block is valid.
+            unsafe {
+                XAsyncBegin(
+                    &mut block,
+                    std::ptr::null_mut(),
+                    identity,
+                    std::ptr::null(),
+                    Some(provider),
+                )
+            },
             S_OK
         );
-        assert!(XTaskQueueDispatch(q, WORK, 0));
-        assert_eq!(XAsyncGetStatus(&mut block, false), S_FALSE);
+        // SAFETY: the call on this block is in flight, so the block is valid.
+        assert!(unsafe { XTaskQueueDispatch(q, WORK, 0) });
+        // SAFETY: the call on this block is in flight, so the block is valid.
+        assert_eq!(unsafe { XAsyncGetStatus(&mut block, false) }, S_FALSE);
         let mut size = 0;
-        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_FALSE);
+        // SAFETY: the call on this block is in flight, so the block is valid.
+        assert_eq!(unsafe { XAsyncGetResultSize(&mut block, &mut size) }, S_FALSE);
         assert_eq!(size, 8);
         let mut value = 0u64;
         let mut used = 0;
         assert_eq!(
-            XAsyncGetResult(&mut block, identity, 8, (&mut value as *mut u64).cast(), &mut used),
+            // SAFETY: the call on this block is in flight, so the block is valid.
+            unsafe {
+                XAsyncGetResult(&mut block, identity, 8, (&mut value as *mut u64).cast(), &mut used)
+            },
             S_OK
         );
         assert_eq!((value, used), (0x1234, 8));
         assert!(call(&raw mut block).is_none(), "the call ends with its result");
-        XTaskQueueCloseHandle(q);
+        // SAFETY: the call on this block is in flight, so the block is valid.
+        unsafe { XTaskQueueCloseHandle(q) };
     }
 
     #[test]
@@ -1138,7 +1404,8 @@ mod tests {
             ),
             S_OK
         );
-        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XAsyncGetStatus(&mut block, true) }, E_ABORT);
     }
 
     #[test]
@@ -1156,16 +1423,23 @@ mod tests {
             SECOND.store(true, Ordering::SeqCst);
         }
         let mut q = std::ptr::null();
-        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueCreate(1, 1, &mut q) }, S_OK);
         let none = std::ptr::null_mut();
-        assert_eq!(XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(waits)), S_OK);
-        assert_eq!(XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(releases)), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(waits)) }, S_OK);
+        assert_eq!(
+            // SAFETY: this test's own locals, valid for the call.
+            unsafe { XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(releases)) },
+            S_OK
+        );
         let start = std::time::Instant::now();
         while !FIRST.load(Ordering::SeqCst) && start.elapsed().as_secs() < 10 {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(FIRST.load(Ordering::SeqCst));
-        XTaskQueueCloseHandle(q);
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { XTaskQueueCloseHandle(q) };
     }
 
     /// A dispatcher thread's loop, `while (XTaskQueueDispatch(queue, port,
@@ -1183,14 +1457,19 @@ mod tests {
             let (done, ended) = std::sync::mpsc::channel();
             let queue = queue as usize;
             std::thread::spawn(move || {
-                while XTaskQueueDispatch(queue as *const Queue, WORK, INFINITE) {}
+                // SAFETY: this test's own locals, valid for the call.
+                while unsafe { XTaskQueueDispatch(queue as *const Queue, WORK, INFINITE) } {}
                 let _ = done.send(());
             });
             ended
         }
         let run_one = |queue, total| {
             let none = std::ptr::null_mut();
-            assert_eq!(XTaskQueueSubmitDelayedCallback(queue, WORK, 0, none, Some(ran)), S_OK);
+            assert_eq!(
+                // SAFETY: this test's own locals, valid for the call.
+                unsafe { XTaskQueueSubmitDelayedCallback(queue, WORK, 0, none, Some(ran)) },
+                S_OK
+            );
             for _ in 0..500 {
                 if RAN.load(Ordering::SeqCst) == total {
                     return;
@@ -1204,26 +1483,35 @@ mod tests {
 
         // Two queues on the same manual ports.
         let (mut a, mut b) = (std::ptr::null(), std::ptr::null());
-        assert_eq!(XTaskQueueCreate(0, 0, &mut a), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueCreate(0, 0, &mut a) }, S_OK);
         let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
-        assert_eq!(XTaskQueueGetPort(a, WORK, &mut work), S_OK);
-        assert_eq!(XTaskQueueGetPort(a, COMPLETION, &mut completion), S_OK);
-        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut b), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueGetPort(a, WORK, &mut work) }, S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueGetPort(a, COMPLETION, &mut completion) }, S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueCreateComposite(work, completion, &mut b) }, S_OK);
 
         let ended = dispatcher(a);
         run_one(a, 1);
         // The other queue's end is not this one's: the wait goes on and
         // still runs what comes in.
-        assert_eq!(XTaskQueueTerminate(b, false, none, None), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueTerminate(b, false, none, None) }, S_OK);
         assert!(ended.recv_timeout(short).is_err(), "ended with another queue");
         run_one(a, 2);
         // Its own queue's end is.
-        assert_eq!(XTaskQueueTerminate(a, false, none, None), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueTerminate(a, false, none, None) }, S_OK);
         assert!(ended.recv_timeout(long).is_ok(), "still waiting on a terminated queue");
         // And a dispatch that starts after the end returns at once.
-        assert!(!XTaskQueueDispatch(a, WORK, INFINITE));
-        XTaskQueueCloseHandle(a);
-        XTaskQueueCloseHandle(b);
+        // SAFETY: this test's own locals, valid for the call.
+        assert!(!unsafe { XTaskQueueDispatch(a, WORK, INFINITE) });
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { XTaskQueueCloseHandle(a) };
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { XTaskQueueCloseHandle(b) };
     }
 
     #[test]
@@ -1237,13 +1525,24 @@ mod tests {
             unsafe { *context.cast::<bool>() = canceled };
         }
         let mut q = std::ptr::null();
-        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueCreate(0, 0, &mut q) }, S_OK);
         let mut canceled = false;
         let flag = (&mut canceled as *mut bool).cast();
-        assert_eq!(XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)), S_OK);
-        assert_eq!(XTaskQueueTerminate(q, true, std::ptr::null_mut(), Some(terminated)), S_OK);
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!(unsafe { XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)) }, S_OK);
+        assert_eq!(
+            // SAFETY: this test's own locals, valid for the call.
+            unsafe { XTaskQueueTerminate(q, true, std::ptr::null_mut(), Some(terminated)) },
+            S_OK
+        );
         assert!(canceled && TERMINATED.load(Ordering::SeqCst));
-        assert_eq!(XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)), E_ABORT);
-        XTaskQueueCloseHandle(q);
+        assert_eq!(
+            // SAFETY: this test's own locals, valid for the call.
+            unsafe { XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)) },
+            E_ABORT
+        );
+        // SAFETY: this test's own locals, valid for the call.
+        unsafe { XTaskQueueCloseHandle(q) };
     }
 }
