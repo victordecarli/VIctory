@@ -64,7 +64,8 @@ fn user() -> Handle {
 ///
 /// `out` is null or valid for a write of a user handle.
 unsafe fn found(found: bool, out: *mut Handle) -> HRESULT {
-    if found { put(out, user()) } else { USER_NOT_FOUND }
+    // SAFETY: the pointers passed on are under this function's own contract.
+    if found { unsafe { put(out, user()) } } else { USER_NOT_FOUND }
 }
 
 pub static OBJECT: Object = Object::new("user", &VTABLE);
@@ -87,7 +88,8 @@ type This = *const Object;
 ///
 /// `out` is null or valid for a write of a user handle.
 unsafe extern "system" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
-    put(out, user())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, user()) }
 }
 extern "system" fn close(_: This, _: Handle) {}
 extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
@@ -104,7 +106,8 @@ extern "system" fn add_provider(op: u32, data: *const ProviderData) -> HRESULT {
     match op {
         // SAFETY: the call on this block is in flight, so the block is valid.
         BEGIN => unsafe { xasync::XAsyncComplete(data.block, S_OK, size_of::<Handle>()) },
-        GET_RESULT => return put(data.buffer.cast::<Handle>(), user()),
+        // SAFETY: the runtime checked that the buffer holds a handle.
+        GET_RESULT => return unsafe { put(data.buffer.cast::<Handle>(), user()) },
         _ => {}
     }
     S_OK
@@ -155,7 +158,8 @@ unsafe extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut 
 ///
 /// `out` is null or valid for a write of a `u64`.
 unsafe extern "system" fn get_local_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
-    put(out, LOCAL_ID)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, LOCAL_ID) }
 }
 /// # Safety
 ///
@@ -168,7 +172,8 @@ unsafe extern "system" fn find_by_local_id(_: This, id: u64, out: *mut Handle) -
 ///
 /// `out` is null or valid for a write of a `u64`.
 unsafe extern "system" fn get_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
-    put(out, XUID)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, XUID) }
 }
 /// # Safety
 ///
@@ -181,7 +186,8 @@ unsafe extern "system" fn find_by_id(_: This, id: u64, out: *mut Handle) -> HRES
 ///
 /// `out` is null or valid for a write of a `bool`.
 unsafe extern "system" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HRESULT {
-    put(out, false)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, false) }
 }
 /// 0: signed in.
 ///
@@ -189,7 +195,8 @@ unsafe extern "system" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HR
 ///
 /// `out` is null or valid for a write of a `u32`.
 unsafe extern "system" fn get_state(_: This, _: Handle, out: *mut u32) -> HRESULT {
-    put(out, 0)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, 0) }
 }
 /// The user's gamertag as the component asked for (`XUserGamertagComponent`):
 /// it has no suffix, so the modern suffix is empty and every other component
@@ -212,7 +219,8 @@ unsafe extern "system" fn get_gamertag(
         MODERN_SUFFIX => "",
         _ => GAMERTAG,
     };
-    put_string(text, size, buffer, used)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put_string(text, size, buffer, used) }
 }
 /// Granted; deny reason 0 (none).
 ///
@@ -232,7 +240,8 @@ unsafe extern "system" fn check_privilege(
         // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { reason.write(0) };
     }
-    put(has, true)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(has, true) }
 }
 
 /// 3: adult.
@@ -241,7 +250,8 @@ unsafe extern "system" fn check_privilege(
 ///
 /// `out` is null or valid for a write of a `u32`.
 unsafe extern "system" fn get_age_group(_: This, _: Handle, out: *mut u32) -> HRESULT {
-    put(out, 3)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, 3) }
 }
 
 static RESOLVE: u8 = 0;
@@ -299,7 +309,8 @@ unsafe extern "system" fn token_async(
     _body: *const c_void,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    tracing::info!(url = text(url).unwrap_or_default(), "token and signature: offline");
+    // SAFETY: the pointers passed on are under this function's own contract.
+    tracing::info!(url = unsafe { text(url) }.unwrap_or_default(), "token and signature: offline");
     // SAFETY: the pointers passed on are under this function's own contract.
     unsafe { xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN) }
 }
@@ -346,7 +357,8 @@ unsafe extern "system" fn register(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    put(out, token())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, token()) }
 }
 extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true

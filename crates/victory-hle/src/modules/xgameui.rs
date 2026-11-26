@@ -73,7 +73,8 @@ unsafe extern "system" fn text_entry_async(
     max_length: u32,
 ) -> HRESULT {
     let [title, description, default] =
-        [title, description, default].map(|t| text(t).unwrap_or_default());
+        // SAFETY: the pointers passed on are under this function's own contract.
+        [title, description, default].map(|t| unsafe { text(t) }.unwrap_or_default());
     tracing::info!(title, description, max_length, "text entry");
     // SAFETY: the pointers passed on are under this function's own contract.
     unsafe {
@@ -110,7 +111,8 @@ unsafe extern "system" fn text_entry_size(
     if hr < 0 {
         return hr;
     }
-    put(out, size as u32)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, size as u32) }
 }
 /// The text typed, with its NUL.
 ///
@@ -135,7 +137,8 @@ unsafe extern "system" fn text_entry_result(
     if hr < 0 || used.is_null() {
         return hr;
     }
-    put(used, written as u32)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(used, written as u32) }
 }
 
 /// At most `max` characters (0: no limit).
@@ -371,7 +374,8 @@ mod tests {
         let result = method::<Result_>(&OBJECT, 0x98);
         // SAFETY: `out` holds 7 bytes, `used` is a local to write.
         assert_eq!(unsafe { result(this, &mut b, 7, out.as_mut_ptr(), &mut used) }, S_OK);
-        assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyp"), 7));
+        // SAFETY: this test's own locals, valid for the call.
+        assert_eq!((unsafe { text(out.as_ptr()) }.as_deref(), used), (Some("abctyp"), 7));
         assert_eq!(limit("\u{e9}t\u{e9}s", 3), "\u{e9}t\u{e9}");
     }
 }

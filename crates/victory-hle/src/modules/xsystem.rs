@@ -53,7 +53,8 @@ unsafe extern "system" fn console_id(
     buffer: *mut u8,
     used: *mut usize,
 ) -> HRESULT {
-    put_string(CONSOLE_ID, size, buffer, used)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put_string(CONSOLE_ID, size, buffer, used) }
 }
 /// The sandbox id.
 ///
@@ -67,7 +68,8 @@ unsafe extern "system" fn sandbox_id(
     buffer: *mut u8,
     used: *mut usize,
 ) -> HRESULT {
-    put_string(SANDBOX, size, buffer, used)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put_string(SANDBOX, size, buffer, used) }
 }
 /// The device id this title sees (titles see different ones).
 ///
@@ -81,7 +83,8 @@ unsafe extern "system" fn device_id(
     buffer: *mut u8,
     used: *mut usize,
 ) -> HRESULT {
-    put_string(DEVICE_ID, size, buffer, used)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put_string(DEVICE_ID, size, buffer, used) }
 }
 
 #[repr(C)]

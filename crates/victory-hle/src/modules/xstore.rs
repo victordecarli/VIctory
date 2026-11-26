@@ -80,7 +80,8 @@ unsafe extern "system" fn create_context(
     _user: *const c_void,
     out: *mut Handle,
 ) -> HRESULT {
-    put(out, handle(&CONTEXT))
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, handle(&CONTEXT)) }
 }
 extern "system" fn close(_: This, _: Handle) {}
 
@@ -184,7 +185,8 @@ unsafe extern "system" fn license_for_package_async(
     package: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let ours = text(package).is_some_and(|p| p == xpackage::identifier());
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let ours = unsafe { text(package) }.is_some_and(|p| p == xpackage::identifier());
     // SAFETY: `block` is as this function's contract gives it.
     unsafe { license_for(ours, block) }
 }
@@ -202,7 +204,8 @@ unsafe extern "system" fn license_for_durables_async(
     store_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    tracing::debug!(store_id = text(store_id).unwrap_or_default(), "durable not owned");
+    // SAFETY: the pointers passed on are under this function's own contract.
+    tracing::debug!(store_id = unsafe { text(store_id) }.unwrap_or_default(), "durable not owned");
     // SAFETY: `block` is as this function's contract gives it.
     unsafe { license_for(false, block) }
 }
@@ -465,9 +468,11 @@ unsafe extern "system" fn package_identifier(
     buffer: *mut u8,
 ) -> HRESULT {
     let title = runtime::title();
-    match text(store_id) {
+    // SAFETY: the pointers passed on are under this function's own contract.
+    match unsafe { text(store_id) } {
         Some(id) if !title.store_id.is_empty() && id == title.store_id => {
-            put_string(&xpackage::identifier(), size, buffer, std::ptr::null_mut())
+            // SAFETY: the pointers passed on are under this function's own contract.
+            unsafe { put_string(&xpackage::identifier(), size, buffer, std::ptr::null_mut()) }
         }
         _ => xpackage::NO_PACKAGE,
     }
@@ -486,7 +491,8 @@ unsafe extern "system" fn register(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    put(out, token())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, token()) }
 }
 extern "system" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> bool {
     true

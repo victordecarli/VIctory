@@ -60,7 +60,8 @@ type This = *const Object;
 ///
 /// `out` is null or valid for a write of a `u16`.
 unsafe extern "system" fn udp_port(_: This, out: *mut u16) -> HRESULT {
-    put(out, UDP_PORT)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, UDP_PORT) }
 }
 
 /// Tells our port queries apart from other calls on the same block.
@@ -106,7 +107,9 @@ unsafe extern "system" fn security_info_async(
     url: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    tracing::debug!(url = text(url).unwrap_or_default(), "security information: offline");
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let url = unsafe { text(url) }.unwrap_or_default();
+    tracing::debug!(url, "security information: offline");
     // SAFETY: the pointers passed on are under this function's own contract.
     unsafe { xasync::finished(block, (&raw const SECURITY).cast(), UNREACHABLE) }
 }
@@ -160,7 +163,8 @@ extern "system" fn verify_certificate(
 ///
 /// `out` is null or valid for a write of a [`ConnectivityHint`].
 unsafe extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRESULT {
-    put(out, OFFLINE)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, OFFLINE) }
 }
 
 /// The hint never changes offline, so the callback never runs.
@@ -175,7 +179,8 @@ unsafe extern "system" fn register(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    put(out, token())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, token()) }
 }
 extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true

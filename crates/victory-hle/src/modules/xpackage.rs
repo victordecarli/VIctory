@@ -40,7 +40,8 @@ pub fn identifier() -> String {
 /// `id` is null or points to a NUL-terminated string valid for reads for the
 /// duration of the call.
 unsafe fn is_ours(id: *const c_char) -> bool {
-    text(id).is_some_and(|id| id == identifier())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { text(id) }.is_some_and(|id| id == identifier())
 }
 
 /// Bytes in the package folder, counted once.
@@ -71,7 +72,8 @@ type This = *const Object;
 ///
 /// `buffer` is null or valid for writes of `size` bytes.
 unsafe extern "system" fn current_identifier(_: This, size: usize, buffer: *mut u8) -> HRESULT {
-    put_string(&identifier(), size, buffer, std::ptr::null_mut())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put_string(&identifier(), size, buffer, std::ptr::null_mut()) }
 }
 
 extern "system" fn is_packaged(_: This) -> bool {
@@ -104,7 +106,8 @@ unsafe extern "system" fn create_monitor(
     if !unsafe { is_ours(id) } {
         return NO_PACKAGE;
     }
-    put(out, monitor())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, monitor()) }
 }
 extern "system" fn close_monitor(_: This, _: *const c_void) {}
 
@@ -123,16 +126,19 @@ pub struct Progress {
 /// `out` is null or valid for a write of a [`Progress`].
 unsafe extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
     let bytes = package_bytes();
-    put(
-        out,
-        Progress {
-            total_bytes: bytes,
-            installed_bytes: bytes,
-            launch_bytes: bytes,
-            launchable: true,
-            completed: true,
-        },
-    );
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        put(
+            out,
+            Progress {
+                total_bytes: bytes,
+                installed_bytes: bytes,
+                launch_bytes: bytes,
+                launchable: true,
+                completed: true,
+            },
+        )
+    };
 }
 
 /// The installation is complete, so progress never changes.
@@ -147,7 +153,8 @@ unsafe extern "system" fn register_progress(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    put(out, token())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, token()) }
 }
 
 /// 0: ready.
@@ -173,7 +180,8 @@ unsafe extern "system" fn find_availability(
     if !unsafe { is_ours(id) } {
         return NO_PACKAGE;
     }
-    put(out, 0)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, 0) }
 }
 
 /// # Safety
@@ -254,7 +262,8 @@ unsafe extern "system" fn estimate_download(
         // SAFETY: checked non-null; writable, per this function's contract.
         unsafe { confirm.write(false) };
     }
-    put(bytes, 0)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(bytes, 0) }
 }
 
 /// Accepted without removing anything.
@@ -291,7 +300,8 @@ extern "system" fn close_mount(_: This, _: *const c_void) {}
 /// `id` is null or points to a NUL-terminated string valid for reads for the
 /// duration of the call.
 unsafe extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
-    tracing::info!(id = text(id).unwrap_or_default(), "package uninstall refused");
+    // SAFETY: the pointers passed on are under this function's own contract.
+    tracing::info!(id = unsafe { text(id) }.unwrap_or_default(), "package uninstall refused");
     false
 }
 
@@ -307,7 +317,8 @@ unsafe extern "system" fn mount_async(
     id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    tracing::info!(id = text(id).unwrap_or_default(), "package mount: not installed");
+    // SAFETY: the pointers passed on are under this function's own contract.
+    tracing::info!(id = unsafe { text(id) }.unwrap_or_default(), "package mount: not installed");
     // SAFETY: the pointers passed on are under this function's own contract.
     unsafe { xasync::finished(block, (&raw const MOUNT).cast(), NO_PACKAGE) }
 }
