@@ -49,6 +49,24 @@ const LANE_LOOP: [u32; 9] = [
     0xBF89_FFFA,          // s_cbranch_execnz back to the v_readlane
     END_IF,
 ];
+/// v1 = v0; each round, v1 += lane 10's v0 (read into s14), and the lanes that reached 40
+/// leave (`break`: the loop's first exit, when every lane left); then v1 += 1, and the
+/// lanes that reached 40 leave at the loop's second exit.
+const LOOP_TWO_EXITS: [u32; 13] = [
+    V1_V0,
+    0xBE8C_047E, // s_mov_b64 s[12:13], exec
+    READLANE_10[0],
+    READLANE_10[1],
+    vop2(0x25, 1, 14, 1),   // v_add_nc_u32 v1, s14, v1
+    0x7D86_02A8,            // v_cmp_le_u32 vcc, 40, v1
+    0x8AFE_6A7E,            // s_andn2_b64 exec, exec, vcc
+    0xBF88_0004,            // s_cbranch_execz past the loop
+    vop2(0x25, 1, 0x81, 1), // v_add_nc_u32 v1, 1, v1
+    0x7D86_02A8,            // v_cmp_le_u32 vcc, 40, v1
+    0x8AFE_6A7E,            // s_andn2_b64 exec, exec, vcc
+    0xBF89_FFF6,            // s_cbranch_execnz back to the v_readlane
+    END_IF,
+];
 /// v_mov_b32 v1, 0; s_mov_b32 s12, 7; v_writelane_b32 v1, s12, 40
 const WRITELANE_40: [u32; 4] = [0x7E02_0280, 0xBE8C_0387, 0xD761_0001, 0x0001_500C];
 /// v_lshlrev_b32 v2, 2, v0; buffer_store_dword v1, v2, s[8:11], 0 offen: v1 to dword
@@ -403,6 +421,12 @@ fn branch_encodings_decode_as_named() {
         ]
     );
     assert_eq!(sp3(&[READFIRSTLANE_V0_S14]), ["v_readfirstlane_b32 s14, v0"]);
+    let two = sp3(&LOOP_TWO_EXITS);
+    assert_eq!(
+        two[5..8],
+        ["s_andn2_b64 exec, exec, vcc", "s_cbranch_execz label_0030", "v_add_nc_u32 v1, 1, v1"]
+    );
+    assert_eq!(two[10..], ["s_cbranch_execnz label_0008", "s_mov_b64 exec, s[12:13]"]);
 }
 
 #[test]
@@ -516,6 +540,14 @@ fn sum_in_a_branch() -> NativeProgram {
 #[test]
 fn a_lane_loop_is_taken_wave_wide() {
     assert_eq!(translate(&wave(&LANE_LOOP), 32).unwrap().wave_size, Some(32));
+}
+
+/// A loop with two exits: each lies in the other's region, so neither is outermost. Both
+/// close the same loop and the console takes each for the whole wave, so they are taken
+/// wave-wide together.
+#[test]
+fn the_exits_of_one_loop_are_taken_wave_wide_together() {
+    assert_eq!(translate(&wave(&LOOP_TWO_EXITS), 32).unwrap().wave_size, Some(32));
 }
 
 /// The console adds floats in its own tree, which the halves' wave sums do not follow: a
@@ -725,6 +757,29 @@ mod card {
                     v += 10;
                 }
                 v
+            })
+            .collect();
+        assert_eq!(out, want);
+    }
+
+    /// The upper half's lanes all leave at the first exit of the first round; the lower
+    /// half's go on reading lane 10.
+    #[test]
+    fn a_lane_read_in_a_loop_of_two_exits_reaches_the_other_half() {
+        let Some(out) = run_program(&wave(&LOOP_TWO_EXITS)) else { return };
+        let want: Vec<u32> = (0..64)
+            .map(|t| {
+                let mut v = t;
+                loop {
+                    v += 10;
+                    if v >= 40 {
+                        break v;
+                    }
+                    v += 1;
+                    if v >= 40 {
+                        break v;
+                    }
+                }
             })
             .collect();
         assert_eq!(out, want);

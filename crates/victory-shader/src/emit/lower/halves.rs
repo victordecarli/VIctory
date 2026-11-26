@@ -41,7 +41,9 @@
 //! blocks. A branch closing a loop each lane leaves on its own is taken so
 //! too: the wave goes round again while some lane of it is left, and the
 //! lanes that left stay out of the vector instructions. Only branches in no
-//! other lane branch's region are taken so, outermost first.
+//! other lane branch's region are taken so, outermost first, but for the
+//! exits of one such loop, which lie in each other's regions and are taken
+//! together.
 //!
 //! Every other console wave64 program keeps 64-lane waves.
 //!
@@ -268,8 +270,10 @@ fn lane_scalar_read_past(
 
 /// The lane branches to take wave-wide next so that `p` could run in
 /// halves: those around the block holding the reason [`keeps_64`] gives
-/// that lie in no other lane branch's region (a branch closing a loop each
-/// lane leaves on its own lies in its own). Empty when there is none.
+/// that lie in no other lane branch's region, but for the regions of the
+/// branches that lie in theirs too: the exits of one loop each lanes leave
+/// on their own, taken together. (A branch closing such a loop lies in its
+/// own region.) Empty when there is none.
 pub(super) fn to_widen(p: &Program, st: &Structured, group: u32, lds_dwords: u32) -> Vec<usize> {
     let Some(Keep { at: Some(at), .. }) = keeps_64_at(p, st, group, lds_dwords) else {
         return Vec::new();
@@ -277,14 +281,12 @@ pub(super) fn to_widen(p: &Program, st: &Structured, group: u32, lds_dwords: u32
     let Some(regions) = lane_regions(st) else {
         return Vec::new();
     };
-    let inside_another = |d: usize| {
-        regions.iter().any(|r| r.branch != d && r.blocks.get(d).copied().unwrap_or(false))
+    let holds = |r: &Region, b: usize| r.blocks.get(b).copied().unwrap_or(false);
+    // Some other branch's region holds `r`'s branch, and `r`'s does not hold it back.
+    let enclosed = |r: &Region| {
+        regions.iter().any(|o| o.branch != r.branch && holds(o, r.branch) && !holds(r, o.branch))
     };
-    regions
-        .iter()
-        .filter(|r| !inside_another(r.branch) && r.blocks.get(at).copied().unwrap_or(false))
-        .map(|r| r.branch)
-        .collect()
+    regions.iter().filter(|r| !enclosed(r) && holds(r, at)).map(|r| r.branch).collect()
 }
 
 /// Why the whole-wave sections of `p` keep 64-lane waves. In a group of two
