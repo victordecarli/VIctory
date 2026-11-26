@@ -118,7 +118,8 @@ pub(crate) unsafe extern "system" fn create_allocator(
     out: *mut This,
 ) -> HRESULT {
     let allocator = Box::new(Allocator { object: Object::new(&ALLOCATOR_FUNCTIONS), kind });
-    object::hand_out(ALLOCATOR, allocator, iid, &ALLOCATOR_IIDS, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::hand_out(ALLOCATOR, allocator, iid, &ALLOCATOR_IIDS, out) }
 }
 
 /// Lists start open, as in D3D12.
@@ -210,7 +211,8 @@ unsafe fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) 
         #[cfg(windows)]
         state: Default::default(),
     });
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::hand_out(LIST, list, iid, &LIST_IIDS, out) }
 }
 
 /// # Safety
@@ -219,15 +221,19 @@ unsafe fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) 
 /// to an interface id valid for reads, and `out` is null or valid for a
 /// write of an object pointer, for the duration of the call.
 unsafe extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let found = object::is(iid, &ALLOCATOR_IIDS).then_some(this);
-    object::answer(ALLOCATOR, iid, found, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let found = unsafe { object::is(iid, &ALLOCATOR_IIDS) }.then_some(this);
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(ALLOCATOR, iid, found, out) }
 }
 /// # Safety
 ///
 /// `this` is a live allocator this module created, holding the reference
 /// the caller gives up; it must not be used after the last one is released.
 unsafe extern "system" fn allocator_release(this: This) -> u32 {
-    object::release_boxed::<Allocator>(this)
+    // SAFETY: a live object this module made with `hand_out` from a box of
+    // this type (this function's contract).
+    unsafe { object::release_boxed::<Allocator>(this) }
 }
 /// Nothing is recorded, so there is nothing to free.
 extern "system" fn allocator_reset(_: This) -> HRESULT {
@@ -240,14 +246,17 @@ extern "system" fn allocator_reset(_: This) -> HRESULT {
 /// interface id valid for reads, and `out` is null or valid for a write of
 /// an object pointer, for the duration of the call.
 unsafe extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out) }
 }
 /// # Safety
 ///
 /// `this` is a live list this module created, holding the reference the
 /// caller gives up; it must not be used after the last one is released.
 unsafe extern "system" fn list_release(this: This) -> u32 {
-    object::release_boxed::<List>(this)
+    // SAFETY: a live object this module made with `hand_out` from a box of
+    // this type (this function's contract).
+    unsafe { object::release_boxed::<List>(this) }
 }
 /// # Safety
 ///

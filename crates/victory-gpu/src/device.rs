@@ -44,7 +44,8 @@ const LEVEL_IIDS: [Iid; 9] = [
 ///
 /// `iid` is null or points to an interface id valid for reads.
 pub(crate) unsafe fn is_device(iid: *const Iid) -> bool {
-    object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS) }
 }
 
 /// The interface version these layouts were checked against (2.4). Both
@@ -115,7 +116,8 @@ pub unsafe extern "system" fn create(
     if *iid == LEVEL_IIDS[8] {
         NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    object::answer(object::DEVICE, iid, Some(device()), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(object::DEVICE, iid, Some(device()), out) }
 }
 
 /// Set when the title creates the device as `ID3D12Device11`. Its lists and
@@ -139,14 +141,17 @@ pub(crate) fn newer() -> bool {
 /// for the duration of the call.
 unsafe extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     // SAFETY: `iid` is null or readable, per this function's contract.
-    let found = if unsafe { is_device(iid) } {
-        Some(this)
-    } else if object::is(iid, &dxgi::DEVICE_IIDS) {
-        Some(dxgi::device())
-    } else {
-        None
+    let found = unsafe {
+        if is_device(iid) {
+            Some(this)
+        } else if object::is(iid, &dxgi::DEVICE_IIDS) {
+            Some(dxgi::device())
+        } else {
+            None
+        }
     };
-    object::answer(object::DEVICE, iid, found, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(object::DEVICE, iid, found, out) }
 }
 
 /// What `D3D12ConfigureVirtualMemoryX` takes and fills in.

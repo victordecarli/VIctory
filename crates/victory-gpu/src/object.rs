@@ -1,10 +1,6 @@
 //! What every console graphics object starts with: a function table
 //! pointer, bookkeeping bits and a reference count. Tables begin with
 //! IUnknown's three slots. Our objects are static and never destroyed.
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -64,13 +60,19 @@ pub(crate) struct Table<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Table<N> {}
 
-pub(crate) extern "system" fn add_ref(this: This) -> u32 {
-    // SAFETY: `this` is one of our objects.
+/// # Safety
+///
+/// `this` is one of our objects.
+pub(crate) unsafe extern "system" fn add_ref(this: This) -> u32 {
+    // SAFETY: one of our objects (the caller's contract).
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-pub(crate) extern "system" fn release(this: This) -> u32 {
-    // SAFETY: `this` is one of our objects.
+/// # Safety
+///
+/// `this` is one of our objects.
+pub(crate) unsafe extern "system" fn release(this: This) -> u32 {
+    // SAFETY: one of our objects (the caller's contract).
     let refs = &unsafe { &*this }.refs;
     let _ = refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     refs.load(Ordering::Relaxed)
@@ -78,56 +80,85 @@ pub(crate) extern "system" fn release(this: This) -> u32 {
 
 /// Answers an interface query (or any call handing out an object): a new
 /// reference to `found`, or null and `E_NOINTERFACE`.
-pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mut This) -> HRESULT {
+///
+/// # Safety
+///
+/// `iid` is null or valid for a read of an interface id; `found` is one of
+/// our objects; `out` is null or valid for a write of a pointer.
+pub(crate) unsafe fn answer(
+    kind: usize,
+    iid: *const Iid,
+    found: Option<This>,
+    out: *mut This,
+) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
     let hr = match found {
         Some(object) => {
-            add_ref(object);
-            // SAFETY: checked non-null; the title passes room for a pointer.
+            // SAFETY: one of our objects (the caller's contract).
+            unsafe { add_ref(object) };
+            // SAFETY: checked non-null; valid (the caller's contract).
             unsafe { out.write(object) };
             return S_OK;
         }
         None => E_NOINTERFACE,
     };
-    // SAFETY: the title passes an interface id (null is tolerated).
+    // SAFETY: null or a valid interface id (the caller's contract).
     let iid = unsafe { iid.as_ref() }.map(guid_text).unwrap_or_default();
     tracing::warn!(object = KINDS[kind], %iid, "unknown interface");
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; valid (the caller's contract).
     unsafe { out.write(std::ptr::null()) };
     hr
 }
 
 /// Whether `iid` is one of `known`.
-pub(crate) fn is(iid: *const Iid, known: &[Iid]) -> bool {
-    // SAFETY: the title passes an interface id (null is tolerated).
+///
+/// # Safety
+///
+/// `iid` is null or valid for a read of an interface id.
+pub(crate) unsafe fn is(iid: *const Iid, known: &[Iid]) -> bool {
+    // SAFETY: null or a valid interface id (the caller's contract).
     unsafe { iid.as_ref() }.is_some_and(|i| known.contains(i))
 }
 
 /// Hands a new object to the title as one of `known`, or drops it. `T`
 /// starts with its `Object`; its table's release slot is
 /// [`release_boxed::<T>`].
-pub(crate) fn hand_out<T>(
+///
+/// # Safety
+///
+/// `T` starts with its `Object`; `iid` is null or valid for a read of an
+/// interface id; `out` is null or valid for a write of a pointer.
+pub(crate) unsafe fn hand_out<T>(
     kind: usize,
     object: Box<T>,
     iid: *const Iid,
     known: &[Iid],
     out: *mut This,
 ) -> HRESULT {
-    if !is(iid, known) {
-        return answer(kind, iid, None, out);
+    // SAFETY: the caller's contract on `iid`.
+    if !unsafe { is(iid, known) } {
+        // SAFETY: the caller's contract on `iid` and `out`.
+        return unsafe { answer(kind, iid, None, out) };
     }
     if out.is_null() {
         // Asked only whether creation would succeed.
         return S_FALSE;
     }
-    answer(kind, iid, Some(Box::into_raw(object).cast()), out)
+    // SAFETY: as above; a `T` starts with its `Object`, so the box is one of
+    // our objects.
+    unsafe { answer(kind, iid, Some(Box::into_raw(object).cast()), out) }
 }
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
-pub(crate) fn release_boxed<T>(this: This) -> u32 {
-    // SAFETY: `this` is the header of a boxed `T`.
+///
+/// # Safety
+///
+/// `this` is an object [`hand_out`] made from a `Box<T>`, with a reference
+/// the caller gives up.
+pub(crate) unsafe fn release_boxed<T>(this: This) -> u32 {
+    // SAFETY: the header of a boxed `T` (the caller's contract).
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
@@ -148,13 +179,18 @@ fn private_data() -> std::sync::MutexGuard<'static, BTreeMap<(usize, Iid), Vec<u
     PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-extern "system" fn get_private_data(
+/// # Safety
+///
+/// `id` is null or valid for a read of an id; `size` is null or valid for
+/// reads and writes of a `u32`; `data` is null or valid for writes of
+/// `*size` bytes.
+unsafe extern "system" fn get_private_data(
     this: This,
     id: *const Iid,
     size: *mut u32,
     data: *mut u8,
 ) -> HRESULT {
-    // SAFETY: the title passes an id and its buffer size (null is tolerated).
+    // SAFETY: null or valid (the caller's contract).
     let (Some(id), Some(size)) = (unsafe { (id.as_ref(), size.as_mut()) }) else {
         return E_INVALIDARG;
     };
@@ -171,19 +207,25 @@ extern "system" fn get_private_data(
     if room < len {
         return MORE_DATA;
     }
-    // SAFETY: the buffer holds `room` >= `len` bytes.
+    // SAFETY: the buffer holds `room` >= `len` bytes (the caller's
+    // contract).
     unsafe { data.copy_from_nonoverlapping(value.as_ptr(), value.len()) };
     S_OK
 }
 
 /// Null data removes the entry.
-extern "system" fn set_private_data(
+///
+/// # Safety
+///
+/// `id` is null or valid for a read of an id; `data` is null or valid for
+/// reads of `size` bytes.
+unsafe extern "system" fn set_private_data(
     this: This,
     id: *const Iid,
     size: u32,
     data: *const u8,
 ) -> HRESULT {
-    // SAFETY: the title passes an id (null is tolerated).
+    // SAFETY: null or valid (the caller's contract).
     let Some(&id) = (unsafe { id.as_ref() }) else {
         return E_INVALIDARG;
     };
@@ -191,7 +233,7 @@ extern "system" fn set_private_data(
     if data.is_null() {
         map.remove(&(this as usize, id));
     } else {
-        // SAFETY: the title passes `size` bytes.
+        // SAFETY: non-null, so `size` bytes (the caller's contract).
         let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
         map.insert((this as usize, id), value.to_vec());
     }
@@ -208,11 +250,15 @@ pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*con
 }
 
 /// The object methods' name setter: names only reach our log.
-pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
+///
+/// # Safety
+///
+/// `name` is null or a NUL-terminated UTF-16 string valid for reads.
+pub(crate) unsafe extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
     let name = if name.is_null() {
         String::new()
     } else {
-        // SAFETY: a non-null name is NUL-terminated UTF-16.
+        // SAFETY: non-null, so NUL-terminated UTF-16 (the caller's contract).
         let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
         // SAFETY: `len` units were just read.
         String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
@@ -223,12 +269,21 @@ pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT 
 
 /// The device-child method: the device that made the object, as any of
 /// the interfaces the device itself answers to.
-pub(crate) extern "system" fn parent_device(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+///
+/// # Safety
+///
+/// `iid` is null or valid for a read of an interface id; `out` is null or
+/// valid for a write of a pointer.
+pub(crate) unsafe extern "system" fn parent_device(
+    _: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     let device = crate::device::device();
-    // SAFETY: the title's id (null is tolerated), as for any method that
-    // takes one.
+    // SAFETY: the caller's contract on `iid`.
     let is_device = unsafe { crate::device::is_device(iid) };
-    answer(DEVICE, iid, is_device.then_some(device), out)
+    // SAFETY: the caller's contract; the device is one of our objects.
+    unsafe { answer(DEVICE, iid, is_device.then_some(device), out) }
 }
 
 pub(crate) const DEVICE: usize = 0;

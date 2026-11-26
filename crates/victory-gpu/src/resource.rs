@@ -656,7 +656,8 @@ pub(crate) unsafe extern "system" fn create_heap(
         Err(hr) => return hr,
     };
     let heap = Box::new(Heap { object: Object::new(&HEAP_FUNCTIONS), desc, memory });
-    object::hand_out(HEAP, heap, iid, &HEAP_IIDS, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::hand_out(HEAP, heap, iid, &HEAP_IIDS, out) }
 }
 
 /// # Safety
@@ -665,14 +666,17 @@ pub(crate) unsafe extern "system" fn create_heap(
 /// interface id valid for reads, and `out` is null or valid for a write of
 /// an object pointer, for the duration of the call.
 unsafe extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    object::answer(HEAP, iid, object::is(iid, &HEAP_IIDS).then_some(this), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(HEAP, iid, object::is(iid, &HEAP_IIDS).then_some(this), out) }
 }
 /// # Safety
 ///
 /// `this` is a live heap this module created, holding the reference the
 /// caller gives up; it must not be used after the last one is released.
 unsafe extern "system" fn heap_release(this: This) -> u32 {
-    object::release_boxed::<Heap>(this)
+    // SAFETY: a live object this module made with `hand_out` from a box of
+    // this type (this function's contract).
+    unsafe { object::release_boxed::<Heap>(this) }
 }
 /// # Safety
 ///
@@ -1013,7 +1017,8 @@ unsafe fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
-    object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out) }
 }
 
 #[cfg(windows)]
@@ -1314,7 +1319,8 @@ pub(crate) unsafe extern "system" fn create_placed(
         tracing::warn!(?desc, offset, heap = h.desc.size, "placed resource does not fit");
         return E_INVALIDARG;
     }
-    object::add_ref(heap);
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::add_ref(heap) };
     let backing = Backing::Placed { heap, offset };
     // SAFETY: as this function's contract gives them.
     unsafe {
@@ -1328,14 +1334,17 @@ pub(crate) unsafe extern "system" fn create_placed(
 /// to an interface id valid for reads, and `out` is null or valid for a
 /// write of an object pointer, for the duration of the call.
 unsafe extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    object::answer(RESOURCE, iid, object::is(iid, &RESOURCE_IIDS).then_some(this), out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(RESOURCE, iid, object::is(iid, &RESOURCE_IIDS).then_some(this), out) }
 }
 /// # Safety
 ///
 /// `this` is a live resource this module created, holding the reference the
 /// caller gives up; it must not be used after the last one is released.
 unsafe extern "system" fn resource_release(this: This) -> u32 {
-    object::release_boxed::<Resource>(this)
+    // SAFETY: a live object this module made with `hand_out` from a box of
+    // this type (this function's contract).
+    unsafe { object::release_boxed::<Resource>(this) }
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
 /// `out` only asks for residency.

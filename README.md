@@ -108,8 +108,8 @@ Safe to call from title code:
   stages return the API's failure instead (`a1c63b8`, `13bec12`, `c4ae7c1`,
   `a2db8c8`, `197bf80`, `cab9fcf`).
 - FFI functions that dereference raw pointers are `unsafe` with a `# Safety`
-  section, one module at a time; 1 module-level `not_unsafe_ptr_arg_deref`
-  allow remains (see the lint ratchet in `AGENTS.md`).
+  section; no module-level `not_unsafe_ptr_arg_deref` allow remains, so
+  clippy rejects a safe one.
 - A pointer read goes through `NonNull` instead of a null check
   (`c8753f8`); tests check the pointers a call wrote out before using them
   (`c26b43d`, `cc0ba34`).

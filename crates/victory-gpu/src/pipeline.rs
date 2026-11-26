@@ -299,7 +299,8 @@ unsafe fn hand_out(
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
-    object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out) }
 }
 
 /// Device method.
@@ -491,8 +492,10 @@ pub(crate) unsafe extern "system" fn create_stream(
 /// to an interface id valid for reads, and `out` is null or valid for a
 /// write of an object pointer, for the duration of the call.
 unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
-    object::answer(PIPELINE, iid, found, out)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let found = unsafe { object::is(iid, &PIPELINE_IIDS) }.then_some(this);
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { object::answer(PIPELINE, iid, found, out) }
 }
 /// `Release`.
 ///
@@ -501,7 +504,9 @@ unsafe extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> 
 /// `this` is a live pipeline this module created, holding the reference the
 /// caller gives up; it must not be used after the last one is released.
 unsafe extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<Pipeline>(this)
+    // SAFETY: a live object this module made with `hand_out` from a box of
+    // this type (this function's contract).
+    unsafe { object::release_boxed::<Pipeline>(this) }
 }
 
 /// IUnknown 3, object 4, device child 1, pipeline 3.
