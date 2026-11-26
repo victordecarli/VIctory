@@ -343,6 +343,18 @@ fn encodings_decode_as_named() {
             "s_cbranch_scc1 label_0010",
         ]
     );
+    assert_eq!(
+        sp3(&IF_ELSE_ONE_QUIET_WAY)[1..],
+        [
+            "v_readfirstlane_b32 s14, v0",
+            "s_cmp_lt_u32 s14, 64",
+            "s_cbranch_scc1 label_0020",
+            "v_readlane_b32 s14, v0, 10",
+            "v_mov_b32 v1, s14",
+            "s_branch label_0024",
+            "v_add_nc_u32 v1, 7, v1",
+        ]
+    );
     assert_eq!(names(&[vop2(0x1D, 3, 0x81, 0)]), ["v_xor_b32"]);
     // (the branch skips the one dword after it)
     assert_eq!(
@@ -528,6 +540,15 @@ fn what_the_waves_of_a_group_take_apart_keeps_64_lane_waves() {
     // v1 = s14, lane 10's v0 as the loop's last round read it.
     let read_past = [&SCALAR_LOOP_BY_WAVE[..], &[V1_S14]].concat();
     assert_eq!(translate(&two_waves(&read_past), 32).unwrap().wave_size, Some(64));
+    // [`IF_ELSE_ONE_QUIET_WAY`] whose other way reads lane 40 (into s12) too: both ways meet.
+    let both_meet = [
+        &IF_ELSE_ONE_QUIET_WAY[..7],
+        &[0xBF82_0003], // s_branch past the other way
+        &READLANE_40[..],
+        &[V1_S12],
+    ]
+    .concat();
+    assert_eq!(translate(&two_waves(&both_meet), 32).unwrap().wave_size, Some(64));
 }
 
 /// v1 = the console lane (which asks for 64-lane waves); s14 = 0; s14 = 5 where some lane
@@ -553,6 +574,30 @@ const SCALAR_JOINED_PAST_104: [u32; 12] = [
 #[test]
 fn a_scalar_joined_past_a_group_wide_branch_splits() {
     let cs = two_waves(&SCALAR_JOINED_PAST_104);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
+}
+
+/// v1 = v0; a scalar branch the console waves decide each for themselves (on the wave's
+/// first thread): the second wave sets v1 to its lane 10 (read into s14), a way where the
+/// halves meet, and the first adds 7 to v1, a way where they do not.
+const IF_ELSE_ONE_QUIET_WAY: [u32; 9] = [
+    V1_V0,
+    READFIRSTLANE_V0_S14,
+    0xBF0A_C00E, // s_cmp_lt_u32 s14, 64: the first console wave
+    0xBF85_0004, // s_cbranch_scc1 to the add
+    READLANE_10[0],
+    READLANE_10[1],
+    V1_S14,
+    0xBF82_0001,            // s_branch past the add
+    vop2(0x25, 1, 0x87, 1), // v_add_nc_u32 v1, 7, v1
+];
+
+/// An if/else the whole group takes, one of whose ways has no place where the halves meet,
+/// splits: the group runs the other way, then each console wave that takes the quiet one
+/// runs it on its own.
+#[test]
+fn an_if_else_with_one_quiet_way_splits() {
+    let cs = two_waves(&IF_ELSE_ONE_QUIET_WAY);
     assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
 }
 
@@ -1356,6 +1401,15 @@ mod card {
     fn a_scalar_joined_past_a_group_wide_branch_is_each_waves_own() {
         let Some(out) = run_group(&two_waves(&SCALAR_JOINED_PAST_104), 128) else { return };
         let want: Vec<u32> = (0..128).map(|t| if t < 64 { 0 } else { 5 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// The second console wave takes the way that reads its lane 10, which the group runs;
+    /// the first then adds 7 on its own way.
+    #[test]
+    fn an_if_else_with_one_quiet_way_runs_each_waves_way() {
+        let Some(out) = run_group(&two_waves(&IF_ELSE_ONE_QUIET_WAY), 128) else { return };
+        let want: Vec<u32> = (0..128).map(|t| if t < 64 { t + 7 } else { 74 }).collect();
         assert_eq!(out, want);
     }
 
