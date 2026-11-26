@@ -53,7 +53,8 @@ extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) 
 /// `uri` is null or points to a NUL-terminated string valid for reads for
 /// the duration of the call.
 unsafe extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char) -> HRESULT {
-    tracing::info!(uri = text(uri).unwrap_or_default(), "URI not launched");
+    // SAFETY: the pointers passed on are under this function's own contract.
+    tracing::info!(uri = unsafe { text(uri) }.unwrap_or_default(), "URI not launched");
     NOT_SUPPORTED
 }
 
@@ -90,7 +91,8 @@ unsafe extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HR
         unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
         return hr;
     }
-    put(out, request)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, request) }
 }
 
 /// Ends a deferral.

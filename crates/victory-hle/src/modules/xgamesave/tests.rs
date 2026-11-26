@@ -281,8 +281,10 @@ fn saves_persist_across_providers() {
         let (info, out) =
             unsafe { (&*info, &mut *context.cast::<Vec<(String, String, u32, u64)>>()) };
         out.push((
-            text(info.name).unwrap(),
-            text(info.display_name).unwrap(),
+            // SAFETY: the info's names are NUL-terminated during the callback.
+            unsafe { text(info.name) }.unwrap(),
+            // SAFETY: the info's names are NUL-terminated during the callback.
+            unsafe { text(info.display_name) }.unwrap(),
             info.blob_count,
             info.total_size,
         ));

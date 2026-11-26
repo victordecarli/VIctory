@@ -49,15 +49,11 @@ non-Windows body.
 
 ## FFI debt
 
-One module, `xgameruntime`, still starts with a module-level
-`not_unsafe_ptr_arg_deref` allow: its exports take raw pointers in safe
-signatures. Leave that allow as it is when you touch the module for other
-reasons. Removing it is its own change: its functions become
-`unsafe extern "system"` with a `# Safety` section, verified on Windows.
-That includes functions that only hand a title pointer to `put` or
-`text`: the contract belongs on the function the title calls.
-
-`xasync`'s functions are `unsafe` already: a module that starts a call
-or reads its result passes its own contract on in an `unsafe` block. In
+No module here has a `not_unsafe_ptr_arg_deref` allow any more, and new
+code may not add one (hard rule 3). A function that takes a title pointer
+is `unsafe extern "system"` with a `# Safety` section. That includes
+functions that only hand the pointer to `put`, `put_string`, `text` or
+`xasync`, which are `unsafe` themselves: the contract belongs on the
+function the title calls, which passes it on in an `unsafe` block. In
 those `# Safety` sections, "an async block" is one whose `queue` is null
 or an open queue handle.
