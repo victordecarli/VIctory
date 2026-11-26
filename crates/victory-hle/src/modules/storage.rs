@@ -52,7 +52,8 @@ fn folder() -> Option<String> {
 /// `out` is null or valid for a write of a `usize`.
 unsafe extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
     match folder() {
-        Some(path) => put(out, path.len() + 1),
+        // SAFETY: the pointers passed on are under this function's own contract.
+        Some(path) => unsafe { put(out, path.len() + 1) },
         None => NOT_SUPPORTED,
     }
 }
@@ -67,7 +68,8 @@ unsafe extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
 unsafe extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     match folder() {
         Some(path) if size <= path.len() => E_FAIL,
-        Some(path) => put_string(&path, size, buffer, used),
+        // SAFETY: the pointers passed on are under this function's own contract.
+        Some(path) => unsafe { put_string(&path, size, buffer, used) },
         None => NOT_SUPPORTED,
     }
 }
@@ -142,7 +144,8 @@ fn space() -> SpaceInfo {
 ///
 /// `out` is null or valid for a write of a [`SpaceInfo`].
 unsafe extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
-    put(out, space())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, space()) }
 }
 
 /// Tells our prompts apart from other calls on the same block.

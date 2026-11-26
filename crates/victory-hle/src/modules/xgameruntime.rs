@@ -19,10 +19,6 @@
     non_snake_case,
     reason = "exports carry the exact API names (`XGameRuntimeInitialize`) that `hle_export!` binds imports by"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
-)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Mutex;
@@ -115,45 +111,63 @@ pub extern "system" fn add_ref(_: *const Object) -> u32 {
 
 /// A slot nobody has needed yet; logged with its area. Wrong for a slot
 /// that returns `bool` or a value.
-pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
-    // SAFETY: title code calls methods on objects we handed out.
+///
+/// # Safety
+///
+/// `this` is one of our objects, as title code calls its methods.
+pub unsafe extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
+    // SAFETY: one of our static objects (the caller's contract).
     let area = unsafe { (*this).area };
     tracing::warn!(area, slot = format_args!("{:#x}", SLOT * 8), "runtime method not implemented");
     xasync::E_NOTIMPL
 }
 
 /// Writes `value` through `out` if it is non-null.
-pub fn put<T>(out: *mut T, value: T) -> HRESULT {
+///
+/// # Safety
+///
+/// `out` is null or valid for a write of a `T`.
+pub unsafe fn put<T>(out: *mut T, value: T) -> HRESULT {
     if out.is_null() {
         return xasync::E_INVALIDARG;
     }
-    // SAFETY: checked non-null; the title passes room for a `T`.
+    // SAFETY: checked non-null; valid for a `T` (the caller's contract).
     unsafe { out.write(value) };
     S_OK
 }
 
 /// Copies `text` and a NUL into the title's `size`-byte buffer and reports
 /// the bytes used, as the runtime's string getters do.
-pub fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+///
+/// # Safety
+///
+/// `buffer` is null or valid for writes of `size` bytes; `used` is null or
+/// valid for a write of a `usize`.
+pub unsafe fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     let len = text.len() + 1;
     if buffer.is_null() || size < len {
         return xasync::E_NOT_SUFFICIENT_BUFFER;
     }
-    // SAFETY: the buffer holds `size` bytes, checked above.
+    // SAFETY: non-null, so it holds `size` bytes (the caller's contract),
+    // and `size` was checked above.
     unsafe {
         buffer.copy_from_nonoverlapping(text.as_ptr(), text.len());
         buffer.add(text.len()).write(0);
     }
     if !used.is_null() {
-        // SAFETY: checked non-null.
+        // SAFETY: checked non-null; valid (the caller's contract).
         unsafe { used.write(len) };
     }
     S_OK
 }
 
 /// The title's NUL-terminated string, if any.
-pub fn text(s: *const c_char) -> Option<String> {
-    // SAFETY: the title passes a NUL-terminated string or null.
+///
+/// # Safety
+///
+/// `s` is null or a NUL-terminated string valid for reads.
+pub unsafe fn text(s: *const c_char) -> Option<String> {
+    // SAFETY: a non-null `s` is NUL-terminated (the caller's contract).
     (!s.is_null()).then(|| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned())
 }
 
@@ -211,13 +225,18 @@ pub extern "system" fn UninitializeApiImpl() {
 
 /// The object for an implemented (provider, interface id); others fail,
 /// each pair logged once.
-pub extern "system" fn QueryApiImpl(
+///
+/// # Safety
+///
+/// `provider` and `iid` are null or valid for a read of a GUID; `out` is
+/// null or valid for a write of a pointer.
+pub unsafe extern "system" fn QueryApiImpl(
     provider: *const Guid,
     iid: *const Guid,
     out: *mut *mut c_void,
 ) -> HRESULT {
     static QUERIED: Mutex<Vec<(Guid, Guid)>> = Mutex::new(Vec::new());
-    // SAFETY: the title passes pointers to GUIDs (null is tolerated).
+    // SAFETY: null or valid GUIDs (the caller's contract).
     let (Some(&provider), Some(&iid)) = (unsafe { provider.as_ref() }, unsafe { iid.as_ref() })
     else {
         return NOT_SUPPORTED;
@@ -238,7 +257,7 @@ pub extern "system" fn QueryApiImpl(
     if let Some(&(_, _, object)) = found
         && !out.is_null()
     {
-        // SAFETY: checked non-null; the title passes room for a pointer.
+        // SAFETY: checked non-null; valid (the caller's contract).
         unsafe { out.write((object as *const Object).cast_mut().cast()) };
         return S_OK;
     }
@@ -250,11 +269,14 @@ pub extern "system" fn QueryApiImpl(
     NOT_SUPPORTED
 }
 
-pub extern "system" fn XErrorReport(hr: HRESULT, message: *const c_char) {
+/// # Safety
+///
+/// `message` is null or a NUL-terminated string valid for reads.
+pub unsafe extern "system" fn XErrorReport(hr: HRESULT, message: *const c_char) {
     let message = if message.is_null() {
         "".into()
     } else {
-        // SAFETY: a non-null message is a NUL-terminated string.
+        // SAFETY: non-null, so NUL-terminated (the caller's contract).
         unsafe { CStr::from_ptr(message) }.to_string_lossy()
     };
     tracing::warn!(hr = format_args!("{:#010x}", hr as u32), %message, "XErrorReport");

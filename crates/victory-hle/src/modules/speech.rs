@@ -49,7 +49,8 @@ extern "system" fn enumerate_voices(
 ///
 /// `out` is null or valid for a write of a handle.
 unsafe extern "system" fn create(_: This, out: *mut *const u8) -> HRESULT {
-    put(out, &raw const SYNTHESIZER)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, &raw const SYNTHESIZER) }
 }
 extern "system" fn close(_: This, _: *const u8) -> HRESULT {
     S_OK
@@ -73,8 +74,10 @@ unsafe extern "system" fn create_stream(
     words: *const c_char,
     out: *mut *const u8,
 ) -> HRESULT {
-    tracing::debug!(text = text(words).unwrap_or_default(), "speech (silent)");
-    put(out, &raw const STREAM)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    tracing::debug!(text = unsafe { text(words) }.unwrap_or_default(), "speech (silent)");
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, &raw const STREAM) }
 }
 /// The size of a stream's WAVE file.
 ///
@@ -82,7 +85,8 @@ unsafe extern "system" fn create_stream(
 ///
 /// `out` is null or valid for a write of a `usize`.
 unsafe extern "system" fn stream_size(_: This, _: *const u8, out: *mut usize) -> HRESULT {
-    put(out, SILENCE.len())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, SILENCE.len()) }
 }
 /// Copies the empty WAVE file into the title's buffer.
 ///

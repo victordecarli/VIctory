@@ -43,7 +43,8 @@ type This = *const Object;
 ///
 /// `out` is null or valid for a write of a `u32`.
 unsafe extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
-    put(out, runtime::title().id)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, runtime::title().id) }
 }
 
 /// As documented: the title ends (suspended first, as on any end) and the
@@ -63,7 +64,8 @@ unsafe extern "system" fn launch_new_game(
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let (exe, args) = unsafe { (text(exe).unwrap_or_default(), text(args).unwrap_or_default()) };
     tracing::info!(exe, args, "XLaunchNewGame");
     let current = runtime::main_image().and_then(runtime::image_path).unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
@@ -123,7 +125,8 @@ unsafe extern "system" fn register(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    put(out, token())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, token()) }
 }
 extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true

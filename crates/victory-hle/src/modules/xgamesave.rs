@@ -530,7 +530,8 @@ unsafe fn names(names: *const *const c_char, count: u32) -> Option<Vec<String>> 
     }
     // SAFETY: non-null, and `count` strings, per this function's contract.
     let names = unsafe { std::slice::from_raw_parts(names, count as usize) };
-    Some(names.iter().map(|&n| text(n).unwrap_or_default()).collect())
+    // SAFETY: the pointers passed on are under this function's own contract.
+    Some(names.iter().map(|&n| unsafe { text(n) }.unwrap_or_default()).collect())
 }
 
 type This = *const Object;
@@ -625,7 +626,8 @@ unsafe extern "system" fn initialize_async(
     let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         Err(NO_ACCESS)
     } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
+        // SAFETY: the pointers passed on are under this function's own contract.
+        Provider::open(&saves, unsafe { text(config) }.as_deref()).map(|p| xasync::bytes(give(p)))
     };
     // SAFETY: the pointers passed on are under this function's own contract.
     unsafe { xasync::finished_with(block, (&raw const INIT).cast(), result) }
@@ -691,7 +693,8 @@ unsafe extern "system" fn delete_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     // SAFETY: as this function's contract gives them.
-    let hr = match (unsafe { get(provider) }, text(name)) {
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let hr = match (unsafe { get(provider) }, unsafe { text(name) }) {
         (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
         (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
         _ => E_INVALIDARG,
@@ -726,7 +729,9 @@ unsafe extern "system" fn container_info(
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
     // SAFETY: as this function's contract gives them.
-    let (Some(p), Some(name), Some(callback)) = (unsafe { get(provider) }, text(name), callback)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let (Some(p), Some(name), Some(callback)) =
+        (unsafe { get(provider) }, unsafe { text(name) }, callback)
     else {
         return E_INVALIDARG;
     };
@@ -772,13 +777,15 @@ unsafe extern "system" fn create_container(
     out: *mut *mut Container,
 ) -> HRESULT {
     // SAFETY: as this function's contract gives them.
-    let (Some(p), Some(name)) = (unsafe { get(provider) }, text(name)) else {
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let (Some(p), Some(name)) = (unsafe { get(provider) }, unsafe { text(name) }) else {
         return E_INVALIDARG;
     };
     if !valid_container(&name) {
         return INVALID_CONTAINER_NAME;
     }
-    put(out, give(p.container(&name)))
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, give(p.container(&name))) }
 }
 /// # Safety
 ///
@@ -807,7 +814,8 @@ unsafe extern "system" fn enumerate_blobs(
     let (Some(c), Some(callback)) = (unsafe { get(container) }, callback) else {
         return E_INVALIDARG;
     };
-    let prefix = text(prefix).unwrap_or_default();
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let prefix = unsafe { text(prefix) }.unwrap_or_default();
     let blobs = {
         let _saves = saves_lock();
         let version = current_named(&c.dir, &c.name).ok().flatten();
@@ -856,7 +864,8 @@ unsafe extern "system" fn read_blobs(
     // SAFETY: non-null, and `size` writable bytes, per this function's
     // contract.
     unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
-    put(count, blobs.len() as u32)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(count, blobs.len() as u32) }
 }
 
 /// Read at once; the result holds the layout with pointers relative to the
@@ -925,7 +934,8 @@ unsafe extern "system" fn read_result(
             }
         }
     }
-    put(count, blobs as u32)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(count, blobs as u32) }
 }
 
 /// # Safety
@@ -944,15 +954,18 @@ unsafe extern "system" fn create_update(
     let Some(c) = found else {
         return E_INVALIDARG;
     };
-    put(
-        out,
-        give(Update {
-            name: c.name.clone(),
-            dir: c.dir.clone(),
-            display: text(display),
-            changes: Vec::new(),
-        }),
-    )
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        put(
+            out,
+            give(Update {
+                name: c.name.clone(),
+                dir: c.dir.clone(),
+                display: text(display),
+                changes: Vec::new(),
+            }),
+        )
+    }
 }
 /// # Safety
 ///
@@ -978,7 +991,8 @@ unsafe extern "system" fn write_blob(
 ) -> HRESULT {
     // SAFETY: a handle we gave out, per this function's contract; the title
     // does not use it concurrently.
-    let (Some(update), Some(name)) = (unsafe { update.as_mut() }, text(name)) else {
+    // SAFETY: the pointers passed on are under this function's own contract.
+    let (Some(update), Some(name)) = (unsafe { update.as_mut() }, unsafe { text(name) }) else {
         return E_INVALIDARG;
     };
     if name.is_empty() || (data.is_null() && size > 0) {
@@ -1009,7 +1023,8 @@ unsafe extern "system" fn delete_blob(
     name: *const c_char,
 ) -> HRESULT {
     // SAFETY: as in `write_blob`.
-    match (unsafe { update.as_mut() }, text(name)) {
+    // SAFETY: the pointers passed on are under this function's own contract.
+    match (unsafe { update.as_mut() }, unsafe { text(name) }) {
         (Some(update), Some(name)) if !name.is_empty() => {
             update.changes.push((name, None));
             S_OK

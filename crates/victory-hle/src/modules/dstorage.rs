@@ -55,7 +55,8 @@ pub unsafe extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> 
     // SAFETY: `iid` is null or readable, per this function's contract.
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
-            put(out, std::ptr::from_ref(&FACTORY_OBJECT).cast_mut().cast())
+            // SAFETY: the pointers passed on are under this function's own contract.
+            unsafe { put(out, std::ptr::from_ref(&FACTORY_OBJECT).cast_mut().cast()) }
         }
         iid => {
             tracing::warn!(iid = ?iid.map(Guid::to_string), "DStorageGetFactory: unknown interface");
@@ -166,7 +167,8 @@ unsafe extern "system" fn open_file(
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
-    put(out, file)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, file) }
 }
 
 /// `(capacity, name, iid, out)`.
@@ -191,7 +193,8 @@ unsafe extern "system" fn create_status_array(
         Object::new("dstorage status array", &STATUS_VTABLE),
         StatusArray { entries },
     );
-    put(out, array)
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe { put(out, array) }
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
@@ -241,7 +244,10 @@ unsafe extern "system" fn create_queue(
     let lane = Lane::new(desc.priority, desc.capacity);
     lanes.lanes.insert(id, lane);
     drop(lanes);
-    put(out, Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }))
+    // SAFETY: the pointers passed on are under this function's own contract.
+    unsafe {
+        put(out, Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }))
+    }
 }
 
 /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
