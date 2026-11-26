@@ -355,6 +355,25 @@ fn encodings_decode_as_named() {
             "v_add_nc_u32 v1, 7, v1",
         ]
     );
+    assert_eq!(sp3(&IF_ELSE_IN_AN_IF)[1..3], ["s_cmp_lg_u32 s0, 0", "s_cbranch_scc1 label_002C"]);
+    assert_eq!(
+        sp3(&LOOP_TWO_EXITS_BY_WAVE)[1..],
+        [
+            "v_readfirstlane_b32 s16, v0",
+            "s_lshr_b32 s16, s16, 6",
+            "s_mov_b32 s17, s16",
+            "s_add_i32 s16, s16, 1",
+            "v_readlane_b32 s14, v0, 10",
+            "v_add_nc_u32 v1, s14, v1",
+            "s_cmp_eq_u32 s17, 0",
+            "s_cbranch_scc1 label_0038",
+            "s_sub_i32 s16, s16, 1",
+            "s_cmp_lg_u32 s16, 0",
+            "s_cbranch_scc1 label_0014",
+            "s_branch label_003C",
+            "v_add_nc_u32 v1, 64, v1",
+        ]
+    );
     assert_eq!(names(&[vop2(0x1D, 3, 0x81, 0)]), ["v_xor_b32"]);
     // (the branch skips the one dword after it)
     assert_eq!(
@@ -531,12 +550,49 @@ fn a_loop_the_waves_of_a_group_leave_apart_splits() {
     assert_eq!(translate(&two_waves(&LANE_LOOP), 32).unwrap().wave_size, Some(32));
 }
 
+/// v1 = v0; s16 = the wave's first thread / 64 (its console wave) + 1 rounds, s17 = the
+/// console wave. Each round, v1 += lane 10's v0 (read into s14); then the first console wave
+/// leaves (s17 = 0), through a block adding 64 to v1 on its way to the loop's join; the
+/// others count s16 down and leave at the loop's end once it reaches 0, through a block that
+/// only jumps to the join. A loop of two exits the console waves of a group leave apart.
+const LOOP_TWO_EXITS_BY_WAVE: [u32; 15] = [
+    V1_V0,
+    0x7E20_0500, // v_readfirstlane_b32 s16, v0
+    0x9010_8610, // s_lshr_b32 s16, s16, 6
+    0xBE91_0310, // s_mov_b32 s17, s16
+    0x8110_8110, // s_add_i32 s16, s16, 1
+    READLANE_10[0],
+    READLANE_10[1],
+    vop2(0x25, 1, 14, 1),   // v_add_nc_u32 v1, s14, v1
+    0xBF06_8011,            // s_cmp_eq_u32 s17, 0
+    0xBF85_0004,            // s_cbranch_scc1 to the add of 64
+    0x8190_8110,            // s_sub_i32 s16, s16, 1
+    0xBF07_8010,            // s_cmp_lg_u32 s16, 0
+    0xBF85_FFF8,            // s_cbranch_scc1 back to the v_readlane
+    0xBF82_0001,            // s_branch past the add of 64
+    vop2(0x25, 1, 0xC0, 1), // v_add_nc_u32 v1, 64, v1
+];
+
+/// A loop of several exits around a place where the halves meet, which the console waves of
+/// a group leave apart, splits: the group goes round while some console wave would, a wave
+/// runs the block past its own exit in the round it leaves, and each takes, at the loop's
+/// join, what it had there. A lane loop of two exits splits too.
+#[test]
+fn a_loop_of_several_exits_the_waves_leave_apart_splits() {
+    let cs = two_waves(&LOOP_TWO_EXITS_BY_WAVE);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
+    assert_eq!(translate(&two_waves(&LOOP_TWO_EXITS), 32).unwrap().wave_size, Some(32));
+}
+
 /// In a group of several console waves, what the group cannot take as one keeps 64-lane
-/// waves: a lane loop of two exits, and a scalar written in a loop the group takes and read
-/// past it (a wave that left the loop early ran the later rounds' scalar instructions too).
+/// waves: a loop one exit of which ends the program, the other going on, and a scalar
+/// written in a loop the group takes and read past it (a wave that left the loop early ran
+/// the later rounds' scalar instructions too).
 #[test]
 fn what_the_waves_of_a_group_take_apart_keeps_64_lane_waves() {
-    assert_eq!(translate(&two_waves(&LOOP_TWO_EXITS), 32).unwrap().wave_size, Some(64));
+    // [`LOOP_TWO_EXITS_BY_WAVE`] whose first exit ends the program.
+    let returns = [&LOOP_TWO_EXITS_BY_WAVE[..14], &[S_ENDPGM]].concat();
+    assert_eq!(translate(&two_waves(&returns), 32).unwrap().wave_size, Some(64));
     // v1 = s14, lane 10's v0 as the loop's last round read it.
     let read_past = [&SCALAR_LOOP_BY_WAVE[..], &[V1_S14]].concat();
     assert_eq!(translate(&two_waves(&read_past), 32).unwrap().wave_size, Some(64));
@@ -594,12 +650,30 @@ const IF_ELSE_ONE_QUIET_WAY: [u32; 9] = [
 
 /// An if/else the whole group takes, one of whose ways has no place where the halves meet,
 /// splits: the group runs the other way, then each console wave that takes the quiet one
-/// runs it on its own.
+/// runs it on its own. So does one inside an `if` joining where it does.
 #[test]
 fn an_if_else_with_one_quiet_way_splits() {
     let cs = two_waves(&IF_ELSE_ONE_QUIET_WAY);
     assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
+    let cs = two_waves(&IF_ELSE_IN_AN_IF);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
 }
+
+/// [`IF_ELSE_ONE_QUIET_WAY`] inside an `if` on root constant s0 (0, so the program enters
+/// it) that joins where the if/else does.
+const IF_ELSE_IN_AN_IF: [u32; 11] = [
+    V1_V0,
+    0xBF07_8000, // s_cmp_lg_u32 s0, 0
+    0xBF85_0008, // s_cbranch_scc1 to the join
+    READFIRSTLANE_V0_S14,
+    0xBF0A_C00E, // s_cmp_lt_u32 s14, 64: the first console wave
+    0xBF85_0004, // s_cbranch_scc1 to the add
+    READLANE_10[0],
+    READLANE_10[1],
+    V1_S14,
+    0xBF82_0001,            // s_branch past the add
+    vop2(0x25, 1, 0x87, 1), // v_add_nc_u32 v1, 7, v1
+];
 
 /// v_cmp_le_u32 vcc, 104, v0: lanes 40..63 of the second console wave only.
 const VCC_FROM_104: [u32; 2] = [0x7D86_00FF, 104];
@@ -1212,6 +1286,40 @@ mod card {
         assert_eq!(out, want);
     }
 
+    /// The first console wave goes round once and adds 64 on its way out; the second goes
+    /// round twice.
+    #[test]
+    fn a_loop_of_several_exits_runs_each_waves_way_out() {
+        let Some(out) = run_group(&two_waves(&LOOP_TWO_EXITS_BY_WAVE), 128) else { return };
+        let want: Vec<u32> =
+            (0..128).map(|t| if t < 64 { t + 10 + 64 } else { t + 2 * 74 }).collect();
+        assert_eq!(out, want);
+    }
+
+    /// [`a_lane_read_in_a_loop_of_two_exits_reaches_the_other_half`] in a group of two
+    /// console waves, each adding its own lane 10: the lanes leave at either exit, the second
+    /// wave's after its first round.
+    #[test]
+    fn a_lane_loop_of_two_exits_runs_each_lanes_rounds_in_a_group() {
+        let Some(out) = run_group(&two_waves(&LOOP_TWO_EXITS), 128) else { return };
+        let want: Vec<u32> = (0..128)
+            .map(|t| {
+                let (mut v, add) = (t, t / 64 * 64 + 10);
+                loop {
+                    v += add;
+                    if v >= 40 {
+                        break v;
+                    }
+                    v += 1;
+                    if v >= 40 {
+                        break v;
+                    }
+                }
+            })
+            .collect();
+        assert_eq!(out, want);
+    }
+
     /// The lanes from 40 on add lane 10's v0 in each of three rounds; the others keep v0.
     #[test]
     fn a_lane_read_in_a_uniform_loop_inside_a_branch_reaches_the_other_half() {
@@ -1405,11 +1513,13 @@ mod card {
     }
 
     /// The second console wave takes the way that reads its lane 10, which the group runs;
-    /// the first then adds 7 on its own way.
+    /// the first then adds 7 on its own way. The same inside an `if` joining there.
     #[test]
     fn an_if_else_with_one_quiet_way_runs_each_waves_way() {
-        let Some(out) = run_group(&two_waves(&IF_ELSE_ONE_QUIET_WAY), 128) else { return };
         let want: Vec<u32> = (0..128).map(|t| if t < 64 { t + 7 } else { 74 }).collect();
+        let Some(out) = run_group(&two_waves(&IF_ELSE_ONE_QUIET_WAY), 128) else { return };
+        assert_eq!(out, want);
+        let Some(out) = run_group(&two_waves(&IF_ELSE_IN_AN_IF), 128) else { return };
         assert_eq!(out, want);
     }
 

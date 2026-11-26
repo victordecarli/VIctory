@@ -886,6 +886,10 @@ impl<'a> Lower<'a> {
         }
         let mut blocks = Vec::with_capacity(order.len());
         for (n, &b) in order.iter().enumerate() {
+            // (a tail of a loop of several exits runs in its exiting blocks)
+            if n > 0 && self.group_tail_block(b) {
+                continue;
+            }
             let blk = if n == 0 {
                 self.s.entry
             } else {
@@ -913,6 +917,9 @@ impl<'a> Lower<'a> {
             self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
+            if self.block[b].is_none() {
+                continue;
+            }
             self.cur = self.dxil_block(b)?;
             self.cur_ir = b;
             // (the flag's phi, if `b` begins a loop the group takes)
@@ -956,6 +963,8 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+            // (a loop's tail may have run in it, [`Self::group_leave`])
+            self.tail[b] = Some(self.cur);
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
@@ -6907,6 +6916,8 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
+                // (past a vote at an exit of a loop of several exits)
+                self.group_leave(b)?;
                 // A back edge is taken only below the iteration limit.
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
@@ -7009,6 +7020,13 @@ impl<'a> Lower<'a> {
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> Result<usize, Stop> {
+        // An exit of a loop of several exits gets a block of its own.
+        if let Some(join) = self.group_exit_target(from, to) {
+            let e = self.s.m.new_block();
+            self.s.m.terminate(e, Term::Br(join));
+            self.edges.insert((from, to), e);
+            return Ok(e);
+        }
         let target = match self.group_target(from, to) {
             Some(t) => t,
             None => self.dxil_block(to)?,
@@ -7047,6 +7065,23 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            if let Some(ways) = self.group_exits_join(b, i) {
+                let mut incoming = Vec::with_capacity(ways.len());
+                for (x, at) in ways {
+                    let x = match x {
+                        Some(x) => x,
+                        None if self.read_phis.contains(&phi.value) => {
+                            let why = "a loop's exits joining a value with no DXIL form";
+                            return Err(Stop::Retry(phi.value, why));
+                        }
+                        None if bit => self.s.m.bool(false),
+                        None => self.s.m.i32(0),
+                    };
+                    incoming.push((x, at));
+                }
+                self.s.m.set_phi(v, incoming);
+                continue;
+            }
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -7085,6 +7120,9 @@ impl<'a> Lower<'a> {
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
+            if self.group_exits_join(b, i).is_some() {
+                return Err(unsupported(offset, "a lane-mask join past a loop of several exits"));
+            }
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };

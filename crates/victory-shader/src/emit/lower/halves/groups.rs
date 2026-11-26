@@ -21,13 +21,15 @@
 //! on its own, by a branch of its own ([`Lower::group_else`]), so each
 //! comes to the join by its own way.
 //!
-//! A loop around such a place whose branch is its one way out, passed every
-//! round, is taken so too ([`group_loop`]): the group goes round while some
-//! console wave would, and a wave's flag in the loop, a phi at its header,
-//! turns off once the wave would have left ([`Lower::group_round`]), so it
-//! keeps its VGPRs from then on. A wave already out votes to leave. A loop
-//! inside such a loop is taken so too: a wave enters it with its flag in
-//! the loop around.
+//! A loop around such a place whose branches out are ones the group takes,
+//! each passed every round, is taken so too ([`group_loop`]): the group goes
+//! round while some console wave would, and a wave's flag in the loop, a
+//! phi at its header, turns off once the wave would have left
+//! ([`Lower::group_round`]), so it keeps its VGPRs from then on. A wave
+//! already out votes to leave. Of a loop of several exits, a wave runs the
+//! block past its own exit in the round it leaves, and takes at the join
+//! what it had then (`loops`). A loop inside such a loop is taken so too: a
+//! wave enters it with its flag in the loop around.
 //!
 //! That is exact only where the region has nothing else a skipping wave
 //! could get wrong ([`several_keep_64`]): such a wave still runs the
@@ -132,8 +134,9 @@ const BOTH_WAYS: Why =
 /// `if` with an `else` whose ways join at the block first post-dominating
 /// `d`: the way where the halves or the group meet, the other way quiet
 /// (no such place, so no branch the group takes either). Each way begins
-/// at a block only `d` leads to, and the join is reached from the ways
-/// alone.
+/// at a block only `d` leads to, and no block lies on both. The join may be
+/// reached from elsewhere too, not through `d`: such a way keeps its own
+/// values there.
 fn group_if_else(
     p: &Program,
     st: &Structured,
@@ -168,9 +171,9 @@ fn group_if_else(
         (true, true) | (false, false) => return Err(BOTH_WAYS),
     };
     let only_from_d = |b: usize| p.blocks[b].preds == [d];
+    // (the join may be reached from elsewhere too: not through `d`)
     let apart = (0..n).all(|b| !(t[b] && f[b]));
-    let joined = p.blocks[join].preds.iter().all(|&q| t[q] || f[q]);
-    if !(apart && joined && only_from_d(enter) && only_from_d(quiet)) {
+    if !(apart && only_from_d(enter) && only_from_d(quiet)) {
         return Err(BOTH_WAYS);
     }
     Ok(GroupRegion { enter, blocks, join: Some((d, join)), quiet: Some(quiet) })
@@ -242,9 +245,10 @@ pub(super) fn several_keep_64(
     };
     let mut taken: Vec<usize> = st.wide.iter().copied().chain(apart).collect();
     taken.sort_unstable();
+    let set: HashSet<usize> = taken.iter().copied().collect();
     let mut loops = Vec::new();
     for &d in &taken {
-        match group_loop(p, st, d) {
+        match group_loop(p, st, d, &set, lds_dwords > 0) {
             Ok(Some(lp)) => loops.push((d, lp)),
             Ok(None) => {}
             Err(why) => return Keep::fixed(why),
@@ -254,7 +258,9 @@ pub(super) fn several_keep_64(
         // (a console wave out of a loop runs its later rounds as one that skips them)
         let region = match loops.iter().find(|(e, _)| *e == d) {
             Some((_, lp)) => {
-                GroupRegion { enter: lp.header, blocks: lp.blocks.clone(), join: None, quiet: None }
+                // (a console wave runs a tail with the rounds' blocks)
+                let blocks = lp.blocks.iter().zip(&lp.tails).map(|(&b, &t)| b || t).collect();
+                GroupRegion { enter: lp.header, blocks, join: None, quiet: None }
             }
             None => match group_region(p, st, d, lds_dwords > 0) {
                 Ok(r) => r,
