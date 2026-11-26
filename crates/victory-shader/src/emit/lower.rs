@@ -57,6 +57,9 @@ pub(crate) struct Lowered {
     /// group-wide branch ([`halves`]).
     #[cfg(test)]
     pub flagged_accesses: u32,
+    /// Votes of the whole group at a branch it takes as one ([`halves`]).
+    #[cfg(test)]
+    pub group_votes: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -249,6 +252,9 @@ struct Lower<'a> {
     /// See [`Lowered::flagged_accesses`].
     #[cfg(test)]
     flagged_accesses: u32,
+    /// See [`Lowered::group_votes`].
+    #[cfg(test)]
+    group_votes: u32,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -561,6 +567,8 @@ impl<'a> Lower<'a> {
             halves: split,
             #[cfg(test)]
             flagged_accesses: 0,
+            #[cfg(test)]
+            group_votes: 0,
         }
     }
 
@@ -907,6 +915,8 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.dxil_block(b)?;
             self.cur_ir = b;
+            // (the flag's phi, if `b` begins a loop the group takes)
+            self.group_loop_enter(b);
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -967,6 +977,8 @@ impl<'a> Lower<'a> {
             lane_reads: self.s.lane_reads,
             #[cfg(test)]
             flagged_accesses: self.flagged_accesses,
+            #[cfg(test)]
+            group_votes: self.group_votes,
             wave_size: self.s.wave_size,
             dxil: self.s.finish().map_err(Stop::Fail)?,
             user_data,
@@ -6940,11 +6952,12 @@ impl<'a> Lower<'a> {
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+    fn enter_loop(&mut self, from: usize, to: usize, via: usize) {
         if let Some((_, incoming)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
+        self.group_loop_entry(from, to, via);
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no
@@ -6961,6 +6974,7 @@ impl<'a> Lower<'a> {
         let next = self.s.m.bin(c, Bin::Add, *phi, one);
         let limit = self.s.m.i32(super::loop_limit());
         incoming.push((next, c));
+        self.group_loop_back(to, c).map_err(|w| internal(w.to_string()))?;
         Ok(self.s.m.cmp(c, p, next, limit))
     }
 
@@ -7053,6 +7067,7 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        self.fill_group_loops();
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
