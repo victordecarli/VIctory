@@ -10,11 +10,11 @@
     "found": 2734,
     "validated": 1417
   },
-  "compute_wave64": 10,
+  "compute_wave64": 4,
   "mesh": {
     "found": 8765,
     "validated": 8152
   },
-  "commit": "4c1553ea69",
+  "commit": "6ae940792a",
   "commit_date": "2026-11-26"
 }
