@@ -394,7 +394,7 @@ impl<'a> Lower<'a> {
     /// A float source with its abs/neg modifiers.
     fn fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
+            return Err("a vector ALU instruction without VALU fields");
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let selected = Self::sdwa_src(inst, k);
@@ -440,7 +440,7 @@ impl<'a> Lower<'a> {
 
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
+            return Err("a vector ALU instruction without VALU fields");
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
@@ -542,7 +542,7 @@ impl<'a> Lower<'a> {
 
     fn write_f(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
+            return Err("a vector ALU instruction without VALU fields");
         };
         let mut f = f;
         match v.omod {
@@ -572,7 +572,7 @@ impl<'a> Lower<'a> {
 
     fn write_i(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
+            return Err("a vector ALU instruction without VALU fields");
         };
         if v.clamp || v.omod != 0 {
             return Err("integer output modifiers");
