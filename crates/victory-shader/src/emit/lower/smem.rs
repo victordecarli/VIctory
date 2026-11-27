@@ -3,6 +3,31 @@
 
 use super::*;
 
+/// Where an `s_buffer_load_dword*` reads, and what it writes.
+struct Load {
+    /// The first SGPR written.
+    code: u8,
+    /// Dwords read.
+    count: u32,
+    /// The byte address.
+    addr: V,
+    /// The block the instruction starts in.
+    c: usize,
+}
+
+/// The view a descriptor read as data stands for, from how the program
+/// uses the descriptor.
+struct View {
+    /// The descriptor's first dword in the load.
+    first: u8,
+    src: Source,
+    /// The view's handle properties.
+    props: (u32, u32),
+    /// An image's DXIL resource kind; `None` for a buffer.
+    image: Option<u32>,
+    uav: bool,
+}
+
 impl Lower<'_> {
     /// The dword of the program's code at byte `byte` (a constant table
     /// the compiler appends to the code), as an internal constant array.
@@ -98,6 +123,7 @@ impl Lower<'_> {
             let so = self.operand(inst, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
+        let l = Load { code, count, addr, c };
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
             for k in 0..count {
@@ -110,23 +136,7 @@ impl Lower<'_> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
-            }
+            self.smem_srv(inst, &l, h);
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
@@ -138,8 +148,38 @@ impl Lower<'_> {
             }
             _ => None,
         };
+        self.smem_cbuffer(inst, &l, h, constant);
+        Ok(())
+    }
+
+    /// The dwords of a scalar load from SRV `h`, a raw buffer.
+    fn smem_srv(&mut self, inst: &Inst, l: &Load, h: V) {
+        let c = l.c;
+        for k in 0..l.count {
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(c, Bin::Add, l.addr, off);
+            let mask = self.s.m.i8(1);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
+            self.write(inst, Reg::S(l.code + k as u8), x, None);
+        }
+    }
+
+    /// The dwords of a scalar load from constant buffer `h`: at a `constant`
+    /// byte offset, one legacy row load for each 16 bytes.
+    fn smem_cbuffer(&mut self, inst: &Inst, l: &Load, h: V, constant: Option<u32>) {
+        let c = l.c;
         let mut rows: HashMap<u32, V> = HashMap::new();
-        for k in 0..count {
+        for k in 0..l.count {
             let x = match constant {
                 Some(base) => {
                     let byte = base + 4 * k;
@@ -163,13 +203,12 @@ impl Lower<'_> {
                 }
                 None => {
                     let off = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, addr, off);
+                    let a = self.s.m.bin(c, Bin::Add, l.addr, off);
                     self.cbuffer_dword(h, a)
                 }
             };
-            self.write(inst, Reg::S(code + k as u8), x, None);
+            self.write(inst, Reg::S(l.code + k as u8), x, None);
         }
-        Ok(())
     }
 
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
@@ -197,7 +236,26 @@ impl Lower<'_> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
+        let view = self.descriptor_view(site)?;
+        let h = self.handle(site, &view.src, false, view.props)?;
+        let words = self.descriptor_words(h, &view);
+        for k in 0..count {
+            let rel = k.wrapping_sub(u32::from(view.first));
+            match words.iter().find(|w| w.0 == rel) {
+                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                None => {
+                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        self.vals.insert(v, Val::Missing(OTHER));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// How the program uses the descriptor loaded at `site` tells the
+    /// view's kind.
+    fn descriptor_view(&mut self, site: Site) -> Result<View, Why> {
         let use_at =
             self.x.res.descriptors.iter().filter(|d| d.role == Role::Resource).find_map(|d| {
                 d.source.leaves().into_iter().find_map(|l| match *l {
@@ -246,55 +304,47 @@ impl Lower<'_> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        Ok(View { first, src, props, image, uav })
+    }
+
+    /// The descriptor dwords rebuilt from the dimensions of view `h`, by
+    /// their number relative to the descriptor's first.
+    fn descriptor_words(&mut self, h: V, view: &View) -> Vec<(u32, V)> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav { self.s.m.i32(0) } else { self.s.m.undef(i32t) };
+        let mip =
+            if view.image.is_some() && !view.uav { self.s.m.i32(0) } else { self.s.m.undef(i32t) };
         let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
         let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
-            Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) =
-                    (less(self, w), less(self, height), less(self, depth), less(self, levels));
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) =
-                    (k(self, 30), k(self, 2), k(self, 14), k(self, 16), k(self, 0x3FFF));
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
-            }
-            None => vec![(2, field(self, 0))],
+        let Some(kind) = view.image else {
+            return vec![(2, field(self, 0))];
         };
-        for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
-                None => {
-                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
-                    }
-                }
-            }
-        }
-        Ok(())
+        let one = self.s.m.i32(1);
+        let w = field(self, 0);
+        let (height, depth) = match kind {
+            1 => (one, one),
+            2 => (field(self, 1), one),
+            6 => (one, field(self, 1)),
+            _ => (field(self, 1), field(self, 2)),
+        };
+        let levels = if view.uav { one } else { field(self, 3) };
+        let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+        let (w, height, depth, levels) =
+            (less(self, w), less(self, height), less(self, depth), less(self, levels));
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k30, k2, k14, k16, mask) =
+            (k(self, 30), k(self, 2), k(self, 14), k(self, 16), k(self, 0x3FFF));
+        let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+        let hi = self.s.m.bin(c, Bin::LShr, w, k2);
+        let hi = self.s.m.bin(c, Bin::And, hi, mask);
+        let ht = self.s.m.bin(c, Bin::Shl, height, k14);
+        let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
+        let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+        let base = k(self, 0xFAC | ty << 28);
+        let last = self.s.m.bin(c, Bin::Shl, levels, k16);
+        let d3 = self.s.m.bin(c, Bin::Or, base, last);
+        vec![(1, d1), (2, d2), (3, d3), (4, depth)]
     }
 
     /// `s_load_dword*` from the program's constant table.
