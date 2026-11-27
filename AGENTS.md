@@ -126,10 +126,10 @@ Claude Code sessions run `.claude/hooks/check_edit.ps1` before every file
 edit and shell command (configured in `.claude/settings.json`; needs
 `pwsh`). It rejects what CI would fail later: `#[expect(...)]`,
 `cfg(all(test, ...))`, `#[allow]` without `reason`, new
-`not_unsafe_ptr_arg_deref` allows (hard rule 3), citations of decision
-records, and `git commit` with `--no-verify` or `-n`. It checks only the
-text being written, so it shortens the loop; it replaces none of the
-commands above. After each edit of a `.rs` file,
+`not_unsafe_ptr_arg_deref` allows (hard rule 3), decision records cited
+in the old numbered form (see Citations), and `git commit` with
+`--no-verify` or `-n`. It checks only the text being written, so it
+shortens the loop; it replaces none of the commands above. After each edit of a `.rs` file,
 `.claude/hooks/rustfmt_edit.ps1` runs rustfmt on that file alone if it
 was already formatted at `HEAD`, and leaves the files rustfmt has not
 been run on as they are (see the `cargo fmt` row of the lint ratchet).
@@ -167,8 +167,10 @@ been run on as they are (see the `cargo fmt` row of the lint ratchet).
    ~1,200; split by responsibility before you cross either.
 10. **Docs match code in the same commit.** Do not call implemented things
     "planned", or planned things done. Cite only documents that exist in
-    the repository; there is no decision-record directory under `docs/`.
-    Paths cited here are checked; see Citations.
+    the repository. Decision records are ADRs in the docs/adr directory,
+    created when the first decision is recorded (`docs/agents/domain.md`);
+    until then there are none to cite. Paths cited here are checked; see
+    Citations.
 11. **Lints.** Libraries log through `tracing`, never `println!`/`eprintln!`;
     no `dbg!`, `todo!`, `unimplemented!`, `std::process::exit`,
     `mem::forget`, `result.ok();`, or `unwrap`/`expect` outside tests (all
@@ -202,10 +204,11 @@ checks:
   `// SAFETY:`), are not citations and are not checked.
 - To mention a path that must not exist, say it in words, not in a code
   span.
-- The repository has no decision records, so the `portable` job also
-  fails on any `.rs` or `.md` line citing one by number (the word
-  "decision", a space, then a four-digit number starting with 0). Put the
-  reason itself in the comment instead.
+- An ADR is cited as `ADR-NNNN` or by its path. The `portable` job fails
+  on any `.rs` or `.md` line citing a decision record in the old form (the
+  word "decision", a space, then a four-digit number starting with 0),
+  which pointed at records the repository never held. Cite an existing
+  ADR, or put the reason itself in the comment.
 
 ## Pitfalls seen in this repository
 

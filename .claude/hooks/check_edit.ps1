@@ -28,7 +28,7 @@ if ($call.tool_name -eq 'Bash') {
         else { ($in.edits | ForEach-Object { $_.new_string }) -join "`n" }
 
     if ($path -match '\.(rs|md)$' -and [regex]::IsMatch($text, $decisionRecord)) {
-        $problems += 'cites a decision record; none exist, state the reason inline (AGENTS.md, Citations)'
+        $problems += 'cites a decision record in the old numbered form; cite an ADR as ADR-NNNN or by path, or state the reason inline (AGENTS.md, Citations)'
     }
     if ($path -match '\.rs$') {
         if ([regex]::IsMatch($text, $cfgAllTest)) {
