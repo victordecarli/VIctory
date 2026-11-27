@@ -150,6 +150,10 @@ pub unsafe extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if constrained && !at.is_null() {
+        // The frame report counts what the title commits in it.
+        victory_gpu::title_reserved(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
