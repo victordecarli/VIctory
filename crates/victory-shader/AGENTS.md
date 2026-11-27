@@ -49,13 +49,16 @@ dispatch of each instruction (`inst`) and the value helpers every lowering
 shares. The lowerings sit in modules under
 `crates/victory-shader/src/emit/lower/`, each an `impl Lower` block of its
 own: `image`, `memory` (buffer and global loads), `smem` (scalar loads),
-`descriptor` (resource handles), `valu16`, `io` (inputs, interpolation,
-exports) and `halves` (wave64 on a 32-lane host). The scalar ALU, the
-32-bit vector ALU, LDS, stage setup and control flow are still in
-lower.rs, still several times the file limit, and move out the same way
-(issue #77). Put a new lowering in the module of its kind, or a new one
-beside them, never in lower.rs. An `unreachable!` you touch there becomes
-a `let ... else` returning the lowering's error.
+`descriptor` (resource handles), `salu` (scalar ALU), `valu` (32-bit
+vector ALU: moves, floats, conversions, lanes, DPP), `integer` (vector
+integer operations and compares), `valu16`, `lds`, `io` (inputs,
+interpolation, exports) and `halves` (wave64 on a 32-lane host). The
+float helpers several of them share (`unary`, `fmad`, `bfe`...), stage
+setup and control flow are still in lower.rs, still twice the file
+limit, and move out the same way (issue #77). Put a new lowering in the
+module of its kind, or a new one beside them, never in lower.rs. An
+`unreachable!` you touch there becomes a `let ... else` returning the
+lowering's error.
 
 ## Tests
 
