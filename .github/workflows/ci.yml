@@ -66,14 +66,14 @@ jobs:
       - name: AGENTS.md citations
         if: ${{ !cancelled() }}
         run: cargo xtask citations
-      # The repository has no decision records; citing one points readers at
-      # nothing (issue #10 removed 28 such citations). State the reason inline.
+      # This form cited decision records the repository never held (issue #10
+      # removed 28 such citations). ADRs are cited as ADR-NNNN or by path.
       - name: No citations of decision records
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           if git grep -nE 'decision 0[0-9]{3}' -- '*.rs' '*.md'; then
-            echo "::error::no decision records exist; state the reason inline instead (AGENTS.md, Citations)"
+            echo "::error::cite an ADR as ADR-NNNN or by path, or state the reason inline (AGENTS.md, Citations)"
             exit 1
           fi
       - name: Check
