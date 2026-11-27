@@ -28,13 +28,13 @@ README describes where it is now.
 
 | Programs | Validated for a 32-lane GPU | Share | |
 |---|---:|---:|---|
-| **All** | 21,732 of 26,148 | 83.1% | `████████████████░░░░` |
+| **All** | 21,733 of 26,148 | 83.1% | `████████████████░░░░` |
 | Mesh | 8,152 of 8,765 | 93.0% | `██████████████████░░` |
 | Vertex/pixel | 12,167 of 14,649 | 83.0% | `████████████████░░░░` |
-| Compute | 1,413 of 2,734 | 51.6% | `██████████░░░░░░░░░░` |
+| Compute | 1,414 of 2,734 | 51.7% | `██████████░░░░░░░░░░` |
 
-Measured with `victory translate --validate --host-lanes 32 --json` over the game directory (files above 2 GiB are not read), built at commit `6ae940792a` (2026-11-26). A program counts once its DXIL passes the validator and, on a GPU with 32-lane waves, does not need 64-lane waves; creating its pipeline on a GPU is not part of the share.
-4 more compute programs pass the validator but need 64-lane waves, which such a GPU refuses.
+Measured with `victory translate --validate --host-lanes 32 --json` over the game directory (files above 2 GiB are not read), built at commit `cdc702cbfb` (2026-11-26). A program counts once its DXIL passes the validator and, on a GPU with 32-lane waves, does not need 64-lane waves; creating its pipeline on a GPU is not part of the share.
+3 more compute programs pass the validator but need 64-lane waves, which such a GPU refuses.
 <!-- progress:end -->
 
 ## Status

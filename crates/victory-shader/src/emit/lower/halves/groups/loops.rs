@@ -428,8 +428,9 @@ impl Lower<'_> {
     /// Tail `t` of a loop of several exits ([`joined_exits`]), run past the
     /// exit at block `e` in the round a console wave leaves there: in `e`'s
     /// DXIL block, its phis taking what the way from `e` brings, `flag` (the
-    /// console wave leaves now) guarding it.
-    fn group_tail(&mut self, e: usize, t: usize, flag: V) -> Result<(), Stop> {
+    /// console wave leaves now) guarding it. `t`'s own flag is as it was
+    /// after.
+    pub(super) fn group_tail(&mut self, e: usize, t: usize, flag: V) -> Result<(), Stop> {
         let p = self.x.p;
         let n = p.blocks[t]
             .preds
@@ -453,14 +454,18 @@ impl Lower<'_> {
                 self.mask_phis.insert(phi.value, lanes);
             }
         }
-        if let Some(h) = self.halves.as_mut() {
-            h.flags.insert(t, flag);
-        }
+        let before = self.halves.as_mut().and_then(|h| h.flags.insert(t, flag));
         let ir = std::mem::replace(&mut self.cur_ir, t);
         for i in 0..p.blocks[t].insts.len() {
             self.inst(t, i)?;
         }
         self.cur_ir = ir;
+        if let Some(h) = self.halves.as_mut() {
+            match before {
+                Some(f) => h.flags.insert(t, f),
+                None => h.flags.remove(&t),
+            };
+        }
         Ok(())
     }
 

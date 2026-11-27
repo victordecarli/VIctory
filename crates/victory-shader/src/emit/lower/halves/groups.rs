@@ -19,7 +19,9 @@
 //! has such a place ([`group_if_else`]): the group runs that way as the
 //! region, then each console wave that takes the other, quiet, way runs it
 //! on its own, by a branch of its own ([`Lower::group_else`]), so each
-//! comes to the join by its own way.
+//! comes to the join by its own way. A block both ways go on through before
+//! the join is lowered twice: past the region, in each block leading there
+//! ([`Lower::group_shared`]), and on its own past the quiet way.
 //!
 //! A loop around such a place whose branches out are ones the group takes,
 //! each passed every round, is taken so too ([`group_loop`]): the group goes
@@ -58,6 +60,9 @@ pub(super) struct GroupRegion {
     /// console wave that takes it runs on its own once the group ran the
     /// region ([`Lower::group_target`]).
     pub(super) quiet: Option<usize>,
+    /// For such an `if`: the blocks both its ways go on through before they
+    /// join, outside the region ([`Lower::group_shared`]).
+    pub(super) shared: Vec<usize>,
 }
 
 /// The successors of each IR block, None with an indirect exit.
@@ -124,7 +129,7 @@ pub(super) fn group_region(
     };
     let end = if enter == taken { not_taken } else { taken };
     blocks[end] = false;
-    Ok(GroupRegion { enter, blocks, join: Some((d, end)), quiet: None })
+    Ok(GroupRegion { enter, blocks, join: Some((d, end)), quiet: None, shared: Vec::new() })
 }
 
 const BOTH_WAYS: Why =
@@ -134,9 +139,11 @@ const BOTH_WAYS: Why =
 /// `if` with an `else` whose ways join at the block first post-dominating
 /// `d`: the way where the halves or the group meet, the other way quiet
 /// (no such place, so no branch the group takes either). Each way begins
-/// at a block only `d` leads to, and no block lies on both. The join may be
-/// reached from elsewhere too, not through `d`: such a way keeps its own
-/// values there.
+/// at a block only `d` leads to. A block on both ways (shared) jumps to the
+/// join, is reached from the ways alone, and from the region by jumps only:
+/// it is lowered once past each of those ([`Lower::group_shared`]). The join
+/// may be reached from elsewhere too, not through `d`: such a way keeps its
+/// own values there.
 fn group_if_else(
     p: &Program,
     st: &Structured,
@@ -165,18 +172,28 @@ fn group_if_else(
     };
     let (t, f) = (way(taken), way(not_taken));
     let meet = |w: &[bool]| (0..n).any(|b| w[b] && meets_in(p, st, b, lds));
-    let (enter, quiet, blocks) = match (meet(&t), meet(&f)) {
+    let (enter, quiet, mut blocks) = match (meet(&t), meet(&f)) {
         (true, false) => (taken, not_taken, t.clone()),
         (false, true) => (not_taken, taken, f.clone()),
         (true, true) | (false, false) => return Err(BOTH_WAYS),
     };
+    let shared: Vec<usize> = (0..n).filter(|&b| t[b] && f[b]).collect();
+    for &b in &shared {
+        blocks[b] = false;
+    }
     let only_from_d = |b: usize| p.blocks[b].preds == [d];
     // (the join may be reached from elsewhere too: not through `d`)
-    let apart = (0..n).all(|b| !(t[b] && f[b]));
-    if !(apart && only_from_d(enter) && only_from_d(quiet)) {
+    let lowered_twice = |s: usize| {
+        st.exits[s] == LaneExit::Jump(join)
+            && p.blocks[s]
+                .preds
+                .iter()
+                .all(|&q| (t[q] || f[q]) && (!blocks[q] || st.exits[q] == LaneExit::Jump(s)))
+    };
+    if !(shared.iter().all(|&s| lowered_twice(s)) && only_from_d(enter) && only_from_d(quiet)) {
         return Err(BOTH_WAYS);
     }
-    Ok(GroupRegion { enter, blocks, join: Some((d, join)), quiet: Some(quiet) })
+    Ok(GroupRegion { enter, blocks, join: Some((d, join)), quiet: Some(quiet), shared })
 }
 
 /// Whether IR block `b` is where the halves or the group meet: a branch
@@ -260,7 +277,13 @@ pub(super) fn several_keep_64(
             Some((_, lp)) => {
                 // (a console wave runs a tail with the rounds' blocks)
                 let blocks = lp.blocks.iter().zip(&lp.tails).map(|(&b, &t)| b || t).collect();
-                GroupRegion { enter: lp.header, blocks, join: None, quiet: None }
+                GroupRegion {
+                    enter: lp.header,
+                    blocks,
+                    join: None,
+                    quiet: None,
+                    shared: Vec::new(),
+                }
             }
             None => match group_region(p, st, d, lds_dwords > 0) {
                 Ok(r) => r,
@@ -307,15 +330,19 @@ pub(super) fn apart_branches(p: &Program, st: &Structured, lds: bool) -> Option<
 /// is restored as it was), but by a scalar phi (no lane mask) where an
 /// `if`'s ways join, which takes each wave's own way
 /// ([`Lower::group_join`]; its branch must dominate the way in, whose
-/// values the phi's take). A group barrier of the program's own is no
+/// values the phi's take). A block both ways of an `if` with an `else`
+/// share is lowered past the region too, so it is held to the region's
+/// stores; what it writes there reaches no other way. A group barrier of the
+/// program's own is no
 /// trouble: every console wave reaches it, with the group. Nor is a memory
 /// access ([`Lower::flagged`]), but for one reading a lane mask as a
 /// number, whose ballot could have the halves meet where only some console
 /// waves run.
 fn skipping_wave_keeps_64(p: &Program, st: &Structured, region: &GroupRegion) -> Option<Keep> {
     let inside = |b: usize| region.blocks.get(b).copied().unwrap_or(false);
+    let shared = |b: usize| region.shared.contains(&b);
     let mut written = HashSet::new();
-    for (b, block) in p.blocks.iter().enumerate().filter(|&(b, _)| inside(b)) {
+    for (b, block) in p.blocks.iter().enumerate().filter(|&(b, _)| inside(b) || shared(b)) {
         // (a whole-wave section's results are written whatever the guard)
         for section in super::super::super::wave::sections(p, b).values() {
             written.extend(section.shapes.keys().copied());
@@ -330,13 +357,16 @@ fn skipping_wave_keeps_64(p: &Program, st: &Structured, region: &GroupRegion) ->
             if memory_access(inst) && reads_mask(st, inst) {
                 return Keep::fixed("a memory access reading a lane mask in a group-wide branch");
             }
+            if shared(b) {
+                continue;
+            }
             for &(r, w) in &inst.writes {
                 if matches!(r, Reg::S(c) if c != EXEC && c != EXEC + 1) || r == Reg::Scc {
                     written.insert(w);
                 }
             }
         }
-        for phi in &block.phis {
+        for phi in block.phis.iter().filter(|_| inside(b)) {
             if !matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
                 && !matches!(phi.reg, Reg::V(_))
             {
@@ -354,7 +384,7 @@ fn skipping_wave_keeps_64(p: &Program, st: &Structured, region: &GroupRegion) ->
                 || phi.reg == Reg::Scc)
                 && !st.masks.contains_key(&phi.value)
                 && !st.highs.contains_key(&phi.value);
-            b == end
+            (b == end || shared(b))
                 && inside(q)
                 && phi.args.len() == p.blocks[b].preds.len()
                 // (past an `else`, each wave comes by its own way)
@@ -509,7 +539,18 @@ impl Lower<'_> {
             }
         }
         match (region.join, region.quiet) {
-            (Some((d, end)), Some(quiet)) => self.group_else(d, end, quiet, region.blocks, own)?,
+            (Some((d, end)), Some(quiet)) => {
+                let arms = Arms {
+                    d,
+                    quiet,
+                    arm: region.blocks,
+                    shared: region.shared,
+                    copies: Vec::new(),
+                    skip: 0,
+                    dispatch: 0,
+                };
+                self.group_else(end, arms, own)?;
+            }
             (Some((d, end)), None) => {
                 if let Some(h) = self.halves.as_mut() {
                     h.joins.entry(end).or_default().push(Join { d, blocks: region.blocks, own });
@@ -520,20 +561,13 @@ impl Lower<'_> {
         Ok(if flip { self.not(group) } else { group })
     }
 
-    /// The `else` of the `if` at block `d` ([`group_if_else`]): past the
-    /// region (`arm`), whose ways to `join` go to a block of their own, each
+    /// The `else` of the `if` at block `arms.d` ([`group_if_else`]): past the
+    /// region (`arms.arm`), whose ways to `join` go to a block of their own, each
     /// console wave goes on by its own decision `own`: to `join`, or into
     /// the quiet way, which it runs on its own. The group comes there
     /// straight from `d` when no console wave enters the region.
-    fn group_else(
-        &mut self,
-        d: usize,
-        join: usize,
-        quiet: usize,
-        arm: Vec<bool>,
-        own: V,
-    ) -> Result<(), Why> {
-        let (Some(j), Some(q)) = (self.block[join], self.block[quiet]) else {
+    fn group_else(&mut self, join: usize, mut arms: Arms, own: V) -> Result<(), Why> {
+        let (Some(j), Some(q)) = (self.block[join], self.block[arms.quiet]) else {
             return Err("an if with an else joining where the entry does not reach");
         };
         let (skip, dispatch) = (self.s.m.new_block(), self.s.m.new_block());
@@ -545,7 +579,8 @@ impl Lower<'_> {
         if h.arms.contains_key(&join) {
             return Err("two ifs with an else the group takes joining at one block");
         }
-        h.arms.insert(join, Arms { d, quiet, arm, skip, dispatch });
+        (arms.skip, arms.dispatch) = (skip, dispatch);
+        h.arms.insert(join, arms);
         Ok(())
     }
 
@@ -553,11 +588,18 @@ impl Lower<'_> {
     /// `to`'s, around an `if` with an `else` the whole group takes
     /// ([`Self::group_else`]): from its branch into the quiet way, the block
     /// the group comes by when no console wave enters the region; from the
-    /// region to the join, the block where each console wave goes its own
-    /// way.
+    /// region to the join, or to a block both ways share (which ran on the
+    /// way, [`Self::group_shared`]), the block where each console wave goes
+    /// its own way.
     pub(in super::super) fn group_target(&self, from: usize, to: usize) -> Option<usize> {
         let arms = &self.halves.as_ref()?.arms;
         if let Some(a) = arms.get(&to).filter(|a| a.arm.get(from).copied().unwrap_or(false)) {
+            return Some(a.dispatch);
+        }
+        if let Some(a) = arms
+            .values()
+            .find(|a| a.shared.contains(&to) && a.arm.get(from).copied().unwrap_or(false))
+        {
             return Some(a.dispatch);
         }
         arms.values().find(|a| a.d == from && a.quiet == to).map(|a| a.skip)
@@ -588,6 +630,77 @@ impl Lower<'_> {
         self.s.m.set_phi(phi, through);
         outside.push((phi, dispatch, j));
         outside.into_iter().map(|(x, at, _)| (x, at)).collect()
+    }
+
+    /// Past IR block `b` of the region of an `if` with an `else` the whole
+    /// group takes, which jumps to `s`, a block both ways share: `s` runs
+    /// here as the region's, its phis taking what `b` brings and the
+    /// region's flag guarding it ([`Self::group_tail`]), and what each phi of
+    /// the join takes over it is kept for the block where each console wave
+    /// goes its own way ([`Self::group_copies`]). `s` runs again, on its own,
+    /// past the quiet way.
+    pub(in super::super) fn group_shared(&mut self, b: usize, s: usize) -> Result<(), Stop> {
+        let p = self.x.p;
+        let Some(h) = self.halves.as_ref() else { return Ok(()) };
+        let found = h
+            .arms
+            .iter()
+            .find(|(_, a)| a.shared.contains(&s) && a.arm.get(b).copied().unwrap_or(false));
+        let Some((&join, _)) = found else { return Ok(()) };
+        let flag = match h.flags.get(&b).copied() {
+            Some(f) => f,
+            None => self.s.m.bool(true),
+        };
+        self.group_tail(b, s, flag)?;
+        // (`s` runs again past the quiet way, which makes its lane-mask phis anew)
+        for phi in &p.blocks[s].phis {
+            self.mask_phis.remove(&phi.value);
+        }
+        let n = p.blocks[join].preds.iter().position(|&q| q == s).ok_or_else(|| {
+            internal(format!("a block both ways share, {s}, not into their join {join}"))
+        })?;
+        let values = p.blocks[join]
+            .phis
+            .iter()
+            .map(|jp| match jp.reg {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => None,
+                Reg::S(_) | Reg::Scc | Reg::V(_) => self.vals.get(&jp.args[n]).copied(),
+            })
+            .collect();
+        let at = self.cur;
+        if let Some(a) = self.halves.as_mut().and_then(|h| h.arms.get_mut(&join)) {
+            a.copies.push((s, b, at, values));
+        }
+        Ok(())
+    }
+
+    /// Whether the way from IR block `q` into `b` ran in `q` instead: `b` is
+    /// a block both ways of an `if` with an `else` the whole group takes
+    /// share, and `q` lies in its region ([`Self::group_shared`]).
+    pub(in super::super) fn group_copied(&self, q: usize, b: usize) -> bool {
+        self.halves.as_ref().is_some_and(|h| {
+            h.arms.values().any(|a| a.shared.contains(&b) && a.arm.get(q).copied().unwrap_or(false))
+        })
+    }
+
+    /// What phi `i` of IR block `j` takes over the runs, past the region, of
+    /// `q`, a block both ways of an `if` with an `else` share where `j` is
+    /// their join ([`Self::group_shared`]): each with its DXIL block and the
+    /// region's block it ran past.
+    pub(in super::super) fn group_copies(
+        &self,
+        j: usize,
+        i: usize,
+        q: usize,
+    ) -> Vec<(Option<Val>, usize, usize)> {
+        let Some(a) = self.halves.as_ref().and_then(|h| h.arms.get(&j)) else {
+            return Vec::new();
+        };
+        a.copies
+            .iter()
+            .filter(|c| c.0 == q)
+            .map(|(_, b, at, values)| (values.get(i).copied().flatten(), *at, *b))
+            .collect()
     }
 
     /// The group's vote at a branch it takes as one: each host wave posts
@@ -719,6 +832,12 @@ pub(super) struct Arms {
     quiet: usize,
     /// Per IR block: whether it lies in the region, the way the group runs.
     arm: Vec<bool>,
+    /// The blocks both ways go on through before the join.
+    shared: Vec<usize>,
+    /// Per run of a shared block past the region ([`Lower::group_shared`]):
+    /// the block, the region's block it ran past, the DXIL block it ended
+    /// in, and what each phi of the join takes over it.
+    copies: Vec<(usize, usize, usize, Vec<Option<Val>>)>,
     /// The DXIL block the group comes by from `d` when no console wave
     /// enters the region.
     skip: usize,
