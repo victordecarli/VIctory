@@ -357,6 +357,19 @@ fn encodings_decode_as_named() {
     );
     assert_eq!(sp3(&IF_ELSE_IN_AN_IF)[1..3], ["s_cmp_lg_u32 s0, 0", "s_cbranch_scc1 label_002C"]);
     assert_eq!(
+        sp3(&IF_ELSE_SHARING_A_BLOCK)[3..],
+        [
+            "s_cbranch_scc1 label_0020",
+            "v_readlane_b32 s14, v0, 10",
+            "v_mov_b32 v1, s14",
+            "s_branch label_002C",
+            "s_cmp_lg_u32 s0, 0",
+            "s_cbranch_scc1 label_0030",
+            "v_add_nc_u32 v1, 7, v1",
+            "v_add_nc_u32 v1, 64, v1",
+        ]
+    );
+    assert_eq!(
         sp3(&LOOP_TWO_EXITS_BY_WAVE)[1..],
         [
             "v_readfirstlane_b32 s16, v0",
@@ -674,6 +687,33 @@ const IF_ELSE_IN_AN_IF: [u32; 11] = [
     0xBF82_0001,            // s_branch past the add
     vop2(0x25, 1, 0x87, 1), // v_add_nc_u32 v1, 7, v1
 ];
+
+/// [`IF_ELSE_ONE_QUIET_WAY`] whose two ways go on through one block, which adds 64 to v1,
+/// before they join; the quiet way may also go straight to the join, on root constant s0
+/// (0, so it does not).
+const IF_ELSE_SHARING_A_BLOCK: [u32; 12] = [
+    V1_V0,
+    READFIRSTLANE_V0_S14,
+    0xBF0A_C00E, // s_cmp_lt_u32 s14, 64: the first console wave
+    0xBF85_0004, // s_cbranch_scc1 to the quiet way
+    READLANE_10[0],
+    READLANE_10[1],
+    V1_S14,
+    0xBF82_0003,            // s_branch to the shared block
+    0xBF07_8000,            // s_cmp_lg_u32 s0, 0
+    0xBF85_0002,            // s_cbranch_scc1 to the join
+    vop2(0x25, 1, 0x87, 1), // v_add_nc_u32 v1, 7, v1
+    vop2(0x25, 1, 0xC0, 1), // v_add_nc_u32 v1, 64, v1: the shared block
+];
+
+/// An if/else the whole group takes, one of whose ways is quiet, splits where its two ways
+/// share a block before they join: the group runs it past the region, each console wave
+/// past the quiet way.
+#[test]
+fn an_if_else_whose_ways_share_a_block_splits() {
+    let cs = two_waves(&IF_ELSE_SHARING_A_BLOCK);
+    assert_eq!(translate(&cs, 32).unwrap().wave_size, Some(32));
+}
 
 /// v_cmp_le_u32 vcc, 104, v0: lanes 40..63 of the second console wave only.
 const VCC_FROM_104: [u32; 2] = [0x7D86_00FF, 104];
@@ -1520,6 +1560,15 @@ mod card {
         let Some(out) = run_group(&two_waves(&IF_ELSE_ONE_QUIET_WAY), 128) else { return };
         assert_eq!(out, want);
         let Some(out) = run_group(&two_waves(&IF_ELSE_IN_AN_IF), 128) else { return };
+        assert_eq!(out, want);
+    }
+
+    /// The second console wave sets v1 to its lane 10 on the way the group runs, the first
+    /// adds 7 on its own way; both then add 64 in the block their ways share.
+    #[test]
+    fn an_if_else_whose_ways_share_a_block_runs_it_on_each_way() {
+        let want: Vec<u32> = (0..128).map(|t| if t < 64 { t + 71 } else { 138 }).collect();
+        let Some(out) = run_group(&two_waves(&IF_ELSE_SHARING_A_BLOCK), 128) else { return };
         assert_eq!(out, want);
     }
 

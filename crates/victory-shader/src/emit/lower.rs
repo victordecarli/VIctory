@@ -6883,6 +6883,8 @@ impl<'a> Lower<'a> {
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
+                // (into a block both ways of a group-wide if share: it runs here)
+                self.group_shared(b, t)?;
                 match self.group_target(b, t) {
                     Some(to) => Term::Br(to),
                     None => Term::Br(self.dxil_block(t)?),
@@ -7085,29 +7087,35 @@ impl<'a> Lower<'a> {
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
+                if self.group_copied(q, b) {
+                    continue;
+                }
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let arg = phi.args[n];
-                let x = match (self.vals.get(&arg).copied(), bit) {
-                    (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                    }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, why));
-                    }
-                    _ if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
-                    }
-                    _ if bit => self.s.m.bool(false),
-                    _ => self.s.m.i32(0),
-                };
-                let x = if self.read_phis.contains(&phi.value) {
-                    self.group_join(b, i, q, qb, x)
-                        .map_err(|w| Stop::Retry(phi.value, w))?
-                } else {
-                    x
-                };
-                incoming.push((x, qb, q));
+                let mut ways = vec![(self.vals.get(&phi.args[n]).copied(), qb, q)];
+                // (past a block both ways of a group-wide if share, its runs in the region)
+                ways.extend(self.group_copies(b, i, q));
+                for (val, qb, q) in ways {
+                    let x = match (val, bit) {
+                        (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                        (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                            return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                        }
+                        (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                            return Err(Stop::Retry(phi.value, why));
+                        }
+                        _ if self.read_phis.contains(&phi.value) => {
+                            return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                        }
+                        _ if bit => self.s.m.bool(false),
+                        _ => self.s.m.i32(0),
+                    };
+                    let x = if self.read_phis.contains(&phi.value) {
+                        self.group_join(b, i, q, qb, x).map_err(|w| Stop::Retry(phi.value, w))?
+                    } else {
+                        x
+                    };
+                    incoming.push((x, qb, q));
+                }
             }
             let zero = if bit { self.s.m.bool(false) } else { self.s.m.i32(0) };
             let incoming = self.group_arms(b, incoming, zero);
@@ -7126,6 +7134,13 @@ impl<'a> Lower<'a> {
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
+                if self.group_copied(q, b) {
+                    continue;
+                }
+                if !self.group_copies(b, i, q).is_empty() {
+                    let why = "a lane-mask join past a block both ways of a group-wide if share";
+                    return Err(unsupported(offset, why));
+                }
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let m =
                     *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
