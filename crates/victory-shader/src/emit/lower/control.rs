@@ -11,6 +11,28 @@ impl Lower<'_> {
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
+        self.place_blocks(&order);
+        self.cur = self.s.entry;
+        self.find_sections();
+        self.inputs()?;
+        if let Some(mesh) = self.s.mesh {
+            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+            self.block[order[0]] = Some(self.cur);
+        }
+        for &b in &order {
+            if self.block[b].is_some() {
+                self.lower_block(b)?;
+            }
+        }
+        self.fill_phis()?;
+        self.finish()
+    }
+
+    /// A DXIL block for each IR block in reverse postorder (the entry
+    /// first), and an iteration counter for each loop header
+    /// (`LOOP_LIMIT`).
+    fn place_blocks(&mut self, order: &[usize]) {
+        let p = self.x.p;
         let mut blocks = Vec::with_capacity(order.len());
         for (n, &b) in order.iter().enumerate() {
             // (a tail of a loop of several exits runs in its exiting blocks)
@@ -32,60 +54,58 @@ impl Lower<'_> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
-        self.cur = self.s.entry;
-        self.find_sections();
-        self.inputs()?;
-        if let Some(mesh) = self.s.mesh {
-            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
-            self.block[order[0]] = Some(self.cur);
+    }
+
+    /// IR block `b`: its phis, its instructions (a whole-wave section as
+    /// one) and its exit.
+    fn lower_block(&mut self, b: usize) -> Result<(), Stop> {
+        let p = self.x.p;
+        self.cur = self.dxil_block(b)?;
+        self.cur_ir = b;
+        // (the flag's phi, if `b` begins a loop the group takes)
+        self.group_loop_enter(b);
+        let preds: Vec<usize> =
+            p.blocks[b].preds.iter().copied().filter(|&q| self.block[q].is_some()).collect();
+        self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+        for (i, phi) in p.blocks[b].phis.iter().enumerate() {
+            let val = match phi.reg {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+                Reg::Scc => {
+                    let v = self.s.m.phi(self.cur, self.s.t.i1);
+                    self.data_phis.push((v, b, i));
+                    Val::Bit(v)
+                }
+                _ => {
+                    let v = self.s.m.phi(self.cur, self.s.t.i32);
+                    self.data_phis.push((v, b, i));
+                    Val::I32(v)
+                }
+            };
+            self.vals.insert(phi.value, val);
         }
-        for &b in &order {
-            if self.block[b].is_none() {
+        let mut i = 0;
+        while i < p.blocks[b].insts.len() {
+            self.inst(b, i)?;
+            if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                for j in i + 1..end {
+                    self.section_inst(b, j, i);
+                }
+                i = end;
                 continue;
             }
-            self.cur = self.dxil_block(b)?;
-            self.cur_ir = b;
-            // (the flag's phi, if `b` begins a loop the group takes)
-            self.group_loop_enter(b);
-            let preds: Vec<usize> =
-                p.blocks[b].preds.iter().copied().filter(|&q| self.block[q].is_some()).collect();
-            self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
-            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
-                let val = match phi.reg {
-                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
-                    Reg::Scc => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i1);
-                        self.data_phis.push((v, b, i));
-                        Val::Bit(v)
-                    }
-                    _ => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i32);
-                        self.data_phis.push((v, b, i));
-                        Val::I32(v)
-                    }
-                };
-                self.vals.insert(phi.value, val);
-            }
-            let mut i = 0;
-            while i < p.blocks[b].insts.len() {
-                self.inst(b, i)?;
-                if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
-                    for j in i + 1..end {
-                        self.section_inst(b, j, i);
-                    }
-                    i = end;
-                    continue;
-                }
-                i += 1;
-            }
-            self.mask_ok = self.mask_data == MaskData::Console;
-            self.tail[b] = Some(self.cur);
-            self.exit(b)?;
-            // (a loop's tail may have run in it, [`Self::group_leave`])
-            self.tail[b] = Some(self.cur);
+            i += 1;
         }
-        self.fill_phis()?;
+        self.mask_ok = self.mask_data == MaskData::Console;
+        self.tail[b] = Some(self.cur);
+        self.exit(b)?;
+        // (a loop's tail may have run in it, [`Self::group_leave`])
+        self.tail[b] = Some(self.cur);
+        Ok(())
+    }
+
+    /// What the lowering hands back once every block is lowered.
+    fn finish(mut self) -> Result<Lowered, Stop> {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -280,6 +300,22 @@ impl Lower<'_> {
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
+        self.close_read_phis();
+        for (v, b, i) in std::mem::take(&mut self.data_phis) {
+            self.fill_data_phi(v, b, i)?;
+        }
+        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            self.s.m.set_phi(phi, incoming);
+        }
+        self.fill_group_loops();
+        while let Some((v, b, i)) = self.pending_masks.pop() {
+            self.fill_mask_phi(v, b, i)?;
+        }
+        Ok(())
+    }
+
+    /// Marks read the phis that only read phis consume.
+    fn close_read_phis(&mut self) {
         let p = self.x.p;
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
@@ -295,95 +331,102 @@ impl Lower<'_> {
                 }
             }
         }
-        for (v, b, i) in std::mem::take(&mut self.data_phis) {
-            let phi = &p.blocks[b].phis[i];
-            let bit = phi.reg == Reg::Scc;
-            if let Some(ways) = self.group_exits_join(b, i) {
-                let mut incoming = Vec::with_capacity(ways.len());
-                for (x, at) in ways {
-                    let x = match x {
-                        Some(x) => x,
-                        None if self.read_phis.contains(&phi.value) => {
-                            let why = "a loop's exits joining a value with no DXIL form";
-                            return Err(Stop::Retry(phi.value, why));
-                        }
-                        None if bit => self.s.m.bool(false),
-                        None => self.s.m.i32(0),
-                    };
-                    incoming.push((x, at));
-                }
-                self.s.m.set_phi(v, incoming);
+    }
+
+    /// Data phi `v` of IR phi `i` in block `b` (an SGPR, VGPR or SCC): a
+    /// value with no DXIL form fails a phi that is read, and is zero in
+    /// one that is not.
+    fn fill_data_phi(&mut self, v: V, b: usize, i: usize) -> Result<(), Stop> {
+        let p = self.x.p;
+        let phi = &p.blocks[b].phis[i];
+        let bit = phi.reg == Reg::Scc;
+        if let Some(ways) = self.group_exits_join(b, i) {
+            let mut incoming = Vec::with_capacity(ways.len());
+            for (x, at) in ways {
+                let x = match x {
+                    Some(x) => x,
+                    None if self.read_phis.contains(&phi.value) => {
+                        let why = "a loop's exits joining a value with no DXIL form";
+                        return Err(Stop::Retry(phi.value, why));
+                    }
+                    None if bit => self.s.m.bool(false),
+                    None => self.s.m.i32(0),
+                };
+                incoming.push((x, at));
+            }
+            self.s.m.set_phi(v, incoming);
+            return Ok(());
+        }
+        let mut incoming = Vec::new();
+        for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+            let Some(qb) = self.tail[q] else { continue };
+            if self.group_copied(q, b) {
                 continue;
             }
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                if self.group_copied(q, b) {
-                    continue;
-                }
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let mut ways = vec![(self.vals.get(&phi.args[n]).copied(), qb, q)];
-                // (past a block both ways of a group-wide if share, its runs in the region)
-                ways.extend(self.group_copies(b, i, q));
-                for (val, qb, q) in ways {
-                    let x = match (val, bit) {
-                        (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                        (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                            return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                        }
-                        (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
-                            return Err(Stop::Retry(phi.value, why));
-                        }
-                        _ if self.read_phis.contains(&phi.value) => {
-                            return Err(Stop::Retry(phi.value, "a join of mismatched values"));
-                        }
-                        _ if bit => self.s.m.bool(false),
-                        _ => self.s.m.i32(0),
-                    };
-                    let x = if self.read_phis.contains(&phi.value) {
-                        self.group_join(b, i, q, qb, x).map_err(|w| Stop::Retry(phi.value, w))?
-                    } else {
-                        x
-                    };
-                    incoming.push((x, qb, q));
-                }
-            }
-            let zero = if bit { self.s.m.bool(false) } else { self.s.m.i32(0) };
-            let incoming = self.group_arms(b, incoming, zero);
-            self.s.m.set_phi(v, incoming);
-        }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
-            self.s.m.set_phi(phi, incoming);
-        }
-        self.fill_group_loops();
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            if self.group_exits_join(b, i).is_some() {
-                return Err(unsupported(offset, "a lane-mask join past a loop of several exits"));
-            }
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                if self.group_copied(q, b) {
-                    continue;
-                }
-                if !self.group_copies(b, i, q).is_empty() {
-                    let why = "a lane-mask join past a block both ways of a group-wide if share";
-                    return Err(unsupported(offset, why));
-                }
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+            let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+            let mut ways = vec![(self.vals.get(&phi.args[n]).copied(), qb, q)];
+            // (past a block both ways of a group-wide if share, its runs in the region)
+            ways.extend(self.group_copies(b, i, q));
+            for (val, qb, q) in ways {
+                let x = match (val, bit) {
+                    (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                    }
+                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                        return Err(Stop::Retry(phi.value, why));
+                    }
+                    _ if self.read_phis.contains(&phi.value) => {
+                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                    }
+                    _ if bit => self.s.m.bool(false),
+                    _ => self.s.m.i32(0),
+                };
+                let x = if self.read_phis.contains(&phi.value) {
+                    self.group_join(b, i, q, qb, x).map_err(|w| Stop::Retry(phi.value, w))?
+                } else {
+                    x
+                };
                 incoming.push((x, qb, q));
             }
-            let zero = self.s.m.bool(false);
-            let incoming = self.group_arms(b, incoming, zero);
-            self.s.m.set_phi(v, incoming);
         }
+        let zero = if bit { self.s.m.bool(false) } else { self.s.m.i32(0) };
+        let incoming = self.group_arms(b, incoming, zero);
+        self.s.m.set_phi(v, incoming);
+        Ok(())
+    }
+
+    /// Lane-mask phi `v` of IR phi `i` in block `b`: each way's boolean.
+    fn fill_mask_phi(&mut self, v: V, b: usize, i: usize) -> Result<(), Stop> {
+        let p = self.x.p;
+        let phi = &p.blocks[b].phis[i];
+        let offset = p.blocks[b].offset;
+        if self.group_exits_join(b, i).is_some() {
+            return Err(unsupported(offset, "a lane-mask join past a loop of several exits"));
+        }
+        let mut incoming = Vec::new();
+        for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+            let Some(qb) = self.tail[q] else { continue };
+            if self.group_copied(q, b) {
+                continue;
+            }
+            if !self.group_copies(b, i, q).is_empty() {
+                let why = "a lane-mask join past a block both ways of a group-wide if share";
+                return Err(unsupported(offset, why));
+            }
+            let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+            let m = *self
+                .x
+                .st
+                .masks
+                .get(&phi.args[n])
+                .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+            let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+            incoming.push((x, qb, q));
+        }
+        let zero = self.s.m.bool(false);
+        let incoming = self.group_arms(b, incoming, zero);
+        self.s.m.set_phi(v, incoming);
         Ok(())
     }
 }
