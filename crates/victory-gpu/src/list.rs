@@ -1144,9 +1144,9 @@ unsafe extern "system" fn execute_indirect(
     count_draw();
     // SAFETY: `signature` is a signature our device created and the title
     // still holds for the call, per this function's contract.
-    let Some((stride, args)) = (unsafe { crate::signature::layout(signature) }) else {
-        return;
-    };
+    let layout = unsafe { crate::signature::layout(signature) };
+    // No signature: no layout we execute, so it is dropped and counted below.
+    let (stride, args) = layout.unwrap_or((0, &[]));
     // SAFETY: a resource this crate created, which the title keeps alive
     // while it is in use.
     let address =

@@ -248,7 +248,7 @@ missing imports, the host adapter and its wave lanes, the frame reports
 one, `fps`, `ms_per_frame`, `cpu_ms` preparing submissions with its
 `copies_ms`/`copies_mb` and `textures_ms`/`textures_mb`, `gpu_ms`
 waiting for the GPU, `copy_back_ms`/`copy_back_mb`, `draws_per_frame`,
-`dropped_per_frame`, `indirect_per_frame`; `pipelines_making` now; and
+`dropped_per_frame`, `indirect_dropped_per_frame`; `pipelines_making` now; and
 the `frame` the drop lines also name), the draws the host did not run, and a crash
 (`"message":"crash"`, the report in `report`), which also goes to
 `crashes.log` as before. A dropped draw is counted where its cause lives,

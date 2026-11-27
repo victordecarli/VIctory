@@ -45,3 +45,11 @@ fn every_inline_command_falls_back_to_the_table() {
     assert_eq!(release(list), 0);
     assert_eq!(release(allocator), 0);
 }
+
+#[test]
+fn an_indirect_execution_without_a_signature_is_counted_as_dropped() {
+    let null = std::ptr::null();
+    // SAFETY: null list, signature and buffers, which the contract allows.
+    unsafe { execute_indirect(null, null, 1, null, 0, null, 0) };
+    assert_eq!(take_indirect(), 1);
+}

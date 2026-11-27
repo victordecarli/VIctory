@@ -69,7 +69,8 @@ pub(crate) enum Cause {
     /// Indirect: the arguments could not be bounded (no clamp, or not
     /// 4-byte aligned).
     IndirectUnbounded,
-    /// Indirect: the title's signature or buffers are not ones we execute.
+    /// Indirect: the title's signature (or its absence) or buffers are not
+    /// ones we execute.
     IndirectLayout,
     /// A dispatch whose pipeline is a graphics pipeline.
     ComputeKind,
