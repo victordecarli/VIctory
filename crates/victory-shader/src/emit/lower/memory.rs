@@ -64,7 +64,78 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
-impl Lower<'_> {
+/// DXIL's atomic operation for a `buffer_atomic_*` instruction: add, and,
+/// or, xor, signed and unsigned min and max, exchange; compare-exchange
+/// apart (`u32::MAX`). `None` for an access that is no atomic.
+fn atomic_op(name: &'static str) -> Result<Option<u32>, Why> {
+    Ok(match name.strip_prefix("buffer_atomic_") {
+        None => None,
+        Some("add") => Some(0),
+        Some("and") => Some(1),
+        Some("or") => Some(2),
+        Some("xor") => Some(3),
+        Some("smin") => Some(4),
+        Some("smax") => Some(5),
+        Some("umin") => Some(6),
+        Some("umax") => Some(7),
+        Some("swap") => Some(8),
+        Some("cmpswap") => Some(u32::MAX),
+        Some(_) => return Err(name),
+    })
+}
+
+/// Whether a buffer access is typed, and the dwords or channels it moves
+/// (an atomic: one).
+fn shape(name: &str, atomic: bool) -> Option<(bool, u32)> {
+    let plain = name.replace("_format_d16_", "_format_");
+    Some(
+        match plain
+            .strip_prefix("buffer_load_")
+            .or(plain.strip_prefix("buffer_store_"))
+            .or(plain.strip_prefix("tbuffer_load_"))
+        {
+            _ if atomic => (false, 1),
+            Some("dword") => (false, 1),
+            Some("dwordx2") => (false, 2),
+            Some("dwordx3") => (false, 3),
+            Some("dwordx4") => (false, 4),
+            Some("format_x") => (true, 1),
+            Some("format_xy") => (true, 2),
+            Some("format_xyz") => (true, 3),
+            Some("format_xyzw") => (true, 4),
+            _ => return None,
+        },
+    )
+}
+
+/// What the parts of one buffer instruction share.
+struct Access<'a> {
+    site: Site,
+    guard: Option<V>,
+    /// The block the instruction starts in.
+    c: usize,
+    data: Option<Operand>,
+    offset: u16,
+    offen: bool,
+    format: Option<u8>,
+    glc: bool,
+    store: bool,
+    /// The DXIL atomic operation ([`atomic_op`]).
+    atomic: Option<u32>,
+    d16: bool,
+    typed: bool,
+    /// Dwords or channels moved.
+    count: u32,
+    /// The element index (`idxen`).
+    index: Option<V>,
+    /// The byte offset: the instruction's, its VGPR's and SGPR's, and the
+    /// descriptor's when code built it.
+    off: V,
+    src: &'a Source,
+    used: Option<&'a UsedResource>,
+}
+
+impl<'a> Lower<'a> {
     /// A global memory load (`global_load_*`): from the program's constant
     /// table, or from a root SRV at the address the title sets.
     pub(super) fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -187,7 +258,6 @@ impl Lower<'_> {
         } else {
             load(self, off, total / 32)
         };
-        let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
         let mut at = 0;
         for &w in bits {
@@ -201,56 +271,7 @@ impl Lower<'_> {
                 self.s.m.bin(c, Bin::And, t, m)
             };
             at += w;
-            // Sign-extended from the field's top bit.
-            let signed = |l: &mut Self| {
-                if w == 32 {
-                    return field;
-                }
-                let k = l.s.m.i32(32 - w);
-                let t = l.s.m.bin(c, Bin::Shl, field, k);
-                l.s.m.bin(c, Bin::AShr, t, k)
-            };
-            let f32t = self.s.t.f32;
-            let x = match numeric {
-                Numeric::Unorm => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    float(self, q)
-                }
-                Numeric::Snorm => {
-                    let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    let lo = self.s.m.f32((-1.0f32).to_bits());
-                    let q = self.binary(35, q, lo);
-                    float(self, q)
-                }
-                Numeric::Uscaled => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    float(self, f)
-                }
-                Numeric::Sscaled => {
-                    let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    float(self, f)
-                }
-                Numeric::Uint => field,
-                Numeric::Sint => signed(self),
-                Numeric::Float if w == 32 => field,
-                Numeric::Float => {
-                    let h = match half_shift(w) {
-                        0 => field,
-                        k => {
-                            let sh = self.s.m.i32(k);
-                            self.s.m.bin(c, Bin::Shl, field, sh)
-                        }
-                    };
-                    let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-                    float(self, f)
-                }
-            };
+            let x = self.convert(c, numeric, field, w);
             out.push(x);
         }
         let one = match numeric {
@@ -264,9 +285,98 @@ impl Lower<'_> {
         Ok(out)
     }
 
+    /// A typed load's channel `field`, `w` bits wide, converted as
+    /// `numeric` says.
+    fn convert(&mut self, c: usize, numeric: Numeric, field: V, w: u32) -> V {
+        // Sign-extended from the field's top bit.
+        let signed = |l: &mut Self| {
+            if w == 32 {
+                return field;
+            }
+            let k = l.s.m.i32(32 - w);
+            let t = l.s.m.bin(c, Bin::Shl, field, k);
+            l.s.m.bin(c, Bin::AShr, t, k)
+        };
+        let f32t = self.s.t.f32;
+        match numeric {
+            Numeric::Unorm => {
+                let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
+                let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
+                let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                self.as_int(q)
+            }
+            Numeric::Snorm => {
+                let s = signed(self);
+                let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
+                let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
+                let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                let lo = self.s.m.f32((-1.0f32).to_bits());
+                let q = self.binary(35, q, lo);
+                self.as_int(q)
+            }
+            Numeric::Uscaled => {
+                let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
+                self.as_int(f)
+            }
+            Numeric::Sscaled => {
+                let s = signed(self);
+                let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
+                self.as_int(f)
+            }
+            Numeric::Uint => field,
+            Numeric::Sint => signed(self),
+            Numeric::Float if w == 32 => field,
+            Numeric::Float => {
+                let h = match half_shift(w) {
+                    0 => field,
+                    k => {
+                        let sh = self.s.m.i32(k);
+                        self.s.m.bin(c, Bin::Shl, field, sh)
+                    }
+                };
+                let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                self.as_int(f)
+            }
+        }
+    }
+
     pub(super) fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
-        let Fields::Buffer { data, addr, soffset, offset, offen, idxen, format, lds, tfe, .. } =
-            &inst.fields
+        let a = self.buffer_access(inst, b, i)?;
+        if a.used.is_some_and(|u| u.kind == ResourceType::Cbv) && !a.typed {
+            return self.buffer_cbv(inst, &a);
+        }
+        let uav =
+            a.store || a.atomic.is_some() || a.used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let u = if uav { 0x1000 } else { 0 };
+        let iu = self.s.m.undef(self.s.t.i32);
+        if let Some(op) = a.atomic {
+            return self.buffer_atomic(inst, &a, op, (u, iu));
+        }
+        if a.store {
+            return self.buffer_store(inst, &a, (u, iu));
+        }
+        if let Some(f) = a.format {
+            return self.buffer_format_load(inst, &a, f, u);
+        }
+        let r = self.buffer_load(&a, uav, (u, iu))?;
+        self.buffer_result(inst, &a, r)
+    }
+
+    /// The fields, view and byte offset of a buffer instruction.
+    fn buffer_access(&mut self, inst: &Inst, b: usize, i: usize) -> Result<Access<'a>, Why> {
+        let Fields::Buffer {
+            data,
+            addr,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            format,
+            lds,
+            tfe,
+            cache,
+            ..
+        } = &inst.fields
         else {
             return Err("a buffer instruction without buffer fields");
         };
@@ -280,42 +390,10 @@ impl Lower<'_> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
-        let store = name.starts_with("buffer_store_");
-        // DXIL atomic operations: add, and, or, xor, signed and unsigned
-        // min and max, exchange; compare-exchange apart.
-        let atomic = match name.strip_prefix("buffer_atomic_") {
-            None => None,
-            Some("add") => Some(0),
-            Some("and") => Some(1),
-            Some("or") => Some(2),
-            Some("xor") => Some(3),
-            Some("smin") => Some(4),
-            Some("smax") => Some(5),
-            Some("umin") => Some(6),
-            Some("umax") => Some(7),
-            Some("swap") => Some(8),
-            Some("cmpswap") => Some(u32::MAX),
-            Some(_) => return Err(name),
-        };
+        let atomic = atomic_op(name)?;
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
-        let plain = name.replace("_format_d16_", "_format_");
-        let (typed, count) = match plain
-            .strip_prefix("buffer_load_")
-            .or(plain.strip_prefix("buffer_store_"))
-            .or(plain.strip_prefix("tbuffer_load_"))
-        {
-            _ if atomic.is_some() => (false, 1),
-            Some("dword") => (false, 1),
-            Some("dwordx2") => (false, 2),
-            Some("dwordx3") => (false, 3),
-            Some("dwordx4") => (false, 4),
-            Some("format_x") => (true, 1),
-            Some("format_xy") => (true, 2),
-            Some("format_xyz") => (true, 3),
-            Some("format_xyzw") => (true, 4),
-            _ => return Err(name),
-        };
+        let (typed, count) = shape(name, atomic.is_some()).ok_or(name)?;
         let Operand::Vector { reg: areg, .. } = *addr else {
             return Err("a buffer address");
         };
@@ -343,196 +421,211 @@ impl Lower<'_> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
-        if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
-            // A constant buffer read per lane (a dynamically indexed array).
-            // shortcut: the console's CBV descriptor is taken to have a 16-byte
-            // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
-            let byte = match index {
-                Some(i) => {
-                    let sixteen = self.s.m.i32(16);
-                    let rows = self.s.m.bin(c, Bin::Mul, i, sixteen);
-                    self.s.m.bin(c, Bin::Add, rows, off)
-                }
-                None => off,
-            };
-            let Some(Operand::Vector { reg, .. }) = *data else {
-                return Err("a buffer result");
-            };
-            for k in 0..count {
-                let four = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
-            }
-            return Ok(());
+        Ok(Access {
+            site,
+            guard,
+            c,
+            data: *data,
+            offset: *offset,
+            offen: *offen,
+            format: *format,
+            glc: cache.glc,
+            store: name.starts_with("buffer_store_"),
+            atomic,
+            d16,
+            typed,
+            count,
+            index,
+            off,
+            src,
+            used,
+        })
+    }
+
+    /// A structured buffer's handle, with the stride its used resource has.
+    fn structured(&mut self, a: &Access, u: u32) -> Result<V, Why> {
+        let stride = a.used.map_or(0, |u| u.stride);
+        if stride < 4 || !stride.is_multiple_of(4) {
+            return Err("a structured buffer of unknown stride");
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let iu = self.s.m.undef(self.s.t.i32);
-        if let Some(op) = atomic {
-            let d = data.as_ref().ok_or("buffer atomic data")?;
-            let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+        self.handle(a.site, a.src, false, (12 | u, stride))
+    }
+
+    /// A constant buffer read per lane (a dynamically indexed array).
+    // shortcut: the console's CBV descriptor is taken to have a 16-byte
+    // stride, as the vector loads of whole rows suggest.
+    fn buffer_cbv(&mut self, inst: &Inst, a: &Access) -> Result<(), Why> {
+        let c = a.c;
+        let h = self.handle(a.site, a.src, false, (13, 0x1_0000))?;
+        let byte = match a.index {
+            Some(i) => {
+                let sixteen = self.s.m.i32(16);
+                let rows = self.s.m.bin(c, Bin::Mul, i, sixteen);
+                self.s.m.bin(c, Bin::Add, rows, a.off)
+            }
+            None => a.off,
+        };
+        let Some(Operand::Vector { reg, .. }) = a.data else {
+            return Err("a buffer result");
+        };
+        for k in 0..a.count {
+            let four = self.s.m.i32(4 * k);
+            let at = self.s.m.bin(c, Bin::Add, byte, four);
+            let x = self.cbuffer_dword(h, at);
+            self.write(inst, Reg::V(reg + k as u8), x, a.guard);
+        }
+        Ok(())
+    }
+
+    /// DXIL atomic operation `op` on a raw or structured UAV; the old value
+    /// returns with glc.
+    fn buffer_atomic(
+        &mut self,
+        inst: &Inst,
+        a: &Access,
+        op: u32,
+        (u, iu): (u32, V),
+    ) -> Result<(), Why> {
+        let d = a.data.as_ref().ok_or("buffer atomic data")?;
+        let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
+        let (h, coords) = match a.index {
+            Some(index) => (self.structured(a, u)?, [index, a.off, iu]),
+            None => (self.handle(a.site, a.src, false, (11 | u, 0))?, [a.off, iu, iu]),
+        };
+        let Operand::Vector { reg, .. } = *d else {
+            return Err("buffer atomic data");
+        };
+        let old = match inst.read(Reg::V(reg)) {
+            Some(v) if a.glc => self.i32_of(v)?,
+            _ => self.s.m.i32(0),
+        };
+        let at = self.begin_guarded(a.guard);
+        let i32t = self.s.t.i32;
+        let r = if op == u32::MAX {
+            // cmpswap: data is (new, compare).
+            let mut args = vec![h];
+            args.extend(coords);
+            args.extend([vals[1], vals[0]]);
+            self.s.op(self.cur, "atomicCompareExchange.i32", Attr::NoUnwind, i32t, 79, &args)
+        } else {
+            let mut args = vec![h, self.s.m.i32(op)];
+            args.extend(coords);
+            args.push(vals[0]);
+            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+        };
+        let r = self.end_guarded(at, &[(r, old)])[0];
+        if a.glc {
+            self.write(inst, Reg::V(reg), r, None);
+        }
+        Ok(())
+    }
+
+    fn buffer_store(&mut self, inst: &Inst, a: &Access, (u, iu): (u32, V)) -> Result<(), Why> {
+        let c = a.c;
+        let regs = if a.d16 { a.count.div_ceil(2) } else { a.count };
+        let mut vals = self.vgprs(inst, a.data.as_ref().ok_or("buffer store data")?, regs as u8)?;
+        if a.d16 {
+            // shortcut: d16 data is taken as f16 (integer formats would
+            // keep 16 bits), widened for the 32-bit float store.
+            let mut wide = Vec::new();
+            for k in 0..a.count {
+                let mut x = vals[(k / 2) as usize];
+                if k % 2 == 1 {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                }
+                let f32t = self.s.t.f32;
+                let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                wide.push(self.as_int(f));
+            }
+            vals = wide;
+        }
+        let mut args = Vec::new();
+        let (op, name) = if a.typed {
+            // shortcut: typed stores are taken to write all four channels
+            // of a float format.
+            if a.count != 4 || a.offen || a.offset != 0 {
+                return Err("a typed buffer store of some channels or at an offset");
+            }
+            args.push(self.handle(a.site, a.src, false, (10 | u, 0x409))?);
+            args.extend([a.index.unwrap_or(self.s.m.i32(0)), iu]);
+            for x in vals {
+                args.push(self.as_float(x));
+            }
+            (69, "bufferStore.f32")
+        } else {
+            match a.index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    args.push(self.structured(a, u)?);
+                    args.extend([index, a.off]);
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
-            };
-            let Operand::Vector { reg, .. } = *d else {
-                return Err("buffer atomic data");
-            };
-            let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if returns => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
-            };
-            let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
-            let r = if op == u32::MAX {
-                // cmpswap: data is (new, compare).
-                let mut args = vec![h];
-                args.extend(coords);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(self.cur, "atomicCompareExchange.i32", Attr::NoUnwind, i32t, 79, &args)
-            } else {
-                let mut args = vec![h, self.s.m.i32(op)];
-                args.extend(coords);
-                args.push(vals[0]);
-                self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
-            };
-            let r = self.end_guarded(at, &[(r, old)])[0];
-            if returns {
-                self.write(inst, Reg::V(reg), r, None);
+                None => {
+                    args.push(self.handle(a.site, a.src, false, (11 | u, 0))?);
+                    args.extend([a.off, iu]);
+                }
             }
-            return Ok(());
+            args.extend(&vals);
+            args.resize(3 + 4, iu);
+            (140, "rawBufferStore.i32")
+        };
+        args.push(self.s.m.i8(if a.typed { 0xF } else { (1u8 << a.count) - 1 }));
+        if !a.typed {
+            args.push(self.s.m.i32(4));
         }
-        if store {
-            let regs = if d16 { count.div_ceil(2) } else { count };
-            let mut vals =
-                self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
-            if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
-                let mut wide = Vec::new();
-                for k in 0..count {
-                    let mut x = vals[(k / 2) as usize];
-                    if k % 2 == 1 {
-                        let k16 = self.s.m.i32(16);
-                        x = self.s.m.bin(c, Bin::LShr, x, k16);
-                    }
-                    let f32t = self.s.t.f32;
-                    let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
-                }
-                vals = wide;
-            }
-            let mut args = Vec::new();
-            let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
-                }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
-                for x in vals {
-                    args.push(self.as_float(x));
-                }
-                (69, "bufferStore.f32")
-            } else {
-                match index {
-                    Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
-                    }
-                    None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
-                    }
-                }
-                args.extend(&vals);
-                args.resize(3 + 4, iu);
-                (140, "rawBufferStore.i32")
-            };
-            args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
-            if !typed {
-                args.push(self.s.m.i32(4));
-            }
-            let at = self.begin_guarded(guard);
-            let void = self.s.t.void;
-            self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
-            self.end_guarded(at, &[]);
-            return Ok(());
+        let at = self.begin_guarded(a.guard);
+        let void = self.s.t.void;
+        self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// A `tbuffer_load_format_*`: channels in the instruction's own format.
+    fn buffer_format_load(&mut self, inst: &Inst, a: &Access, f: u8, u: u32) -> Result<(), Why> {
+        if a.index.is_some() {
+            return Err("a typed-format load by index");
         }
-        if let Some(f) = *format {
-            if index.is_some() {
-                return Err("a typed-format load by index");
-            }
-            let h = self.handle(site, src, false, (11 | u, 0))?;
-            let Some(Operand::Vector { reg, .. }) = *data else {
-                return Err("a buffer result");
-            };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
-            }
-            return Ok(());
+        let h = self.handle(a.site, a.src, false, (11 | u, 0))?;
+        let Some(Operand::Vector { reg, .. }) = a.data else {
+            return Err("a buffer result");
+        };
+        for (k, x) in self.format_load(h, a.off, f, a.count)?.into_iter().enumerate() {
+            self.write(inst, Reg::V(reg + k as u8), x, a.guard);
         }
-        let r = if typed {
-            if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
+        Ok(())
+    }
+
+    /// A typed load (in the view's format), or a raw or structured one.
+    fn buffer_load(&mut self, a: &Access, uav: bool, (u, iu): (u32, V)) -> Result<V, Why> {
+        let c = a.c;
+        if a.typed {
+            if a.offen || matches!(a.off, V::Inst(_)) || a.offset != 0 {
                 return Err("a typed buffer load at an offset");
             }
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
-            let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(c, "bufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 68, &[h, index, iu])
-        } else {
-            let mask = self.s.m.i8((1u8 << count) - 1);
-            let align = self.s.m.i32(4);
-            match index {
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
-                }
-                None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
-                }
-            }
+            let h = self.handle(a.site, a.src, false, (10 | u, 0x409))?;
+            let index = a.index.unwrap_or(self.s.m.i32(0));
+            let ret = self.s.t.res_ret;
+            return Ok(self.s.op(c, "bufferLoad.f32", Attr::ReadOnly, ret, 68, &[h, index, iu]));
+        }
+        let mask = self.s.m.i8((1u8 << a.count) - 1);
+        let align = self.s.m.i32(4);
+        let (h, [x, y]) = match a.index {
+            Some(index) => (self.structured(a, u)?, [index, a.off]),
+            None => (self.handle(a.site, a.src, false, (11 | u, 0))?, [a.off, iu]),
         };
-        let Some(Operand::Vector { reg, .. }) = *data else {
+        let args = [h, x, y, mask, align];
+        Ok(self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &args))
+    }
+
+    /// Writes the dwords or channels of a load result `r`.
+    fn buffer_result(&mut self, inst: &Inst, a: &Access, r: V) -> Result<(), Why> {
+        let c = a.c;
+        let Some(Operand::Vector { reg, .. }) = a.data else {
             return Err("a buffer result");
         };
-        if d16 {
+        if a.d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
@@ -540,10 +633,10 @@ impl Lower<'_> {
                 let f = l.s.m.extract(c, r, ch);
                 l.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
             };
-            for k in 0..count.div_ceil(2) {
+            for k in 0..a.count.div_ceil(2) {
                 // Channel 2k + 1 (the high half), if any, is converted first.
                 let lo = 2 * k;
-                let hi = (lo + 1 < count).then(|| f16(self, lo + 1));
+                let hi = (lo + 1 < a.count).then(|| f16(self, lo + 1));
                 let h = f16(self, lo);
                 let x = match hi {
                     Some(hi) => {
@@ -552,14 +645,14 @@ impl Lower<'_> {
                     }
                     None => h,
                 };
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+                self.write(inst, Reg::V(reg + k as u8), x, a.guard);
             }
             return Ok(());
         }
-        for k in 0..count {
+        for k in 0..a.count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
+            self.write(inst, Reg::V(reg + k as u8), x, a.guard);
         }
         Ok(())
     }
