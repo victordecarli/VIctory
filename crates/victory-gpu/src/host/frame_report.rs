@@ -1,6 +1,8 @@
 //! The frame report: what the last frames cost, logged every few seconds
 //! with the `victory::summary` target as one event with a field per number.
 
+use crate::memory::Memory;
+
 /// What the counters added up to since the last report.
 pub(super) struct Counts {
     /// Frames presented, at least 1.
@@ -42,12 +44,19 @@ pub(super) struct FrameReport {
     pub(super) indirect_dropped_per_frame: f64,
     /// The frame being recorded, as the drop events name it.
     pub(super) frame: u64,
+    /// Memory when logged, not per frame.
+    pub(super) memory: Memory,
 }
 
 impl FrameReport {
-    /// The report of `counts`, with the pipelines being made and the frame
-    /// being recorded now.
-    pub(super) fn per_frame(counts: &Counts, pipelines_making: u64, frame: u64) -> Self {
+    /// The report of `counts`, with the pipelines being made, the frame
+    /// being recorded and the memory now.
+    pub(super) fn per_frame(
+        counts: &Counts,
+        pipelines_making: u64,
+        frame: u64,
+        memory: Memory,
+    ) -> Self {
         let Counts {
             frames,
             seconds,
@@ -78,11 +87,12 @@ impl FrameReport {
             pipelines_making,
             indirect_dropped_per_frame: each(indirect),
             frame,
+            memory,
         }
     }
 
     /// Logs the report: times, sizes and the frame rate to a tenth, counts
-    /// per frame whole.
+    /// per frame and memory (MB) whole.
     pub(super) fn log(&self) {
         let FrameReport {
             fps,
@@ -100,9 +110,21 @@ impl FrameReport {
             pipelines_making,
             indirect_dropped_per_frame,
             frame,
+            memory:
+                Memory {
+                    commit,
+                    system_commit,
+                    commit_limit,
+                    copies,
+                    snapshots,
+                    staging,
+                    title_private,
+                    title_mapped,
+                },
         } = *self;
         let tenth = |x: f64| (x * 10.0).round() / 10.0;
         let whole = |x: f64| x.round() as u64;
+        let mb = |bytes: u64| whole(bytes as f64 / 1e6);
         tracing::info!(
             target: crate::SUMMARY,
             fps = tenth(fps),
@@ -120,6 +142,14 @@ impl FrameReport {
             pipelines_making,
             indirect_dropped_per_frame = whole(indirect_dropped_per_frame),
             frame,
+            commit_mb = mb(commit),
+            system_commit_mb = mb(system_commit),
+            commit_limit_mb = mb(commit_limit),
+            copies_held_mb = mb(copies),
+            snapshots_held_mb = mb(snapshots),
+            staging_held_mb = mb(staging),
+            title_private_mb = mb(title_private),
+            title_mapped_mb = mb(title_mapped),
             "frame report"
         );
     }
@@ -135,6 +165,7 @@ mod tests {
     use tracing::{Event, Metadata, Subscriber};
 
     use super::{Counts, FrameReport};
+    use crate::memory::Memory;
 
     type Fields = BTreeMap<String, String>;
 
@@ -191,6 +222,16 @@ mod tests {
             pipelines_making: 3,
             indirect_dropped_per_frame: 0.4,
             frame: 812,
+            memory: Memory {
+                commit: 22_302_400_000,
+                system_commit: 46_309_600_000,
+                commit_limit: 47_632_000_000,
+                copies: 1_200_600_000,
+                snapshots: 174_400_000,
+                staging: 2_400_000_000,
+                title_private: 12_100_000_000,
+                title_mapped: 6_549_700_000,
+            },
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         tracing::subscriber::with_default(Recorder(events.clone()), || report.log());
@@ -216,6 +257,14 @@ mod tests {
             ("pipelines_making", "3"),
             ("indirect_dropped_per_frame", "0"),
             ("frame", "812"),
+            ("commit_mb", "22302"),
+            ("system_commit_mb", "46310"),
+            ("commit_limit_mb", "47632"),
+            ("copies_held_mb", "1201"),
+            ("snapshots_held_mb", "174"),
+            ("staging_held_mb", "2400"),
+            ("title_private_mb", "12100"),
+            ("title_mapped_mb", "6550"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -237,7 +286,17 @@ mod tests {
             dropped: 12,
             indirect: 6,
         };
-        let r = FrameReport::per_frame(&counts, 7, 900);
+        let now = Memory {
+            commit: 1,
+            system_commit: 2,
+            commit_limit: 3,
+            copies: 4,
+            snapshots: 5,
+            staging: 6,
+            title_private: 7,
+            title_mapped: 8,
+        };
+        let r = FrameReport::per_frame(&counts, 7, 900, now);
         let FrameReport {
             fps,
             ms_per_frame,
@@ -254,6 +313,7 @@ mod tests {
             pipelines_making,
             indirect_dropped_per_frame,
             frame,
+            memory,
         } = r;
         assert_eq!(
             [fps, ms_per_frame, cpu_ms, copies_ms, copies_mb, textures_ms, textures_mb, gpu_ms],
@@ -270,5 +330,21 @@ mod tests {
             [0.1, 0.5, 500.0, 3.0, 1.5]
         );
         assert_eq!((pipelines_making, frame), (7, 900));
+        // Memory is what it is now, not averaged.
+        let Memory {
+            commit,
+            system_commit,
+            commit_limit,
+            copies,
+            snapshots,
+            staging,
+            title_private,
+            title_mapped,
+        } = memory;
+        assert_eq!(
+            [commit, system_commit, commit_limit, copies, snapshots, staging],
+            [1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!([title_private, title_mapped], [7, 8]);
     }
 }

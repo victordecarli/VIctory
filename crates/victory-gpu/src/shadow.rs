@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
+use crate::memory::Held;
 use crate::watch::PAGE;
 
 /// A title buffer's host copy.
@@ -32,6 +33,8 @@ pub(crate) struct Shadow {
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
+    /// Bytes of `buffer`.
+    bytes: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
@@ -59,7 +62,11 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            let v = Vec::with_capacity(n);
+            Held::Snapshots.hold(v.capacity() as u64);
+            v
+        }
     };
     v.clear();
     v
@@ -71,7 +78,9 @@ fn give_back(v: Vec<u8>) {
     pool.push(v);
     if pool.len() > 8 {
         pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
+        for v in pool.drain(8..) {
+            Held::Snapshots.release(v.capacity() as u64);
+        }
     }
 }
 
@@ -106,14 +115,23 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+    /// The copy of `len` bytes at `start` in `buffer` (`bytes` long, mapped
+    /// at `data`, at `gpu` on the host GPU).
+    fn new(
+        (buffer, data, bytes): (ID3D12Resource, *mut u8, u64),
+        gpu: u64,
+        start: u64,
+        len: u64,
+    ) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        Held::Copies.hold(bytes);
         Shadow {
             buffer,
             data,
             gpu,
             start,
             len,
+            bytes,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -363,6 +381,16 @@ impl Shadow {
     }
 }
 
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        Held::Copies.release(self.bytes);
+        let before = self.before.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, bytes)) = before.take() {
+            Held::Snapshots.release(bytes.capacity() as u64);
+        }
+    }
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -405,7 +433,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let bytes = len.next_multiple_of(1 << 16);
+        let (buffer, data) = host()?.shared_buffer(bytes)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -418,7 +447,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         } else {
             tracing::debug!(start = format_args!("{:#x}", key.0), len, "buffer copied to the host");
         }
-        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
+        entry.shadow = Some(Arc::new(Shadow::new((buffer, data, bytes), gpu, key.0, len)));
     }
     entry.shadow.clone()
 }
@@ -445,7 +474,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(start = format_args!("{start:#x}"), len, "loose memory copied to the host");
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    let shadow = Arc::new(Shadow::new((buffer, data, len), gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
