@@ -82,82 +82,14 @@ impl<'a> Lower<'a> {
                 self.handles.insert(key, h);
                 Ok(h)
             }
-            Source::Constant(words) if sampler => {
-                let words: [u32; 4] =
-                    words.get(..4).and_then(|w| w.try_into().ok()).ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
-                    None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
-                    }
-                };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
-                Ok(self.s.sampler_handle(self.cur, n as u32))
-            }
+            Source::Constant(words) if sampler => self.constant_sampler(words, props),
             Source::Constant(_) => Err("a constant resource descriptor"),
-            Source::Built { address, .. } => {
-                let rp = *self
-                    .x
-                    .native
-                    .layout
-                    .get(address.param)
-                    .ok_or("a descriptor built around a table in the code")?;
-                let kind =
-                    self.x.native.used.iter().find(|u| u.user_data == rp.user_data).map(|u| u.kind);
-                match (rp.root, kind, props.0) {
-                    (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
-                        Ok(self.s.root_cbv_handle(rp.slot))
-                    }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
-                    }
-                    _ => Err("a root UAV or typed root view"),
-                }
-            }
+            Source::Built { address, .. } => self.root_view(*address, props),
             Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                self.phi_handle(*block, args, sampler, props)
             }
-            Source::Select { scc, args } => {
-                // The heap index of each choice, picked by SCC (uniform).
-                let [Source::Loaded { load: a, first: fa }, Source::Loaded { load: b, first: fb }] =
-                    args[..]
-                else {
-                    return Err("a descriptor chosen by a condition");
-                };
-                let cond = match self.get(*scc)? {
-                    Val::Bit(x) => x,
-                    _ => return Err("SCC without a value"),
-                };
-                let set = self.heap_index(a, fa, sampler)?;
-                let clear = self.heap_index(b, fb, sampler)?;
-                let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
-            }
+            Source::Select { scc, args } => self.select_handle(*scc, args, sampler, props),
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
@@ -166,6 +98,99 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// An immediate sampler: a static sampler, one per distinct value.
+    fn constant_sampler(&mut self, words: &[u32], props: (u32, u32)) -> Result<V, Why> {
+        let words: [u32; 4] =
+            words.get(..4).and_then(|w| w.try_into().ok()).ok_or("a sampler constant")?;
+        let n = match self.samplers.iter().position(|w| *w == words) {
+            Some(n) => n,
+            None => {
+                self.samplers.push(words);
+                self.samplers.len() - 1
+            }
+        };
+        if props.0 & 0x8000 != 0 {
+            // shortcut: one sampler used with and without comparison
+            // would need two static samplers; it becomes a comparison one.
+            self.s.cmp_samplers |= 1 << n;
+        }
+        Ok(self.s.sampler_handle(self.cur, n as u32))
+    }
+
+    /// A buffer descriptor built around the address in a root parameter: the
+    /// root CBV or SRV of that parameter.
+    fn root_view(&mut self, address: Address, props: (u32, u32)) -> Result<V, Why> {
+        let rp = *self
+            .x
+            .native
+            .layout
+            .get(address.param)
+            .ok_or("a descriptor built around a table in the code")?;
+        let kind = self.x.native.used.iter().find(|u| u.user_data == rp.user_data).map(|u| u.kind);
+        match (rp.root, kind, props.0) {
+            (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
+                Ok(self.s.root_cbv_handle(rp.slot))
+            }
+            (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
+                Ok(self.s.root_srv_handle(rp.slot))
+            }
+            _ => Err("a root UAV or typed root view"),
+        }
+    }
+
+    /// A descriptor chosen by control flow: each predecessor of `block`
+    /// computes its heap index at its end; the join picks one with a phi.
+    fn phi_handle(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        sampler: bool,
+        props: (u32, u32),
+    ) -> Result<V, Why> {
+        let mut incoming = Vec::new();
+        for (&q, arg) in self.x.p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
+                return Err("a descriptor chosen by control flow");
+            };
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let here = std::mem::replace(&mut self.cur, at);
+            let index = self.heap_index(*load, *first, sampler);
+            self.cur = here;
+            incoming.push((index?, at));
+        }
+        let join = self.block[block].ok_or("a descriptor chosen by control flow")?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+    }
+
+    /// A descriptor chosen by SCC (uniform): the heap index of each choice,
+    /// picked by a select.
+    fn select_handle(
+        &mut self,
+        scc: Value,
+        args: &[Source],
+        sampler: bool,
+        props: (u32, u32),
+    ) -> Result<V, Why> {
+        let [Source::Loaded { load: a, first: fa }, Source::Loaded { load: b, first: fb }] =
+            args[..]
+        else {
+            return Err("a descriptor chosen by a condition");
+        };
+        let cond = match self.get(scc)? {
+            Val::Bit(x) => x,
+            _ => return Err("SCC without a value"),
+        };
+        let set = self.heap_index(a, fa, sampler)?;
+        let clear = self.heap_index(b, fb, sampler)?;
+        let index = self.s.m.select(self.cur, cond, set, clear);
+        Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
     }
 
     /// The heap index of a descriptor that may differ between lanes,
