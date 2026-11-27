@@ -3,6 +3,7 @@
 //! whole-wave sections and the values they leave.
 
 use super::*;
+use crate::native::{ComputeIo, MeshIo};
 
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -36,6 +37,114 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
         .collect()
 }
 
+/// The group, LDS and wave size a compute program declares; whether its
+/// host lanes must be the console's, and the two host waves that run a
+/// console wave64 on a 32-lane host.
+fn compute_shader(x: &Parts, s: &mut Shader, cs: &ComputeIo) -> (bool, Option<halves::Halves>) {
+    s.threads = Some(cs.threads);
+    s.lds_dwords = cs.lds_bytes() / 4;
+    let console_lanes = needs_console_lanes(x);
+    let wave = if x.native.wave64 { 64 } else { 32 };
+    let one_wave = cs.threads.iter().product::<u32>() <= wave;
+    if console_lanes || one_wave && s.lds_dwords > 0 {
+        s.wave_size = Some(wave);
+    }
+    // A host of 32-lane waves refuses `WaveSize(64)`: two host waves
+    // of 32 where that is exact.
+    let group = cs.threads.iter().product::<u32>();
+    let mut split = None;
+    if s.wave_size == Some(64)
+        && x.host_lanes == 32
+        && halves::keeps_64(x.p, x.st, group, s.lds_dwords).is_none()
+    {
+        s.wave_size = Some(32);
+        split = Some(halves::Halves::new(&mut s.lds_dwords, group));
+    }
+    (console_lanes, split)
+}
+
+/// Code reading other lanes needs the console's wave size and lane order;
+/// so do lane masks read as numbers, and LDS shared within one wave, where
+/// the console compiler leaves out barriers.
+fn needs_console_lanes(x: &Parts) -> bool {
+    let insts = || x.p.blocks.iter().flat_map(|b| &b.insts);
+    insts().any(|i| {
+        let n = i.name();
+        n.starts_with("ds_swizzle")
+            || n.contains("permute")
+            || n.starts_with("v_mbcnt")
+            || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+            || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+            || reads_mask_as_data(x.st, i)
+    }) || {
+        // Masks held as numbers or constant lane sets: the lane
+        // tests its own bit by its console lane.
+        let whens = x.st.exits.iter().filter_map(|e| match *e {
+            LaneExit::Branch { when, .. } => Some(when),
+            _ => None,
+        });
+        let mut all: Vec<Bool> =
+            x.st.guards.iter().flatten().flatten().copied().chain(whens).collect();
+        all.sort_unstable();
+        all.dedup();
+        all.into_iter().any(|g| {
+            x.st.bools.support(g).iter().any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+        })
+    }
+}
+
+/// The group, LDS and limits a mesh program declares, and the IR blocks
+/// whose `s_barrier` is left out.
+fn mesh_shader(x: &Parts, s: &mut Shader, ms: &MeshIo) -> HashSet<usize> {
+    s.prims = x.prims.clone();
+    s.threads = Some([ms.threads, 1, 1]);
+    s.lds_dwords = ms.lds_bytes.div_ceil(4);
+    s.mesh = Some(super::super::shader::Mesh {
+        max_vertices: ms.max_vertices,
+        max_primitives: ms.max_primitives,
+        topology: ms.topology,
+    });
+    no_barrier_blocks(x.p, ms.lds_bytes)
+}
+
+/// Barriers order the lanes' LDS accesses; the console's allocation
+/// request needs them too, but the host does not. One lane sends that
+/// request, and what it dominates (the path for counts out of range) runs
+/// in that lane alone, so its barrier would hang the host.
+fn no_barrier_blocks(p: &Program, lds_bytes: u32) -> HashSet<usize> {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        index[b] = n;
+    }
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let alloc: Vec<usize> = (0..p.blocks.len())
+        .filter(|&b| {
+            p.blocks[b].insts.iter().any(|i| {
+                i.name() == "s_sendmsg"
+                    && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
+            })
+        })
+        .collect();
+    let mut no_barrier = HashSet::new();
+    for &b in &order {
+        let mut d = b;
+        let dominated = loop {
+            if alloc.contains(&d) {
+                break true;
+            }
+            if idom[d] == d || idom[d] == usize::MAX {
+                break false;
+            }
+            d = idom[d];
+        };
+        if lds_bytes == 0 || dominated {
+            no_barrier.insert(b);
+        }
+    }
+    no_barrier
+}
+
 impl<'a> Lower<'a> {
     pub(super) fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -53,101 +162,16 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
-        let mut console_lanes = false;
-        let mut split = None;
-        if let StageIo::Cs(cs) = x.native.io {
-            s.threads = Some(cs.threads);
-            s.lds_dwords = cs.lds_bytes() / 4;
-            // Code reading other lanes needs the console's wave size and
-            // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards.iter().flatten().flatten().copied().chain(whens).collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
-            }
-            // A host of 32-lane waves refuses `WaveSize(64)`: two host waves
-            // of 32 where that is exact.
-            let group = cs.threads.iter().product::<u32>();
-            if s.wave_size == Some(64)
-                && x.host_lanes == 32
-                && halves::keeps_64(p, x.st, group, s.lds_dwords).is_none()
-            {
-                s.wave_size = Some(32);
-                split = Some(halves::Halves::new(&mut s.lds_dwords, group));
-            }
-        }
-        let mut no_barrier = HashSet::new();
-        if let StageIo::Ms(ms) = &x.native.io {
-            s.prims = x.prims.clone();
-            s.threads = Some([ms.threads, 1, 1]);
-            s.lds_dwords = ms.lds_bytes.div_ceil(4);
-            s.mesh = Some(super::super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
-                topology: ms.topology,
-            });
-            // Barriers order the lanes' LDS accesses; the console's
-            // allocation request needs them too, but the host does not. One
-            // lane sends that request, and what it dominates (the path for
-            // counts out of range) runs in that lane alone, so its barrier
-            // would hang the host.
-            let order = crate::ir::reverse_postorder(&p.blocks);
-            let mut index = vec![usize::MAX; p.blocks.len()];
-            for (n, &b) in order.iter().enumerate() {
-                index[b] = n;
-            }
-            let idom = crate::ir::idoms(&p.blocks, &order, &index);
-            let alloc: Vec<usize> = (0..p.blocks.len())
-                .filter(|&b| {
-                    p.blocks[b].insts.iter().any(|i| {
-                        i.name() == "s_sendmsg"
-                            && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
-                    })
-                })
-                .collect();
-            for &b in &order {
-                let mut d = b;
-                let dominated = loop {
-                    if alloc.contains(&d) {
-                        break true;
-                    }
-                    if idom[d] == d || idom[d] == usize::MAX {
-                        break false;
-                    }
-                    d = idom[d];
-                };
-                if ms.lds_bytes == 0 || dominated {
-                    no_barrier.insert(b);
-                }
-            }
-        }
+        let (console_lanes, split) = if let StageIo::Cs(cs) = &x.native.io {
+            compute_shader(x, &mut s, cs)
+        } else {
+            (false, None)
+        };
+        let no_barrier = if let StageIo::Ms(ms) = &x.native.io {
+            mesh_shader(x, &mut s, ms)
+        } else {
+            HashSet::new()
+        };
         Lower {
             s,
             x,
