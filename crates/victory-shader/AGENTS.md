@@ -44,10 +44,18 @@ export, a branch) needs it, so an unused unsupported value costs nothing.
 
 ## lower.rs
 
-`crates/victory-shader/src/emit/lower.rs` is many times the file limit and
-holds most of the crate's `unreachable!`. Put a new lowering in its own
-module under `emit/` and call it from `lower`, as `wave` is. An `unreachable!` you touch there becomes a `let ... else` returning
-the lowering's error.
+`crates/victory-shader/src/emit/lower.rs` holds the `Lower` struct, the
+dispatch of each instruction (`inst`) and the value helpers every lowering
+shares. The lowerings sit in modules under
+`crates/victory-shader/src/emit/lower/`, each an `impl Lower` block of its
+own: `image`, `memory` (buffer and global loads), `smem` (scalar loads),
+`descriptor` (resource handles), `valu16`, `io` (inputs, interpolation,
+exports) and `halves` (wave64 on a 32-lane host). The scalar ALU, the
+32-bit vector ALU, LDS, stage setup and control flow are still in
+lower.rs, still several times the file limit, and move out the same way
+(issue #77). Put a new lowering in the module of its kind, or a new one
+beside them, never in lower.rs. An `unreachable!` you touch there becomes
+a `let ... else` returning the lowering's error.
 
 ## Tests
 
