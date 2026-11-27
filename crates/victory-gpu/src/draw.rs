@@ -22,8 +22,14 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
+use crate::pipeline::drops::{Cause, NotRun, Unprepared};
 use crate::pipeline::host::HostPipeline;
 use crate::warn::warn_once;
+
+mod record;
+
+pub(crate) use record::take_indirect;
+use record::{Work, record};
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -79,8 +85,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
-    /// A fresh table of the stage being bound could not be made.
-    table_failed: bool,
+    /// The size of a fresh table of the stage being bound that could not
+    /// be made.
+    table_failed: Option<u32>,
 }
 
 impl Drop for State {
@@ -111,30 +118,11 @@ pub(crate) fn take_frame() -> Vec<String> {
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
+/// since the last call.
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
-
-/// Counts a draw not run on the host where its cause lives, and marks the
-/// last traced draw (diagnostics).
-fn dropped(pipeline: usize) {
-    // SAFETY: `pipeline` is the pipeline the title set, which it keeps alive
-    // while a list uses it.
-    unsafe { crate::pipeline::count_drop(pipeline as This) };
-    #[cfg(feature = "diagnostics")]
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
-        last.push_str(" DROPPED");
-    }
-}
-
-/// Counts a draw or dispatch dropped for a general `cause` (no pipeline to
-/// blame), here and in the drop totals.
-pub(crate) fn dropped_for(cause: crate::pipeline::drops::Cause) {
-    DROPPED.fetch_add(1, Ordering::Relaxed);
-    crate::pipeline::drops::general(cause);
-}
 
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
@@ -337,33 +325,28 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
-    /// Brings the host list up to date for a draw; false if the draw cannot
-    /// run on the host.
-    fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
+    /// Brings the host list up to date for a draw, or says why the draw
+    /// cannot run on the host.
+    fn prepare(&mut self, list: &HostList, indexed: bool) -> Result<(), NotRun> {
         self.prepare_for(list, indexed, false)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> Result<(), NotRun> {
         #[cfg(feature = "diagnostics")]
         // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
         // while a list uses it.
         if unsafe { crate::pipeline::is_skipped(self.pipeline as This) } {
-            return false;
+            return Err(NotRun::NoHostPipeline);
         }
         // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
         // while a list uses it.
         let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
-        let Some(p) = ready else {
-            return false;
-        };
+        let p = ready.ok_or(NotRun::NoHostPipeline)?;
         if p.compute || p.mesh != mesh {
-            warn_once!("a draw or mesh dispatch with another kind of pipeline", mesh);
-            return false;
+            return Err(NotRun::Unprepared(Unprepared::OtherKind { mesh }));
         }
-        if !self.bind(list, p, false) {
-            return false;
-        }
+        self.bind(list, p, false)?;
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -395,7 +378,8 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return false;
+                let (address, size) = (v.address, v.size);
+                return Err(NotRun::Unprepared(Unprepared::IndexBuffer { address, size }));
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -416,7 +400,7 @@ impl State {
             // SAFETY: the resources the title set are ones this crate created, which it keeps alive while a list uses them.
             unsafe { crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE) };
         }
-        true
+        Ok(())
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -424,9 +408,9 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
+    /// An error if the draw or dispatch must not run: a table it reads could
     /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Result<(), NotRun> {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -471,11 +455,10 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            self.table_failed = false;
+            self.table_failed = None;
             let made = self.tables(list, &t.used, compute);
-            if self.table_failed {
-                warn_once!("a draw or dispatch dropped: no dynamic slots for its tables");
-                return false;
+            if let Some(n) = self.table_failed {
+                return Err(NotRun::Unprepared(Unprepared::NoDynamicSlots { n }));
             }
             let constants = stage.root().user_data(|u| {
                 let fresh = made.iter().find(|m| m.0 == u.slot && u.root == RootType::Table);
@@ -515,52 +498,38 @@ impl State {
                 }
             }
         }
-        true
+        Ok(())
     }
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let result = self.run_dispatch(list, x, y, z);
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        unsafe { record(self.pipeline, Work::Dispatch, result) };
+    }
+
+    fn run_dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> Result<(), NotRun> {
         #[cfg(feature = "diagnostics")]
         // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
         // while a list uses it.
         if unsafe { crate::pipeline::is_skipped(self.pipeline as This) } {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
-            // while a list uses it.
-            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
-            return;
+            return Err(NotRun::NoHostPipeline);
         }
         // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
         // while a list uses it.
         let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
-        let Some(p) = ready else {
-            warn_once!(
-                "a dispatch without a host pipeline dropped",
-                pipeline = format_args!("{:#x}", self.pipeline)
-            );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
-            // while a list uses it.
-            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
-            return;
-        };
+        let p = ready.ok_or(NotRun::NoHostPipeline)?;
         if !p.compute {
-            warn_once!("a dispatch with a graphics pipeline");
-            dropped_for(crate::pipeline::drops::Cause::ComputeKind);
-            return;
+            return Err(NotRun::General(Cause::ComputeKind));
         }
-        if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
-            // while a list uses it.
-            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
-            return;
-        }
+        self.bind(list, p, true)?;
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -606,26 +575,32 @@ impl State {
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
-    /// programs are one-dimensional).
-    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+    /// programs are one-dimensional); one whose group count is in GPU
+    /// memory (`indirect` not 0) is dropped.
+    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32, indirect: u64) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-                Err(_) => false,
-            };
-        if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            dropped(self.pipeline);
+        let result = self.run_mesh(list, x, indirect);
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        unsafe { record(self.pipeline, Work::Draw, result) };
+    }
+
+    fn run_mesh(&mut self, list: &HostList, x: u32, indirect: u64) -> Result<(), NotRun> {
+        if indirect != 0 {
+            return Err(NotRun::General(Cause::IndirectMesh));
         }
+        self.prepare_for(list, false, true)?;
+        let l6 = list
+            .list
+            .cast::<ID3D12GraphicsCommandList6>()
+            .map_err(|e| NotRun::Unprepared(Unprepared::MeshList { code: e.code().0 }))?;
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("mesh {x}"), false));
+        // SAFETY: an open list with everything set.
+        unsafe { l6.DispatchMesh(x, 1, 1) };
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -736,7 +711,7 @@ impl State {
                 // view: a texture or null descriptor read as a buffer gives
                 // a wild address on AMD and the device is removed (#59).
                 // The draw or dispatch is dropped instead.
-                self.table_failed = true;
+                self.table_failed = Some(n);
                 continue;
             };
             self.fresh_tables.insert(key, first);
@@ -855,32 +830,41 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        let result = self.run_draw(list, (vertices, instances), first, first_instance);
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        unsafe { record(self.pipeline, Work::Draw, result) };
+    }
+
+    fn run_draw(
+        &mut self,
+        list: &HostList,
+        (vertices, instances): (u32, u32),
+        first: u32,
+        first_instance: u32,
+    ) -> Result<(), NotRun> {
         let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
-        if ran {
-            // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects { (vertices / 3 * 6, 0) } else { (vertices, first) };
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe { list.list.DrawInstanced(count, instances, from, first_instance) };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+        self.prepare(list, false)?;
+        if rects {
+            self.rectangles(list, vertices, first)?;
         }
-        if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            dropped(self.pipeline);
-        }
+        // Rectangles were expanded into their own vertex buffers.
+        let (count, from) = if rects { (vertices / 3 * 6, 0) } else { (vertices, first) };
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+        // SAFETY: an open list with everything set.
+        unsafe { list.list.DrawInstanced(count, instances, from, first_instance) };
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> Result<(), NotRun> {
         // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
         // while a list uses it.
         let ready = unsafe { crate::pipeline::host_pipeline(self.pipeline as This) };
-        let Some(p) = ready else {
-            return false;
-        };
+        let p = ready.ok_or(NotRun::NoHostPipeline)?;
         let rects = u64::from(count / 3);
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
@@ -900,11 +884,13 @@ impl State {
                 || u64::from(first + count) * stride > u64::from(v.size)
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
-                warn_once!("rectangle vertices outside their buffer", slot);
-                return false;
+                let reason =
+                    Unprepared::RectangleVertices { slot, address: v.address, size: v.size };
+                return Err(NotRun::Unprepared(reason));
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
-                return false;
+            let bytes = rects * 6 * stride;
+            let Some((gpu, to)) = list.scratch(bytes) else {
+                return Err(NotRun::Unprepared(Unprepared::Scratch { bytes }));
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
@@ -927,7 +913,7 @@ impl State {
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
         }
-        true
+        Ok(())
     }
 
     pub(crate) fn draw_indexed(
@@ -941,67 +927,79 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        let result = self.run_indexed(list, (indices, instances), (first, base), first_instance);
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        unsafe { record(self.pipeline, Work::Draw, result) };
+    }
+
+    fn run_indexed(
+        &mut self,
+        list: &HostList,
+        (indices, instances): (u32, u32),
+        (first, base): (u32, i32),
+        first_instance: u32,
+    ) -> Result<(), NotRun> {
         if self.topology == RECTANGLES {
-            warn_once!("indexed rectangles not drawn");
+            return Err(NotRun::Unprepared(Unprepared::IndexedRectangles));
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
-        if ran {
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list.DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
-        }
-        if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            dropped(self.pipeline);
-        }
+        self.prepare(list, true)?;
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+        // SAFETY: an open list with everything set.
+        unsafe { list.list.DrawIndexedInstanced(indices, instances, first, base, first_instance) };
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
+/// An indirect execution of a one-argument signature of `kind` (PC
+/// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with up
+/// to `max` records `stride` bytes apart at title address `arguments`, and
+/// the record count at `count` if the title gives one.
+pub(crate) struct Indirect {
+    pub(crate) kind: u32,
+    pub(crate) stride: u32,
+    pub(crate) max: u32,
+    pub(crate) arguments: u64,
+    pub(crate) count: Option<u64>,
+}
+
 impl State {
-    /// Indirect execution of a one-argument signature of `kind` (PC
-    /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
-    /// records `stride` bytes apart at title address `arguments`, and the
-    /// record count at `count` if the title gives one: the GPU reads them
-    /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
-    pub(crate) fn execute_indirect(
-        &mut self,
-        list: &HostList,
-        (kind, stride, max): (u32, u32, u32),
-        arguments: u64,
-        count: Option<u64>,
-    ) -> bool {
+    /// Runs `call` on the host: the GPU reads its records from the buffer's
+    /// host copy, where earlier dispatches may have written them. `None` is
+    /// a signature or buffers we do not execute. False if it did not run.
+    pub(crate) fn execute_indirect(&mut self, list: &HostList, call: Option<Indirect>) -> bool {
+        let result = call
+            .ok_or(NotRun::General(Cause::IndirectLayout))
+            .and_then(|call| self.run_indirect(list, call));
+        // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
+        // while a list uses it.
+        unsafe { record(self.pipeline, Work::Indirect, result) }
+    }
+
+    fn run_indirect(&mut self, list: &HostList, call: Indirect) -> Result<(), NotRun> {
+        let Indirect { kind, stride, max, arguments, count } = call;
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
         // while a list uses it.
         if unsafe { crate::pipeline::is_skipped(self.pipeline as This) } {
-            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
-            // while a list uses it.
-            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
-            return false;
+            return Err(NotRun::NoHostPipeline);
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        use crate::pipeline::drops::{Cause, general as why};
+        let why = |cause| Err(NotRun::General(cause));
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
-            why(Cause::IndirectArguments);
-            return false;
+            return why(Cause::IndirectArguments);
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
-                None => {
-                    why(Cause::IndirectCount);
-                    return false;
-                }
+                None => return why(Cause::IndirectCount),
             },
             None => None,
         };
@@ -1009,8 +1007,7 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
-            why(Cause::IndirectSignature);
-            return false;
+            return why(Cause::IndirectSignature);
         };
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
@@ -1018,28 +1015,29 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why(Cause::IndirectUnbounded);
-            return false;
+            return why(Cause::IndirectUnbounded);
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+        let prepared = match kind {
+            DRAW | INDEXED if self.topology == RECTANGLES => {
+                Err(NotRun::Unprepared(Unprepared::IndirectRectangles))
+            }
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
             // while a list uses it.
             DISPATCH => match unsafe { crate::pipeline::host_pipeline(self.pipeline as This) } {
                 Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
+                Some(_) => Err(NotRun::General(Cause::ComputeKind)),
+                None => Err(NotRun::NoHostPipeline),
             },
-            _ => false,
+            // Kinds without a host signature returned above.
+            _ => Err(NotRun::General(Cause::IndirectSignature)),
         };
-        if !ran {
+        if let Err(why) = prepared {
             crate::indirect::done(list, &args.buffer);
-            // SAFETY: `self.pipeline` is the pipeline the title set, which it keeps alive
-            // while a list uses it.
-            unsafe { crate::pipeline::count_drop(self.pipeline as This) };
-            return false;
+            return Err(why);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -1066,7 +1064,7 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
-        true
+        Ok(())
     }
 }
 

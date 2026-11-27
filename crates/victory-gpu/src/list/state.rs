@@ -253,7 +253,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z
         warn_once!("a mesh dispatch with y or z groups", x, y, z);
     }
     // SAFETY: as this function's contract gives them.
-    unsafe { with_state(this, |list, s| s.dispatch_mesh(list, x)) };
+    unsafe { with_state(this, |list, s| s.dispatch_mesh(list, x, 0)) };
 }
 /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
 /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -270,13 +270,8 @@ pub(super) unsafe extern "system" fn dispatch_mesh_x(
     _payload: u64,
 ) {
     super::count_draw();
-    if indirect != 0 {
-        warn_once!("indirect mesh dispatches dropped");
-        crate::draw::dropped_for(crate::pipeline::drops::Cause::IndirectMesh);
-        return;
-    }
     // SAFETY: as this function's contract gives them.
-    unsafe { with_state(this, |list, s| s.dispatch_mesh(list, x)) };
+    unsafe { with_state(this, |list, s| s.dispatch_mesh(list, x, indirect)) };
 }
 /// # Safety
 ///
