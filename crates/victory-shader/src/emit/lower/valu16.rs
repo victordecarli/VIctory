@@ -2,6 +2,7 @@
 //! of a VGPR, and the packed (`v_pk_*`) ones on both halves.
 
 use super::*;
+use crate::gfx10::Valu;
 
 impl Lower<'_> {
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
@@ -175,118 +176,25 @@ impl Lower<'_> {
         let Fields::Valu(v) = &inst.fields else {
             return Err("a vector instruction without VALU fields");
         };
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let f32t = self.s.t.f32;
         if name == "v_cvt_f32_f16" {
             let f = self.half_fsrc(inst, 0)?;
             return self.write_f(inst, f, guard);
         }
-        let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
-            if v.omod != 0 {
-                return Err("an output modifier on a 16-bit operation");
-            }
-            if v.clamp {
-                f = l.unary(7, f);
-            }
-            let h = l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-            l.write_half(inst, h, guard)
-        };
         if name == "v_cvt_f16_f32" {
             let f = self.fsrc(inst, 0)?;
-            return float_result(self, f);
+            return self.float16_result(inst, v, f, guard);
         }
         if float2.contains(&name) {
-            let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
-            let r = match name {
-                "v_add_f16" => self.s.m.bin(c, Bin::Add, a, b),
-                "v_sub_f16" => self.s.m.bin(c, Bin::Sub, a, b),
-                "v_subrev_f16" => self.s.m.bin(c, Bin::Sub, b, a),
-                "v_mul_f16" => self.s.m.bin(c, Bin::Mul, a, b),
-                "v_max_f16" => self.max_min(true, a, b),
-                _ => self.max_min(false, a, b),
-            };
-            return float_result(self, r);
+            let r = self.half_float2(inst, name)?;
+            return self.float16_result(inst, v, r, guard);
         }
         if float3.contains(&name) {
-            let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
-            let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
-                // The accumulator is the destination's half that is written.
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("an accumulator");
-                };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
-                    let k16 = self.s.m.i32(16);
-                    self.s.m.bin(c, Bin::LShr, x, k16)
-                } else {
-                    x
-                };
-                let m = self.s.m.i32(0xFFFF);
-                let x = self.s.m.bin(c, Bin::And, x, m);
-                self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
-            } else {
-                self.half_fsrc(inst, 2)?
-            };
-            let r = match name {
-                // shortcut: fused f16 multiply-adds as FMad in f32 (the
-                // product is exact; the sum rounds twice).
-                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
-                "v_max3_f16" => {
-                    let t = self.max_min(true, a, b);
-                    self.max_min(true, t, acc)
-                }
-                "v_min3_f16" => {
-                    let t = self.max_min(false, a, b);
-                    self.max_min(false, t, acc)
-                }
-                _ => self.med3(a, b, acc),
-            };
-            return float_result(self, r);
+            let r = self.half_float3(inst, v, name)?;
+            return self.float16_result(inst, v, r, guard);
         }
         if float1.contains(&name) {
-            let r = match name {
-                "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
-                    let mut x = self.half_src(inst, 0)?;
-                    let op = if name == "v_cvt_f16_i16" {
-                        let k16 = self.s.m.i32(16);
-                        let t = self.s.m.bin(c, Bin::Shl, x, k16);
-                        x = self.s.m.bin(c, Bin::AShr, t, k16);
-                        Cast::SiToFp
-                    } else {
-                        Cast::UiToFp
-                    };
-                    self.s.m.cast(c, op, x, f32t)
-                }
-                "v_rcp_f16" => {
-                    let a = self.half_fsrc(inst, 0)?;
-                    let one = self.s.m.f32(1.0f32.to_bits());
-                    self.s.m.bin(c, Bin::SDiv, one, a)
-                }
-                _ => {
-                    let a = self.half_fsrc(inst, 0)?;
-                    let op = match name {
-                        "v_sqrt_f16" => 24,
-                        "v_rsq_f16" => 25,
-                        "v_log_f16" => 23,
-                        "v_exp_f16" => 21,
-                        "v_fract_f16" => 22,
-                        "v_trunc_f16" => 29,
-                        "v_floor_f16" => 27,
-                        "v_ceil_f16" => 28,
-                        "v_rndne_f16" => 26,
-                        "v_sin_f16" => 13,
-                        _ => 12,
-                    };
-                    match op {
-                        12 | 13 => self.trig_turns(a, op == 12),
-                        // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
-                        22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
-                        _ => self.unary(op, a),
-                    }
-                }
-            };
-            return float_result(self, r);
+            let r = self.half_float1(inst, name)?;
+            return self.float16_result(inst, v, r, guard);
         }
         if matches!(name, "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16") {
             if v.clamp || v.omod != 0 {
@@ -299,67 +207,186 @@ impl Lower<'_> {
         if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
-        let r = match name {
-            "v_cvt_u16_f16" | "v_cvt_i16_f16" => {
-                // Toward zero, saturating at the 16-bit range (infinities
-                // included); NaN gives 0. Clamped in f32 first, where every
-                // f16 is exact, so the conversion never leaves i32's range.
-                let a = self.half_fsrc(inst, 0)?;
-                let (lo, hi) = if name == "v_cvt_u16_f16" {
-                    (0.0f32, 65535.0f32)
+        let r = self.int16(inst, name)?;
+        self.write_half(inst, r, guard)
+    }
+
+    /// An f16 result computed in f32: clamped if asked, rounded once to f16.
+    fn float16_result(
+        &mut self,
+        inst: &Inst,
+        v: &Valu,
+        mut f: V,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        if v.omod != 0 {
+            return Err("an output modifier on a 16-bit operation");
+        }
+        if v.clamp {
+            f = self.unary(7, f);
+        }
+        let i32t = self.s.t.i32;
+        let h = self.s.op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+        self.write_half(inst, h, guard)
+    }
+
+    /// An f16 operation of two sources, in f32.
+    fn half_float2(&mut self, inst: &Inst, name: &str) -> Result<V, Why> {
+        let c = self.cur;
+        let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
+        Ok(match name {
+            "v_add_f16" => self.s.m.bin(c, Bin::Add, a, b),
+            "v_sub_f16" => self.s.m.bin(c, Bin::Sub, a, b),
+            "v_subrev_f16" => self.s.m.bin(c, Bin::Sub, b, a),
+            "v_mul_f16" => self.s.m.bin(c, Bin::Mul, a, b),
+            "v_max_f16" => self.max_min(true, a, b),
+            _ => self.max_min(false, a, b),
+        })
+    }
+
+    /// An f16 operation of three sources (or two and the accumulator), in f32.
+    fn half_float3(&mut self, inst: &Inst, v: &Valu, name: &str) -> Result<V, Why> {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
+        let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
+            // The accumulator is the destination's half that is written.
+            let Some(Operand::Vector { reg, .. }) = v.dst else {
+                return Err("an accumulator");
+            };
+            let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+            let x = if v.opsel >> 3 & 1 != 0 {
+                let k16 = self.s.m.i32(16);
+                self.s.m.bin(c, Bin::LShr, x, k16)
+            } else {
+                x
+            };
+            let m = self.s.m.i32(0xFFFF);
+            let x = self.s.m.bin(c, Bin::And, x, m);
+            self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+        } else {
+            self.half_fsrc(inst, 2)?
+        };
+        Ok(match name {
+            // shortcut: fused f16 multiply-adds as FMad in f32 (the
+            // product is exact; the sum rounds twice).
+            "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+            "v_max3_f16" => {
+                let t = self.max_min(true, a, b);
+                self.max_min(true, t, acc)
+            }
+            "v_min3_f16" => {
+                let t = self.max_min(false, a, b);
+                self.max_min(false, t, acc)
+            }
+            _ => self.med3(a, b, acc),
+        })
+    }
+
+    /// An f16 operation of one source, in f32.
+    fn half_float1(&mut self, inst: &Inst, name: &str) -> Result<V, Why> {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        Ok(match name {
+            "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
+                let mut x = self.half_src(inst, 0)?;
+                let op = if name == "v_cvt_f16_i16" {
+                    let k16 = self.s.m.i32(16);
+                    let t = self.s.m.bin(c, Bin::Shl, x, k16);
+                    x = self.s.m.bin(c, Bin::AShr, t, k16);
+                    Cast::SiToFp
                 } else {
-                    (-32768.0, 32767.0)
+                    Cast::UiToFp
                 };
-                let (lo, hi) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(hi.to_bits()));
-                let t = self.binary(35, a, lo);
-                let t = self.binary(36, t, hi);
-                let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
-                let nan = self.s.m.cmp(c, pred::UNO, a, a);
-                let z = self.s.m.i32(0);
-                self.s.m.select(c, nan, z, r)
+                self.s.m.cast(c, op, x, f32t)
+            }
+            "v_rcp_f16" => {
+                let a = self.half_fsrc(inst, 0)?;
+                let one = self.s.m.f32(1.0f32.to_bits());
+                self.s.m.bin(c, Bin::SDiv, one, a)
             }
             _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
-                let k16 = self.s.m.i32(16);
-                let sext = |l: &mut Self, x: V| {
-                    let t = l.s.m.bin(c, Bin::Shl, x, k16);
-                    l.s.m.bin(c, Bin::AShr, t, k16)
+                let a = self.half_fsrc(inst, 0)?;
+                let op = match name {
+                    "v_sqrt_f16" => 24,
+                    "v_rsq_f16" => 25,
+                    "v_log_f16" => 23,
+                    "v_exp_f16" => 21,
+                    "v_fract_f16" => 22,
+                    "v_trunc_f16" => 29,
+                    "v_floor_f16" => 27,
+                    "v_ceil_f16" => 28,
+                    "v_rndne_f16" => 26,
+                    "v_sin_f16" => 13,
+                    _ => 12,
                 };
-                if name.ends_with("_i16") {
-                    a = sext(self, a);
-                    b = sext(self, b);
-                }
-                let k15 = self.s.m.i32(15);
-                match name {
-                    "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                    "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
-                    "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
-                    "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
-                    "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
-                        // src0 is the shift (4 bits), src1 the value.
-                        let sh = self.s.m.bin(c, Bin::And, a, k15);
-                        let x = if name == "v_ashrrev_i16" { sext(self, b) } else { b };
-                        let op = match name {
-                            "v_lshlrev_b16" => Bin::Shl,
-                            "v_lshrrev_b16" => Bin::LShr,
-                            _ => Bin::AShr,
-                        };
-                        self.s.m.bin(c, op, x, sh)
-                    }
-                    _ => {
-                        let p = match name {
-                            "v_max_u16" => pred::IUGT,
-                            "v_min_u16" => pred::IULT,
-                            "v_max_i16" => pred::SGT,
-                            _ => pred::SLT,
-                        };
-                        let t = self.s.m.cmp(c, p, a, b);
-                        self.s.m.select(c, t, a, b)
-                    }
+                match op {
+                    12 | 13 => self.trig_turns(a, op == 12),
+                    // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
+                    22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
+                    _ => self.unary(op, a),
                 }
             }
+        })
+    }
+
+    /// A 16-bit integer operation, or a conversion from f16 to one.
+    fn int16(&mut self, inst: &Inst, name: &str) -> Result<V, Why> {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        if matches!(name, "v_cvt_u16_f16" | "v_cvt_i16_f16") {
+            // Toward zero, saturating at the 16-bit range (infinities
+            // included); NaN gives 0. Clamped in f32 first, where every
+            // f16 is exact, so the conversion never leaves i32's range.
+            let a = self.half_fsrc(inst, 0)?;
+            let (lo, hi) =
+                if name == "v_cvt_u16_f16" { (0.0f32, 65535.0f32) } else { (-32768.0, 32767.0) };
+            let (lo, hi) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(hi.to_bits()));
+            let t = self.binary(35, a, lo);
+            let t = self.binary(36, t, hi);
+            let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
+            let nan = self.s.m.cmp(c, pred::UNO, a, a);
+            let z = self.s.m.i32(0);
+            return Ok(self.s.m.select(c, nan, z, r));
+        }
+        let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+        let k16 = self.s.m.i32(16);
+        let sext = |l: &mut Self, x: V| {
+            let t = l.s.m.bin(c, Bin::Shl, x, k16);
+            l.s.m.bin(c, Bin::AShr, t, k16)
         };
-        self.write_half(inst, r, guard)
+        if name.ends_with("_i16") {
+            a = sext(self, a);
+            b = sext(self, b);
+        }
+        let k15 = self.s.m.i32(15);
+        Ok(match name {
+            "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
+            "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+            "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
+            "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+            "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
+                // src0 is the shift (4 bits), src1 the value.
+                let sh = self.s.m.bin(c, Bin::And, a, k15);
+                let x = if name == "v_ashrrev_i16" { sext(self, b) } else { b };
+                let op = match name {
+                    "v_lshlrev_b16" => Bin::Shl,
+                    "v_lshrrev_b16" => Bin::LShr,
+                    _ => Bin::AShr,
+                };
+                self.s.m.bin(c, op, x, sh)
+            }
+            _ => {
+                let p = match name {
+                    "v_max_u16" => pred::IUGT,
+                    "v_min_u16" => pred::IULT,
+                    "v_max_i16" => pred::SGT,
+                    _ => pred::SLT,
+                };
+                let t = self.s.m.cmp(c, p, a, b);
+                self.s.m.select(c, t, a, b)
+            }
+        })
     }
 
     /// `v_cvt_norm_i16_f16` / `v_cvt_norm_u16_f16`: the f16 source (with its
@@ -506,46 +533,7 @@ impl Lower<'_> {
                 }
                 self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
             } else {
-                let k16 = self.s.m.i32(16);
-                let sext = |l: &mut Self, x: V| {
-                    let t = l.s.m.bin(c, Bin::Shl, x, k16);
-                    l.s.m.bin(c, Bin::AShr, t, k16)
-                };
-                if op.ends_with("_i16") {
-                    for x in &mut xs {
-                        *x = sext(self, *x);
-                    }
-                }
-                let k15 = self.s.m.i32(15);
-                match op {
-                    "add_u16" | "add_i16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
-                    "sub_u16" | "sub_i16" => self.s.m.bin(c, Bin::Sub, xs[0], xs[1]),
-                    "mul_lo_u16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
-                    "mad_u16" | "mad_i16" => {
-                        let m = self.s.m.bin(c, Bin::Mul, xs[0], xs[1]);
-                        self.s.m.bin(c, Bin::Add, m, xs[2])
-                    }
-                    "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16" => {
-                        let sh = self.s.m.bin(c, Bin::And, xs[0], k15);
-                        let o = match op {
-                            "lshlrev_b16" => Bin::Shl,
-                            "lshrrev_b16" => Bin::LShr,
-                            _ => Bin::AShr,
-                        };
-                        let x = if op == "ashrrev_i16" { sext(self, xs[1]) } else { xs[1] };
-                        self.s.m.bin(c, o, x, sh)
-                    }
-                    _ => {
-                        let p = match op {
-                            "max_u16" => pred::IUGT,
-                            "min_u16" => pred::IULT,
-                            "max_i16" => pred::SGT,
-                            _ => pred::SLT,
-                        };
-                        let t = self.s.m.cmp(c, p, xs[0], xs[1]);
-                        self.s.m.select(c, t, xs[0], xs[1])
-                    }
-                }
+                self.packed_int(c, op, &mut xs)
             };
             let m = self.s.m.i32(0xFFFF);
             halves.push(self.s.m.bin(c, Bin::And, r, m));
@@ -558,5 +546,49 @@ impl Lower<'_> {
         };
         self.write(inst, Reg::V(reg), r, guard);
         Ok(())
+    }
+
+    /// One half of a packed 16-bit integer operation on its sources `xs`.
+    fn packed_int(&mut self, c: usize, op: &str, xs: &mut [V]) -> V {
+        let k16 = self.s.m.i32(16);
+        let sext = |l: &mut Self, x: V| {
+            let t = l.s.m.bin(c, Bin::Shl, x, k16);
+            l.s.m.bin(c, Bin::AShr, t, k16)
+        };
+        if op.ends_with("_i16") {
+            for x in xs.iter_mut() {
+                *x = sext(self, *x);
+            }
+        }
+        let k15 = self.s.m.i32(15);
+        match op {
+            "add_u16" | "add_i16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
+            "sub_u16" | "sub_i16" => self.s.m.bin(c, Bin::Sub, xs[0], xs[1]),
+            "mul_lo_u16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
+            "mad_u16" | "mad_i16" => {
+                let m = self.s.m.bin(c, Bin::Mul, xs[0], xs[1]);
+                self.s.m.bin(c, Bin::Add, m, xs[2])
+            }
+            "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16" => {
+                let sh = self.s.m.bin(c, Bin::And, xs[0], k15);
+                let o = match op {
+                    "lshlrev_b16" => Bin::Shl,
+                    "lshrrev_b16" => Bin::LShr,
+                    _ => Bin::AShr,
+                };
+                let x = if op == "ashrrev_i16" { sext(self, xs[1]) } else { xs[1] };
+                self.s.m.bin(c, o, x, sh)
+            }
+            _ => {
+                let p = match op {
+                    "max_u16" => pred::IUGT,
+                    "min_u16" => pred::IULT,
+                    "max_i16" => pred::SGT,
+                    _ => pred::SLT,
+                };
+                let t = self.s.m.cmp(c, p, xs[0], xs[1]);
+                self.s.m.select(c, t, xs[0], xs[1])
+            }
+        }
     }
 }
