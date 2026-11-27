@@ -315,3 +315,80 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{
+        S_ENDPGM, lower_wave, lower_with, root, texture_and_uav_tables, texture_tables,
+    };
+    use crate::native::{ResourceType, RootType, UsedResource};
+
+    #[test]
+    fn a_descriptor_selected_by_scc_picks_its_heap_index() {
+        // Two buffer descriptors loaded from the table at s0, one picked by
+        // a root constant (s1) with s_cselect_b64 per half, and loaded
+        // through by index and stored to LDS so the load is needed.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF408_0302,
+            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
+            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
+            0xE030_2000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        // Both are structured buffers of dwords in the table's range.
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn waterfall_loops_over_per_lane_descriptors_sample_with_each_lanes_own() {
+        use crate::resource::tests::{
+            WATERFALL_FETCHED_WAVE32, WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32,
+        };
+        for (words, wave64) in [
+            (WATERFALL_FETCHED_WAVE32, false),
+            (WATERFALL_FETCHED_WAVE64, true),
+            (WATERFALL_PICKED_WAVE32, false),
+        ] {
+            let (layout, used) = texture_tables();
+            let l = lower_wave(words, layout, used, wave64).unwrap();
+            // The loop's reads of the first lane became each lane's own
+            // dwords: no wave operation is left.
+            assert_eq!(l.nonuniform_handles, 1);
+            assert!(!l.wave_ops);
+        }
+    }
+
+    #[test]
+    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
+        use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
+        for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
+            let (layout, used) = texture_and_uav_tables();
+            let l = lower_wave(words, layout, used, false).unwrap();
+            // One image handle, from the join's per-lane heap index.
+            assert_eq!(l.nonuniform_handles, 1);
+            assert!(!l.wave_ops);
+        }
+    }
+}
