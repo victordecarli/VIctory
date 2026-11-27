@@ -248,7 +248,7 @@ missing imports, the host adapter and its wave lanes, the frame reports
 one, `fps`, `ms_per_frame`, `cpu_ms` preparing submissions with its
 `copies_ms`/`copies_mb` and `textures_ms`/`textures_mb`, `gpu_ms`
 waiting for the GPU, `copy_back_ms`/`copy_back_mb`, `draws_per_frame`,
-`dropped_per_frame`, `indirect_per_frame`; `pipelines_making` now; and
+`dropped_per_frame`, `indirect_dropped_per_frame`; `pipelines_making` now; and
 the `frame` the drop lines also name), the draws the host did not run, and a crash
 (`"message":"crash"`, the report in `report`), which also goes to
 `crashes.log` as before. A dropped draw is counted where its cause lives,
@@ -256,8 +256,15 @@ in every build: on the shader that does not translate (with the
 translator's error and its `class`), on the pipeline still being made,
 refused by the host or not prepared, or by a general `cause` (no pipeline
 set, indirect arguments the host cannot read, a dispatch with a graphics
-pipeline, an indirect mesh dispatch). Each shader, pipeline and
-cause logs a `"first drop"` line once, and each frame report is followed
+pipeline, an indirect mesh dispatch). A made pipeline whose draw could
+not be prepared is counted by reason too, each also a `cause` (another
+kind of pipeline, no dynamic descriptor slots, index buffer or rectangle
+vertices outside title buffers, no scratch memory, a host list without
+mesh dispatches, indexed or indirect rectangles): its
+`"drop total: pipeline"` line has `unprepared` and, for each reason it
+has, a field of that reason's name. Each shader, pipeline and
+cause logs a `"first drop"` line once (a reason's with its context in
+`detail`), and each frame report is followed
 by `"drop totals"` and the run's totals for the 40 costliest of each.
 A case the host skips or does not implement yet logs one `warn` line the
 first time; every case after it is counted, and each frame report is also

@@ -1144,9 +1144,9 @@ unsafe extern "system" fn execute_indirect(
     count_draw();
     // SAFETY: `signature` is a signature our device created and the title
     // still holds for the call, per this function's contract.
-    let Some((stride, args)) = (unsafe { crate::signature::layout(signature) }) else {
-        return;
-    };
+    let layout = unsafe { crate::signature::layout(signature) };
+    // No signature: no layout we execute, so `State` drops it.
+    let (stride, args) = layout.unwrap_or((0, &[]));
     // SAFETY: a resource this crate created, which the title keeps alive
     // while it is in use.
     let address =
@@ -1157,26 +1157,22 @@ unsafe extern "system" fn execute_indirect(
         unsafe { crate::resource::buffer_bytes(count) }.map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
-        && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        // SAFETY: as this function's contract gives them.
-        unsafe {
-            with_state(this, |list, s| {
-                ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-            })
+        let call = match (args, address) {
+            ([[kind, ..]], Some(arguments)) if count.is_null() || counter.is_some() => {
+                let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+                Some(crate::draw::Indirect { kind, stride, max, arguments, count: counter })
+            }
+            _ => None,
         };
-    } else {
-        #[cfg(windows)]
-        crate::pipeline::drops::general(crate::pipeline::drops::Cause::IndirectLayout);
+        // SAFETY: as this function's contract gives them.
+        unsafe { with_state(this, |list, s| ran = s.execute_indirect(list, call)) };
     }
     if ran {
         return;
     }
-    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -1192,11 +1188,6 @@ unsafe extern "system" fn execute_indirect(
     }
 }
 
-/// Indirect executions dropped since the last call.
-pub(crate) fn take_indirect() -> u64 {
-    INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
-}
-static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
