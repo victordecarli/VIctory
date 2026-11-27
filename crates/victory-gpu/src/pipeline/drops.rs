@@ -3,8 +3,10 @@
 //!
 //! * a shader that does not translate: on its [`Shader`], with the
 //!   translator's error;
-//! * a pipeline still being made, refused by the host, or made but whose
-//!   draw could not be prepared: on its [`Pending`];
+//! * a pipeline still being made or refused by the host: on its
+//!   [`Pending`];
+//! * a made pipeline whose draw could not be prepared: on its [`Pending`]
+//!   by [`Unprepared`] reason, and on that reason's [`Cause`];
 //! * a drop with no pipeline to blame (none set, indirect arguments the host
 //!   cannot read): here, by [`Cause`].
 //!
@@ -43,13 +45,140 @@ impl Count {
     }
 }
 
-/// A pipeline's drops, by why it had no host pipeline to run with.
+/// A pipeline's drops, by why it had no host pipeline to run with, or why
+/// its draw could not be prepared.
 #[derive(Default)]
 pub(crate) struct PipelineDrops {
     being_made: AtomicU64,
     refused: AtomicU64,
-    unprepared: AtomicU64,
+    unprepared: Reasons,
     seen: AtomicBool,
+}
+
+/// Why a draw, mesh dispatch, dispatch or indirect execution did not run on
+/// the host.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NotRun {
+    /// No host pipeline to run with: none set, not made yet, refused, a
+    /// shader that does not translate, or skipped (`count_drop` tells which).
+    NoHostPipeline,
+    /// No pipeline to blame.
+    General(Cause),
+    /// Its pipeline is made, but the draw could not be prepared.
+    Unprepared(Unprepared),
+}
+
+/// Why the draw of a made pipeline could not be prepared on the host, with
+/// what its first case is logged with.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code, reason = "the context fields are read through `Debug`, by the first drop line")]
+pub(crate) enum Unprepared {
+    /// A draw with a compute or mesh pipeline, or a mesh dispatch with
+    /// another (`mesh` is what was asked for).
+    OtherKind { mesh: bool },
+    /// No dynamic descriptor slots for a fresh table of `n` descriptors.
+    NoDynamicSlots { n: u32 },
+    /// The index buffer is not in a title buffer.
+    IndexBuffer { address: u64, size: u32 },
+    /// Rectangle vertices outside their buffer (`size`, its bytes).
+    RectangleVertices { slot: u32, address: u64, size: u32 },
+    /// No scratch memory for the expanded rectangles.
+    Scratch { bytes: u64 },
+    /// The host list cannot record mesh dispatches (`code`, the
+    /// `HRESULT` of the cast).
+    MeshList { code: i32 },
+    /// Rectangles drawn indexed, which are not expanded.
+    IndexedRectangles,
+    /// Rectangles drawn indirectly, which are not expanded.
+    IndirectRectangles,
+}
+
+impl Unprepared {
+    pub(crate) fn cause(self) -> Cause {
+        match self {
+            Unprepared::OtherKind { .. } => Cause::OtherKind,
+            Unprepared::NoDynamicSlots { .. } => Cause::NoDynamicSlots,
+            Unprepared::IndexBuffer { .. } => Cause::IndexBuffer,
+            Unprepared::RectangleVertices { .. } => Cause::RectangleVertices,
+            Unprepared::Scratch { .. } => Cause::Scratch,
+            Unprepared::MeshList { .. } => Cause::MeshList,
+            Unprepared::IndexedRectangles => Cause::IndexedRectangles,
+            Unprepared::IndirectRectangles => Cause::IndirectRectangles,
+        }
+    }
+
+    /// Its field in a `drop total: pipeline` line.
+    #[cfg(test)]
+    fn field(self) -> &'static str {
+        match self {
+            Unprepared::OtherKind { .. } => "other_kind",
+            Unprepared::NoDynamicSlots { .. } => "no_dynamic_slots",
+            Unprepared::IndexBuffer { .. } => "index_buffer",
+            Unprepared::RectangleVertices { .. } => "rectangle_vertices",
+            Unprepared::Scratch { .. } => "scratch",
+            Unprepared::MeshList { .. } => "mesh_list",
+            Unprepared::IndexedRectangles => "indexed_rectangles",
+            Unprepared::IndirectRectangles => "indirect_rectangles",
+        }
+    }
+}
+
+/// A made pipeline's drops by [`Unprepared`] reason.
+#[derive(Default)]
+struct Reasons {
+    other_kind: AtomicU64,
+    no_dynamic_slots: AtomicU64,
+    index_buffer: AtomicU64,
+    rectangle_vertices: AtomicU64,
+    scratch: AtomicU64,
+    mesh_list: AtomicU64,
+    indexed_rectangles: AtomicU64,
+    indirect_rectangles: AtomicU64,
+}
+
+impl Reasons {
+    fn add(&self, reason: Unprepared) {
+        let counter = match reason {
+            Unprepared::OtherKind { .. } => &self.other_kind,
+            Unprepared::NoDynamicSlots { .. } => &self.no_dynamic_slots,
+            Unprepared::IndexBuffer { .. } => &self.index_buffer,
+            Unprepared::RectangleVertices { .. } => &self.rectangle_vertices,
+            Unprepared::Scratch { .. } => &self.scratch,
+            Unprepared::MeshList { .. } => &self.mesh_list,
+            Unprepared::IndexedRectangles => &self.indexed_rectangles,
+            Unprepared::IndirectRectangles => &self.indirect_rectangles,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Each reason's field name and count, in the order lines list them.
+    fn counts(&self) -> [(&'static str, u64); 8] {
+        let Reasons {
+            other_kind,
+            no_dynamic_slots,
+            index_buffer,
+            rectangle_vertices,
+            scratch,
+            mesh_list,
+            indexed_rectangles,
+            indirect_rectangles,
+        } = self;
+        [
+            ("other_kind", other_kind),
+            ("no_dynamic_slots", no_dynamic_slots),
+            ("index_buffer", index_buffer),
+            ("rectangle_vertices", rectangle_vertices),
+            ("scratch", scratch),
+            ("mesh_list", mesh_list),
+            ("indexed_rectangles", indexed_rectangles),
+            ("indirect_rectangles", indirect_rectangles),
+        ]
+        .map(|(name, n)| (name, n.load(Ordering::Relaxed)))
+    }
+
+    fn total(&self) -> u64 {
+        self.counts().iter().map(|&(_, n)| n).sum()
+    }
 }
 
 /// Why a draw with no pipeline to blame was dropped.
@@ -69,12 +198,22 @@ pub(crate) enum Cause {
     /// Indirect: the arguments could not be bounded (no clamp, or not
     /// 4-byte aligned).
     IndirectUnbounded,
-    /// Indirect: the title's signature or buffers are not ones we execute.
+    /// Indirect: the title's signature (or its absence) or buffers are not
+    /// ones we execute.
     IndirectLayout,
     /// A dispatch whose pipeline is a graphics pipeline.
     ComputeKind,
     /// A mesh dispatch whose group count is in GPU memory.
     IndirectMesh,
+    /// The [`Unprepared`] reasons, one each.
+    OtherKind,
+    NoDynamicSlots,
+    IndexBuffer,
+    RectangleVertices,
+    Scratch,
+    MeshList,
+    IndexedRectangles,
+    IndirectRectangles,
 }
 
 /// Every cause this build has, in the order reports list them.
@@ -89,6 +228,14 @@ const CAUSES: &[Cause] = &[
     Cause::IndirectLayout,
     Cause::ComputeKind,
     Cause::IndirectMesh,
+    Cause::OtherKind,
+    Cause::NoDynamicSlots,
+    Cause::IndexBuffer,
+    Cause::RectangleVertices,
+    Cause::Scratch,
+    Cause::MeshList,
+    Cause::IndexedRectangles,
+    Cause::IndirectRectangles,
 ];
 
 impl Cause {
@@ -104,6 +251,14 @@ impl Cause {
             Cause::IndirectLayout => 5,
             Cause::ComputeKind => 7,
             Cause::IndirectMesh => 8,
+            Cause::OtherKind => 9,
+            Cause::NoDynamicSlots => 10,
+            Cause::IndexBuffer => 11,
+            Cause::RectangleVertices => 12,
+            Cause::Scratch => 13,
+            Cause::MeshList => 14,
+            Cause::IndexedRectangles => 15,
+            Cause::IndirectRectangles => 16,
         }
     }
 
@@ -119,14 +274,22 @@ impl Cause {
             Cause::IndirectLayout => "indirect: signature or buffers not executed",
             Cause::ComputeKind => "dispatch with a graphics pipeline",
             Cause::IndirectMesh => "indirect mesh dispatch",
+            Cause::OtherKind => "draw or mesh dispatch with another kind of pipeline",
+            Cause::NoDynamicSlots => "no dynamic descriptor slots for a table",
+            Cause::IndexBuffer => "index buffer outside title buffers",
+            Cause::RectangleVertices => "rectangle vertices outside their buffer",
+            Cause::Scratch => "no scratch memory for rectangles",
+            Cause::MeshList => "host list cannot record mesh dispatches",
+            Cause::IndexedRectangles => "indexed rectangles",
+            Cause::IndirectRectangles => "indirect rectangles",
         }
     }
 }
 
 /// Drops by cause, at [`Cause::slot`] (one slot more than the causes of a
 /// build without `diagnostics`, which never uses it).
-static GENERAL: [Count; 9] =
-    [const { Count { drops: AtomicU64::new(0), seen: AtomicBool::new(false) } }; 9];
+static GENERAL: [Count; 17] =
+    [const { Count { drops: AtomicU64::new(0), seen: AtomicBool::new(false) } }; 17];
 
 /// The shaders and pipelines that dropped a draw, in the order they first did.
 static SHADERS: Mutex<Vec<Arc<Shader>>> = Mutex::new(Vec::new());
@@ -154,12 +317,31 @@ pub(crate) fn general(cause: Cause) {
     }
 }
 
-/// Counts a drop of a draw whose pipeline is `pending`: on its shaders that
-/// do not translate, else on the pipeline.
+/// Counts a drop of a draw whose pipeline is `pending` and could not be
+/// prepared for `reason`: on the pipeline by reason and on the reason's
+/// cause, the first with its context. A pipeline not made (yet) is to
+/// blame instead, as [`pipeline`] counts it.
+pub(crate) fn unprepared(pending: &Arc<Pending>, reason: Unprepared) {
+    let Some(Some(_)) = pending.made.get() else {
+        pipeline(pending);
+        return;
+    };
+    pending.drops.unprepared.add(reason);
+    first_of_pipeline(pending, "made, but the draw could not be prepared");
+    let cause = reason.cause();
+    if GENERAL.get(cause.slot()).is_some_and(Count::add) {
+        let frame = crate::frame::current();
+        tracing::info!(target: crate::SUMMARY, cause = cause.name(), detail = ?reason, frame, "first drop");
+    }
+}
+
+/// Counts a drop of a draw whose pipeline is `pending` and has no host
+/// pipeline to run with: on its shaders that do not translate, else on the
+/// pipeline.
 pub(crate) fn pipeline(pending: &Arc<Pending>) {
     let (counter, cause) = match pending.made.get() {
-        Some(Some(_)) => (&pending.drops.unprepared, "made, but the draw could not be prepared"),
-        None => (&pending.drops.being_made, "being made"),
+        // Made since the draw found none: it was still being made then.
+        None | Some(Some(_)) => (&pending.drops.being_made, "being made"),
         Some(None) => {
             let mut blamed = false;
             for shader in &pending.shaders {
@@ -175,12 +357,54 @@ pub(crate) fn pipeline(pending: &Arc<Pending>) {
         }
     };
     counter.fetch_add(1, Ordering::Relaxed);
+    first_of_pipeline(pending, cause);
+}
+
+/// Logs the first drop of `pending`, and keeps it for the reports.
+fn first_of_pipeline(pending: &Arc<Pending>, cause: &'static str) {
     if !pending.drops.seen.swap(true, Ordering::Relaxed) {
         let frame = crate::frame::current();
         let shaders = names(&pending.shaders);
         tracing::info!(target: crate::SUMMARY, pipeline = %pending.key, %shaders, cause, frame, "first drop");
         PIPELINES.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(pending));
     }
+}
+
+/// The `drop total: pipeline` line of `p`: its totals, then the count of
+/// each reason its draws could not be prepared for, only those it has (a
+/// field that is `None` is not written).
+fn pipeline_line(p: &Pending) {
+    let PipelineDrops { being_made, refused, unprepared: reasons, seen: _ } = &p.drops;
+    let [being_made, refused] = [being_made, refused].map(|n| n.load(Ordering::Relaxed));
+    let unprepared = reasons.total();
+    let [
+        other_kind,
+        no_dynamic_slots,
+        index_buffer,
+        rectangle_vertices,
+        scratch,
+        mesh_list,
+        indexed_rectangles,
+        indirect_rectangles,
+    ] = reasons.counts().map(|(_, n)| (n > 0).then_some(n));
+    let shaders = names(&p.shaders);
+    tracing::info!(
+        target: crate::SUMMARY,
+        pipeline = %p.key,
+        %shaders,
+        being_made,
+        refused,
+        unprepared,
+        other_kind,
+        no_dynamic_slots,
+        index_buffer,
+        rectangle_vertices,
+        scratch,
+        mesh_list,
+        indexed_rectangles,
+        indirect_rectangles,
+        "drop total: pipeline"
+    );
 }
 
 fn untranslated(shader: &Arc<Shader>, e: &ShaderError) {
@@ -243,22 +467,11 @@ pub(crate) fn report() {
     }
     let pipeline_total = |p: &Arc<Pending>| {
         let PipelineDrops { being_made, refused, unprepared, seen: _ } = &p.drops;
-        [being_made, refused, unprepared].iter().map(|n| n.load(Ordering::Relaxed)).sum()
+        [being_made, refused].iter().map(|n| n.load(Ordering::Relaxed)).sum::<u64>()
+            + unprepared.total()
     };
     for p in costliest(pipelines, pipeline_total, |p| p.key.clone()) {
-        let PipelineDrops { being_made, refused, unprepared, seen: _ } = &p.drops;
-        let [being_made, refused, unprepared] =
-            [being_made, refused, unprepared].map(|n| n.load(Ordering::Relaxed));
-        let shaders = names(&p.shaders);
-        tracing::info!(
-            target: crate::SUMMARY,
-            pipeline = %p.key,
-            %shaders,
-            being_made,
-            refused,
-            unprepared,
-            "drop total: pipeline"
-        );
+        pipeline_line(&p);
     }
     for (cause, drops) in causes {
         tracing::info!(target: crate::SUMMARY, cause = cause.name(), drops, "drop total");
@@ -346,6 +559,56 @@ mod tests {
         general(Cause::IndirectMesh);
         assert_eq!(count(Cause::ComputeKind), kind + 1);
         assert_eq!(count(Cause::IndirectMesh), mesh + 2);
+    }
+
+    /// One of each reason, with made-up context.
+    const EVERY_REASON: [Unprepared; 8] = [
+        Unprepared::OtherKind { mesh: true },
+        Unprepared::NoDynamicSlots { n: 64 },
+        Unprepared::IndexBuffer { address: 0x1000, size: 96 },
+        Unprepared::RectangleVertices { slot: 2, address: 0x2000, size: 48 },
+        Unprepared::Scratch { bytes: 4096 },
+        Unprepared::MeshList { code: -2147467262 },
+        Unprepared::IndexedRectangles,
+        Unprepared::IndirectRectangles,
+    ];
+
+    #[test]
+    fn each_reason_counts_on_its_own_named_counter_and_they_sum_to_unprepared() {
+        let reasons = Reasons::default();
+        // Reason k counted k + 1 times: a counter shared by two reasons
+        // would hold a sum no single k gives.
+        for (k, &reason) in EVERY_REASON.iter().enumerate() {
+            for _ in 0..=k {
+                reasons.add(reason);
+            }
+        }
+        let counts = reasons.counts();
+        for (k, &reason) in EVERY_REASON.iter().enumerate() {
+            let named = counts.iter().find(|(name, _)| *name == reason.field());
+            assert_eq!(named.map(|&(_, n)| n), Some(k as u64 + 1), "{reason:?}");
+        }
+        assert_eq!(reasons.total(), (1..=8).sum::<u64>());
+    }
+
+    #[test]
+    fn a_pipeline_line_names_only_the_reasons_it_has() {
+        let reasons = Reasons::default();
+        reasons.add(Unprepared::NoDynamicSlots { n: 8 });
+        reasons.add(Unprepared::NoDynamicSlots { n: 16 });
+        reasons.add(Unprepared::Scratch { bytes: 1 });
+        let present: Vec<(&str, u64)> =
+            reasons.counts().into_iter().filter(|&(_, n)| n > 0).collect();
+        assert_eq!(present, [("no_dynamic_slots", 2), ("scratch", 1)]);
+        assert_eq!(reasons.total(), 3);
+    }
+
+    #[test]
+    fn every_reason_has_a_cause_of_its_own() {
+        let mut causes: Vec<Cause> = EVERY_REASON.iter().map(|r| r.cause()).collect();
+        causes.dedup();
+        assert_eq!(causes.len(), EVERY_REASON.len());
+        assert!(causes.iter().all(|c| CAUSES.contains(c)));
     }
 
     #[test]

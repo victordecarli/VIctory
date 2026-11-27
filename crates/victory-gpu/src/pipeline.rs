@@ -240,12 +240,13 @@ pub(crate) unsafe fn is_skipped(this: This) -> bool {
 }
 
 /// Counts a draw or dispatch of `this` the host did not run, where its
-/// cause lives (see [`drops`]).
+/// cause lives (see [`drops`]): with no host pipeline to run with, or, with
+/// a `reason`, made but not prepared.
 #[cfg(windows)]
 /// # Safety
 ///
 /// `this` is null or a live pipeline this module created.
-pub(crate) unsafe fn count_drop(this: This) {
+pub(crate) unsafe fn count_drop(this: This, reason: Option<drops::Unprepared>) {
     if this.is_null() {
         drops::general(drops::Cause::NoPipeline);
         return;
@@ -257,7 +258,10 @@ pub(crate) unsafe fn count_drop(this: This) {
         drops::general(drops::Cause::Skipped);
         return;
     }
-    drops::pipeline(&p.host);
+    match reason {
+        Some(reason) => drops::unprepared(&p.host, reason),
+        None => drops::pipeline(&p.host),
+    }
 }
 
 /// The stage's container, if it has one.

@@ -1569,7 +1569,7 @@ impl Meter {
                 preparing: PREPARING.each_ref().map(take),
                 copy_back: COPY_BACK.each_ref().map(take),
                 dropped: crate::draw::take_dropped(),
-                indirect: crate::list::take_indirect(),
+                indirect: crate::draw::take_indirect(),
             };
             (self.logged, self.logged_frames, self.logged_drawn) =
                 (std::time::Instant::now(), 0, drawn);

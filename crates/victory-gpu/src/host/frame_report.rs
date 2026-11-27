@@ -38,7 +38,8 @@ pub(super) struct FrameReport {
     pub(super) dropped_per_frame: f64,
     /// Host pipelines being made when logged.
     pub(super) pipelines_making: u64,
-    pub(super) indirect_per_frame: f64,
+    /// Indirect executions dropped (each also counted on its cause).
+    pub(super) indirect_dropped_per_frame: f64,
     /// The frame being recorded, as the drop events name it.
     pub(super) frame: u64,
 }
@@ -75,7 +76,7 @@ impl FrameReport {
             draws_per_frame: each(draws),
             dropped_per_frame: each(dropped),
             pipelines_making,
-            indirect_per_frame: each(indirect),
+            indirect_dropped_per_frame: each(indirect),
             frame,
         }
     }
@@ -97,7 +98,7 @@ impl FrameReport {
             draws_per_frame,
             dropped_per_frame,
             pipelines_making,
-            indirect_per_frame,
+            indirect_dropped_per_frame,
             frame,
         } = *self;
         let tenth = |x: f64| (x * 10.0).round() / 10.0;
@@ -117,7 +118,7 @@ impl FrameReport {
             draws_per_frame = whole(draws_per_frame),
             dropped_per_frame = whole(dropped_per_frame),
             pipelines_making,
-            indirect_per_frame = whole(indirect_per_frame),
+            indirect_dropped_per_frame = whole(indirect_dropped_per_frame),
             frame,
             "frame report"
         );
@@ -188,7 +189,7 @@ mod tests {
             draws_per_frame: 1234.4,
             dropped_per_frame: 2.6,
             pipelines_making: 3,
-            indirect_per_frame: 0.4,
+            indirect_dropped_per_frame: 0.4,
             frame: 812,
         };
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -213,7 +214,7 @@ mod tests {
             ("draws_per_frame", "1234"),
             ("dropped_per_frame", "3"),
             ("pipelines_making", "3"),
-            ("indirect_per_frame", "0"),
+            ("indirect_dropped_per_frame", "0"),
             ("frame", "812"),
         ]
         .into_iter()
@@ -251,7 +252,7 @@ mod tests {
             draws_per_frame,
             dropped_per_frame,
             pipelines_making,
-            indirect_per_frame,
+            indirect_dropped_per_frame,
             frame,
         } = r;
         assert_eq!(
@@ -259,7 +260,13 @@ mod tests {
             [0.8, 1250.0, 2.0, 1.0, 2.0, 0.5, 0.25, 5.0]
         );
         assert_eq!(
-            [copy_back_ms, copy_back_mb, draws_per_frame, dropped_per_frame, indirect_per_frame],
+            [
+                copy_back_ms,
+                copy_back_mb,
+                draws_per_frame,
+                dropped_per_frame,
+                indirect_dropped_per_frame
+            ],
             [0.1, 0.5, 500.0, 3.0, 1.5]
         );
         assert_eq!((pipelines_making, frame), (7, 900));
