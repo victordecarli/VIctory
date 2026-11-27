@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// One exported channel: output element, its channel, the value, and
+/// which half of an f16 pair it is (`None`: a whole dword).
+type Store = (usize, u8, Value, Option<bool>);
+
 impl Lower<'_> {
     /// Values of the program's input registers.
     pub(super) fn inputs(&mut self) -> Result<(), Stop> {
@@ -371,24 +375,32 @@ impl Lower<'_> {
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
         }
-        let param_row = |usage: Usage, row: u8| match usage {
-            // The 2020 compiler leaves a mesh program's first entry zeroed
-            // (usage "position"): its row is the one no other entry names.
+        let primitive = matches!(e.target, Target::PrimitiveParam { .. });
+        let stores = self.export_stores(e, mesh, primitive)?;
+        self.store_outputs(stores, guard, mesh, primitive)
+    }
+
+    /// The row of a parameter export. The 2020 compiler leaves a mesh
+    /// program's first entry zeroed (usage "position"): its row is the one
+    /// no other entry names.
+    fn param_row(&self, usage: Usage, row: u8, mesh: bool) -> Option<u8> {
+        match usage {
             Usage::Other(0) if mesh => self.unnamed_row(),
             _ => Some(row),
-        };
-        // (output element, channel) per exported channel; per-primitive
-        // outputs are elements of `prims`.
+        }
+    }
+
+    /// The stores of an export's channels; per-primitive outputs are
+    /// elements of `prims`.
+    fn export_stores(&self, e: &Export, mesh: bool, primitive: bool) -> Result<Vec<Store>, Why> {
         let mut stores = Vec::new();
-        let primitive = matches!(e.target, Target::PrimitiveParam { .. });
         let outputs = if primitive { &self.s.prims } else { &self.s.outputs };
-        let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
         // 16-bit vertex outputs: the halves each dword carries, as (output
         // element, channel, high half) per channel.
         let halves = match e.target {
-            Target::Param { usage, row } => {
-                param_row(usage, row).and_then(|r| self.half_outputs.get(&r).map(|&h| (r, h)))
-            }
+            Target::Param { usage, row } => self
+                .param_row(usage, row, mesh)
+                .and_then(|r| self.half_outputs.get(&r).map(|&h| (r, h))),
             _ => None,
         };
         if let Some((row, (pack2, b))) = halves {
@@ -414,71 +426,90 @@ impl Lower<'_> {
                     }
                 }
             }
+            return Ok(stores);
         }
         for ch in 0..4u8 {
             let Some(value) = e.values[usize::from(ch)] else {
                 continue;
             };
-            if halves.is_some() {
-                break;
-            }
-            let found = match e.target {
-                Target::Color(n) => outputs
-                    .iter()
-                    .position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
-                    .map(|id| (id, ch)),
-                Target::Position(0) => by_kind(3).map(|id| (id, ch)),
-                Target::Depth => match ch {
-                    0 => by_kind(17).or(by_kind(18)).or(by_kind(19)).map(|id| (id, 0)),
-                    1 => by_kind(20).map(|id| (id, 0)),
-                    2 => by_kind(14).map(|id| (id, 0)),
-                    _ => None,
-                },
-                Target::Param { usage, row } | Target::PrimitiveParam { usage, row } => {
-                    let row = param_row(usage, row);
-                    outputs
-                        .iter()
-                        .position(|o| {
-                            row.is_some_and(|r| o.row == Some(u32::from(r)))
-                                && ch >= o.col
-                                && ch < o.col + o.cols
-                        })
-                        .map(|id| (id, ch - outputs[id].col))
-                }
-                Target::Null | Target::Unread => None,
-                Target::Position(n @ 1..=2) => {
-                    // shortcut: without the misc vector (point size, render
-                    // target or viewport index) pos1 and pos2 carry the clip
-                    // then cull distances, in semantic order.
-                    if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
-                        return Err("render-target or viewport index exports");
-                    }
-                    let mut dists: Vec<usize> =
-                        (0..outputs.len()).filter(|&i| matches!(outputs[i].kind, 6 | 7)).collect();
-                    dists.sort_by_key(|&i| (outputs[i].kind, outputs[i].index));
-                    let flat: Vec<(usize, u8)> = dists
-                        .iter()
-                        .flat_map(|&i| (0..outputs[i].cols).map(move |c| (i, c)))
-                        .collect();
-                    // Channels past the distances the signature declares are
-                    // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
-                    let k = usize::from(n - 1) * 4 + usize::from(ch);
-                    flat.get(k).copied()
-                }
-                Target::Position(_) => return Err("clip, cull or point-size exports"),
-                Target::Primitive => return Err("a primitive export"),
-            };
-            if let Some((id, col)) = found {
+            if let Some((id, col)) = self.channel_output(e.target, ch, outputs, mesh)? {
                 stores.push((id, col, value, None));
             }
         }
+        Ok(stores)
+    }
+
+    /// The output element and its channel that channel `ch` of an export
+    /// to `target` writes, if any.
+    fn channel_output(
+        &self,
+        target: Target,
+        ch: u8,
+        outputs: &[SigElement],
+        mesh: bool,
+    ) -> Result<Option<(usize, u8)>, Why> {
+        let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
+        Ok(match target {
+            Target::Color(n) => outputs
+                .iter()
+                .position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
+                .map(|id| (id, ch)),
+            Target::Position(0) => by_kind(3).map(|id| (id, ch)),
+            Target::Depth => match ch {
+                0 => by_kind(17).or(by_kind(18)).or(by_kind(19)).map(|id| (id, 0)),
+                1 => by_kind(20).map(|id| (id, 0)),
+                2 => by_kind(14).map(|id| (id, 0)),
+                _ => None,
+            },
+            Target::Param { usage, row } | Target::PrimitiveParam { usage, row } => {
+                let row = self.param_row(usage, row, mesh);
+                outputs
+                    .iter()
+                    .position(|o| {
+                        row.is_some_and(|r| o.row == Some(u32::from(r)))
+                            && ch >= o.col
+                            && ch < o.col + o.cols
+                    })
+                    .map(|id| (id, ch - outputs[id].col))
+            }
+            Target::Null | Target::Unread => None,
+            Target::Position(n @ 1..=2) => {
+                // shortcut: without the misc vector (point size, render
+                // target or viewport index) pos1 and pos2 carry the clip
+                // then cull distances, in semantic order.
+                if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
+                    return Err("render-target or viewport index exports");
+                }
+                let mut dists: Vec<usize> =
+                    (0..outputs.len()).filter(|&i| matches!(outputs[i].kind, 6 | 7)).collect();
+                dists.sort_by_key(|&i| (outputs[i].kind, outputs[i].index));
+                let flat: Vec<(usize, u8)> =
+                    dists.iter().flat_map(|&i| (0..outputs[i].cols).map(move |c| (i, c))).collect();
+                // Channels past the distances the signature declares are
+                // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
+                let k = usize::from(n - 1) * 4 + usize::from(ch);
+                flat.get(k).copied()
+            }
+            Target::Position(_) => return Err("clip, cull or point-size exports"),
+            Target::Primitive => return Err("a primitive export"),
+        })
+    }
+
+    /// Writes the exported channels to their output elements. A mesh lane
+    /// writes its own vertex or primitive, where it exports.
+    fn store_outputs(
+        &mut self,
+        stores: Vec<Store>,
+        guard: Option<V>,
+        mesh: bool,
+        primitive: bool,
+    ) -> Result<(), Why> {
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
             if primitive { &mut l.s.prims } else { &mut l.s.outputs }
         }
         if stores.iter().any(|s| s.3.is_none() && elements(self, primitive)[s.0].half) {
             return Err("a 16-bit output the stage data does not mark");
         }
-        // A mesh lane writes its own vertex or primitive, where it exports.
         let at = if mesh { self.begin_guarded(guard) } else { None };
         let (name, opcode) = match (mesh, primitive) {
             (false, _) => ("storeOutput", 5),
