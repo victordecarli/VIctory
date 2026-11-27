@@ -35,6 +35,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(windows)]
+mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -60,6 +62,8 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use memory::title_reserved;
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};
 

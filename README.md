@@ -248,8 +248,16 @@ missing imports, the host adapter and its wave lanes, the frame reports
 one, `fps`, `ms_per_frame`, `cpu_ms` preparing submissions with its
 `copies_ms`/`copies_mb` and `textures_ms`/`textures_mb`, `gpu_ms`
 waiting for the GPU, `copy_back_ms`/`copy_back_mb`, `draws_per_frame`,
-`dropped_per_frame`, `indirect_dropped_per_frame`; `pipelines_making` now; and
-the `frame` the drop lines also name), the draws the host did not run, and a crash
+`dropped_per_frame`, `indirect_dropped_per_frame`; `pipelines_making` now;
+the `frame` the drop lines also name; and memory now, in MB: the process's
+commit charge `commit_mb`, the system's `system_commit_mb` and its
+`commit_limit_mb`, and what the host side holds of the process's:
+`copies_held_mb` host copies of title memory, `snapshots_held_mb` their
+bytes kept to find shader writes, `staging_held_mb` texture uploads from
+title memory; and what the title's XMem reservations commit,
+`title_private_mb` (part of `commit_mb`) and `title_mapped_mb`, views of
+its physical pages, which only the system's commit counts), the draws the
+host did not run, and a crash
 (`"message":"crash"`, the report in `report`), which also goes to
 `crashes.log` as before. A dropped draw is counted where its cause lives,
 in every build: on the shader that does not translate (with the

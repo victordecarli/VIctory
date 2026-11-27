@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
+use crate::memory::Held;
 use crate::object::This;
 use crate::warn::warn_once;
 
@@ -28,7 +29,6 @@ use crate::warn::warn_once;
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
-    #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -159,6 +159,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let last = self.last.get_mut().unwrap_or_else(|e| e.into_inner());
+        Held::Staging.release(self.size + last.read.capacity() as u64);
+    }
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
@@ -184,7 +191,9 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
+            let room = last.read.capacity();
             last.read.resize(size, 0);
+            Held::Staging.hold((last.read.capacity() - room) as u64);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
@@ -315,9 +324,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    Held::Staging.hold(total);
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,

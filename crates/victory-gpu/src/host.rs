@@ -1577,6 +1577,7 @@ impl Meter {
                 &counts,
                 crate::pipeline::making(),
                 crate::frame::current(),
+                crate::memory::Memory::now(),
             )
             .log();
             crate::pipeline::drops::report();
