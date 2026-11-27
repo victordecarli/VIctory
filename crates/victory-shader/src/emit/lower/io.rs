@@ -7,6 +7,24 @@ use super::*;
 /// which half of an f16 pair it is (`None`: a whole dword).
 type Store = (usize, u8, Value, Option<bool>);
 
+/// Where half `h` (dword h / 2, the high half when odd) of a parameter
+/// packing 16-bit rows `a` and `b` two per dword comes from: a row and
+/// channel of `elements`, none for padding. Channel c of `a` is half c;
+/// `b` starts at the dword after `a`'s last channel.
+fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(u8, u8)> {
+    let extent = |r: u8| {
+        elements.iter().filter(|e| e.row == Some(u32::from(r))).map(|e| e.col + e.cols).max()
+    };
+    let na = extent(a)?;
+    let a_halves = na.div_ceil(2) * 2;
+    if h < a_halves {
+        return (h < na).then_some((a, h));
+    }
+    let b = b?;
+    let c = h - a_halves;
+    (c < extent(b)?).then_some((b, c))
+}
+
 impl Lower<'_> {
     /// Values of the program's input registers.
     pub(super) fn inputs(&mut self) -> Result<(), Stop> {

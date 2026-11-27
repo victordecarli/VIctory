@@ -46,19 +46,26 @@ export, a branch) needs it, so an unused unsupported value costs nothing.
 
 `crates/victory-shader/src/emit/lower.rs` holds the `Lower` struct, the
 dispatch of each instruction (`inst`) and the value helpers every lowering
-shares. The lowerings sit in modules under
-`crates/victory-shader/src/emit/lower/`, each an `impl Lower` block of its
-own: `image`, `memory` (buffer and global loads), `smem` (scalar loads),
-`descriptor` (resource handles), `salu` (scalar ALU), `valu` (32-bit
-vector ALU: moves, floats, conversions, lanes, DPP), `integer` (vector
-integer operations and compares), `valu16`, `lds`, `io` (inputs,
-interpolation, exports) and `halves` (wave64 on a 32-lane host). The
-float helpers several of them share (`unary`, `fmad`, `bfe`...), stage
-setup and control flow are still in lower.rs, still twice the file
-limit, and move out the same way (issue #77). Put a new lowering in the
-module of its kind, or a new one beside them, never in lower.rs. An
-`unreachable!` you touch there becomes a `let ... else` returning the
-lowering's error.
+shares (reading and writing registers, guards, lane reads). Everything
+else sits in modules under `crates/victory-shader/src/emit/lower/`, each
+an `impl Lower` block of its own:
+
+- `setup` (`Lower::new`, what the stage declares, whole-wave sections),
+  `control` (block order, exits, loop limits, phis) and `masks` (lane
+  masks as booleans and as numbers);
+- `salu` (scalar ALU), `valu` (32-bit vector ALU: moves, floats,
+  conversions, lanes, DPP), `integer` (vector integer operations and
+  compares), `valu16` (16-bit and packed), `math` (arithmetic they share)
+  and `lds`;
+- `image`, `memory` (buffer and global loads), `smem` (scalar loads) and
+  `descriptor` (resource handles);
+- `io` (inputs, interpolation, exports) and `halves` (wave64 on a 32-lane
+  host);
+- `tests` (helpers the unit tests share; each test sits beside its code).
+
+Put a new lowering in the module of its kind, or a new one beside them,
+never in lower.rs. An `unreachable!` you touch there becomes a
+`let ... else` returning the lowering's error.
 
 ## Tests
 
